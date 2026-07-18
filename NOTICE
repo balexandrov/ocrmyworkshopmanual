@@ -1,0 +1,27 @@
+ocrmyworkshopmanual
+Copyright (c) 2026 balexandrov — MIT License (see LICENSE).
+
+This project orchestrates several external programs (invoked as subprocesses,
+not linked or redistributed) and bundles one small third-party helper script.
+
+Bundled in this repository
+--------------------------
+* tools/jbig2topdf.py — from jbig2enc by Adam Langley, Apache License 2.0.
+  Full license text: tools/jbig2enc-LICENSE.txt
+  Source: https://github.com/agl/jbig2enc
+
+Required external tools (install separately; NOT distributed here)
+-----------------------------------------------------------------
+* Ghostscript          — AGPL-3.0 (or commercial). https://www.ghostscript.com
+* jbig2enc (`jbig2`)   — Apache-2.0.  https://github.com/agl/jbig2enc
+* Tesseract OCR        — Apache-2.0.  https://github.com/tesseract-ocr/tesseract
+
+Python dependencies (installed via pip; each under its own license)
+-------------------------------------------------------------------
+* ocrmypdf (MPL-2.0), pypdf (BSD), img2pdf (LGPL-3.0), Pillow (HPND/MIT-CMU),
+  numpy (BSD), scipy (BSD).
+
+Ghostscript is used only by executing the `gs` command; this project does not
+link against or redistribute Ghostscript, so its AGPL terms are not imposed on
+this MIT-licensed code. Users who redistribute Ghostscript binaries must comply
+with the Ghostscript license themselves.

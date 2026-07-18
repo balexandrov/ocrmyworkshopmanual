@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Bundled third-party BINARIES are not committed — install them yourself
+# (only the pure-Python tools/jbig2topdf.py wrapper is kept in the repo)
+*.exe
+tools/jbig2/
+
+# Work artifacts
+*.part
+*.log
