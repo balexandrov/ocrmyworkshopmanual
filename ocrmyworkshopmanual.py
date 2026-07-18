@@ -29,6 +29,10 @@ Usage:
   python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu   # multilingual OCR
   python ocrmyworkshopmanual.py SRC --symbol                     # smaller, GS/Acrobat only
 
+Page-type router: classify_page() sorts each page into a PageType (PT_LINE/PT_BLANK
+  bitonal, PT_PHOTO_GRAY, PT_PHOTO_COLOR) and the router dispatches it to that type's
+  strategy; add a page kind by extending classify_page() + the router branch.
+
 Tuning notes (learned on Toyota FSM scans):
   OCR (default on) adds a searchable text layer via ocrmypdf; --no-ocr to skip.
                    Needs Tesseract on PATH and ocrmypdf installed.
@@ -36,9 +40,14 @@ Tuning notes (learned on Toyota FSM scans):
                    all pages → ~30% smaller, BUT PDFium (Chrome/Edge) renders a
                    large shared dictionary as BLANK pages. Generic works everywhere.
   --dpi 200        good speed/quality balance for on-screen viewing (~native ~220).
-  --threshold 125  gray<T => ink. Keep LOW (~120-130): pages with a gray shaded
-                   background wash (e.g. foldout wiring diagrams) turn to
-                   salt-and-pepper NOISE at high thresholds like 190.
+  ADAPTIVE (default) binarization = background-flatten + Sauvola: keeps faint strokes
+                   and dotted leaders on low-contrast/yellowed scans and resolves a
+                   gray shaded wash (foldout wiring diagrams) cleanly, where a fixed
+                   global threshold either erodes ink or (high) makes salt-and-pepper.
+                   --sauvola-k tunes boldness; --global-threshold restores fixed --threshold.
+  photo pages      grayscale photo/mixed pages are paper-whitened + edge-trimmed
+                   (--no-photo-clean off); colour detection is cast-robust so a sepia
+                   B&W page stays whitened-grayscale, not a yellow colour JPEG.
   --min-size 10    drop black connected components smaller than N px (scan speckle).
 
 Dependencies:
@@ -58,6 +67,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import namedtuple
 from pathlib import Path
 
 import img2pdf
@@ -72,6 +82,20 @@ Image.MAX_IMAGE_PIXELS = None  # trusted local scans; foldout pages can be huge
 
 _STRUCT8 = np.ones((3, 3), bool)  # 8-connectivity for speckle labeling
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# ── Page types ───────────────────────────────────────────────────────────────
+# Each scanned page is classified into one PageType, and the router dispatches it
+# to a per-type strategy. To handle a new kind of page, add a type here, a rule in
+# classify_page(), and a branch in the router (see compress_one) — nothing else.
+PT_BLANK = 'blank'              # near-empty  -> folds into the bitonal run (JBIG2 ~nothing)
+PT_LINE = 'line'               # text / line-art (incl. gray-wash/shadow) -> flatten+Sauvola -> JBIG2
+PT_PHOTO_GRAY = 'photo_gray'   # B&W photo / halftone / stipple -> whiten paper + trim edges -> gray JPEG
+PT_PHOTO_COLOR = 'photo_color' # genuine colour (covers, colour diagrams) -> colour JPEG
+_PT_BITONAL = (PT_BLANK, PT_LINE)  # types that share the grouped-JBIG2 path
+
+# classify_page() result: the page's type, plus a pre-rendered colour PNG for photo
+# pages (so the strategy doesn't re-render), else None.
+PageClass = namedtuple('PageClass', 'type color_png')
 
 
 # ── Tool discovery (recomputed on import in each spawned worker) ──────────────
@@ -175,19 +199,102 @@ def check_tools(want_ocr: bool):
 
 # ── Per-page cleanup ─────────────────────────────────────────────────────────
 
-def despeckle_png(path: Path, thresh: int, min_size: int):
-    """In place: threshold a grayscale page to bitonal and drop black connected
-    components smaller than min_size px (scan speckle). Saved as 1-bit PNG."""
+def _flatten_bg(g: np.ndarray, win: int) -> np.ndarray:
+    """Flatten uneven paper: estimate the background field (grey-closing fills the
+    ink/detail, a box blur smooths what's left) and divide the page by it, so a
+    yellow cast, binding-shadow washes and edge darkening all normalise toward white.
+    Returns uint8 gray. Large detail (e.g. a photo) exceeds the window and is kept."""
+    bg = ndimage.grey_closing(g, size=(win, win)).astype(np.float32)
+    bg = np.maximum(ndimage.uniform_filter(bg, win), 1.0)
+    return np.clip(g.astype(np.float32) / bg * 255.0, 0, 255).astype(np.uint8)
+
+
+def _sauvola_ink(g: np.ndarray, win: int, k: float, R: float = 128.0) -> np.ndarray:
+    """Sauvola local adaptive threshold: T = m*(1 + k*(s/R - 1)) with local mean m
+    and std s over a `win`-px window (O(1)/px via box filters). Returns a boolean ink
+    mask (True where ink). Because the cutoff adapts per region, faint low-contrast
+    strokes survive where a single global threshold erodes them, and a mid-gray wash
+    resolves cleanly instead of breaking into salt-and-pepper speckle."""
+    gf = g.astype(np.float64)
+    m = ndimage.uniform_filter(gf, win)
+    s = np.sqrt(np.maximum(ndimage.uniform_filter(gf * gf, win) - m * m, 0.0))
+    return g < m * (1.0 + k * (s / R - 1.0))
+
+
+def binarize_png(path: Path, adaptive: bool, thresh: int, min_size: int,
+                 despeckle: bool, dpi: int, sauvola_k: float = 0.30, ink_floor: int = 100):
+    """In place: turn a grayscale page PNG into a 1-bit PNG. ADAPTIVE (default) does
+    background-flatten + Sauvola, so low-contrast/yellowed scans keep their faint
+    strokes and dotted leaders and a gray wash doesn't speckle; GLOBAL uses a fixed
+    `thresh` (legacy, --global-threshold). Then optionally drops black connected
+    components smaller than min_size px (scan speckle). Window sizes scale with dpi.
+    ink_floor: any flattened pixel darker than this is forced to ink — Sauvola alone
+    HOLLOWS OUT solid-black interiors (bold display type, filled tabs) because a big
+    uniform-dark area has ~no local variance, so this floor keeps blacks solid."""
     g = np.asarray(Image.open(path).convert('L'))
-    ink = g < thresh
-    lbl, _ = ndimage.label(ink, structure=_STRUCT8)
-    counts = np.bincount(lbl.ravel())
-    small = np.where(counts < min_size)[0]
-    small = small[small != 0]
-    if small.size:
-        ink &= ~np.isin(lbl, small)
+    if adaptive:
+        flat_win = max(21, round(dpi * 0.30))  # ~background/paper scale
+        sauv_win = max(15, round(dpi * 0.20))  # ~a few characters
+        flat = _flatten_bg(g, flat_win)
+        ink = _sauvola_ink(flat, sauv_win, sauvola_k)
+        ink |= flat < ink_floor                # keep solid-black fills solid
+    else:
+        ink = g < thresh
+    if despeckle:
+        lbl, _ = ndimage.label(ink, structure=_STRUCT8)
+        counts = np.bincount(lbl.ravel())
+        small = np.where(counts < min_size)[0]
+        small = small[small != 0]
+        if small.size:
+            ink = ink & ~np.isin(lbl, small)
     arr = np.where(ink, 0, 255).astype('uint8')
     Image.fromarray(arr).convert('1').save(path)
+
+
+def _paper_envelope(g: np.ndarray, f: int = 8) -> np.ndarray:
+    """Smooth BRIGHT-paper estimate that survives large solid-dark regions: on an f×
+    downscaled copy take a wide local maximum (≈ paper luminance, which fills even big
+    black fills), smooth it, upscale. Dividing a page by this normalises paper→white and
+    lighting/shadow gradients WITHOUT washing solid blacks (dark / bright stays dark) —
+    a small-window background estimate instead divides a big black fill by itself → gray."""
+    h, w = g.shape
+    small = np.asarray(Image.fromarray(g).resize((max(1, w // f), max(1, h // f))))
+    env = ndimage.grey_dilation(small, size=31)
+    env = ndimage.uniform_filter(env.astype(np.float32), 31)
+    bg = np.asarray(Image.fromarray(env.astype(np.uint8)).resize((w, h))).astype(np.float32)
+    return np.maximum(bg, 1.0)
+
+
+def _soft_levels(norm: np.ndarray, bp: float = 0.28, wp: float = 0.98,
+                 knee: float = 0.85) -> np.ndarray:
+    """Contrast curve for photo/mixed pages. Linearly map [bp, wp] -> [0, 1] (the black
+    point bp deepens shadows = more contrast, less 'washed'), but SOFT-KNEE the highlights
+    above `knee` so a photograph's bright tones roll off gently toward white instead of a
+    hard clip to paper-white — a hard white-point blows out the photo's light detail (sky/
+    chrome/background). Input `norm` is the page divided by its paper envelope (~1.0=paper)."""
+    x = np.clip((norm - bp) / (wp - bp), 0.0, 1.2)
+    hi = x > knee
+    x[hi] = knee + (1 - knee) * (1 - np.exp(-(x[hi] - knee) / (1 - knee)))
+    return np.clip(x, 0.0, 1.0)
+
+
+def _clean_paper(g: np.ndarray, dpi: int, descreen: float = 0.6) -> np.ndarray:
+    """Whiten the paper on a photo/mixed page: optionally DESCREEN (a mild gaussian that
+    merges the scan's halftone dot grain into smooth tone — less 'dithering', smaller
+    JPEG, negligible line softening; sigma scales with dpi, 0 disables), flat-field
+    divide by a bright-paper envelope (removes the yellow cast and uneven lighting while
+    keeping solid blacks black), apply a soft-levels tone curve (contrast without blowing
+    out the photo's highlights), and blank a dark scan-edge border. g / return: uint8 gray."""
+    if descreen > 0:
+        g = ndimage.gaussian_filter(g, descreen * dpi / 150.0)
+    bg = _paper_envelope(g)
+    out = (_soft_levels(g.astype(np.float32) / bg) * 255.0).astype(np.uint8)
+    H, W = out.shape
+    m = max(4, int(min(H, W) * 0.02))
+    for strip in (np.s_[:m, :], np.s_[-m:, :], np.s_[:, :m], np.s_[:, -m:]):
+        if (out[strip] < 110).mean() > 0.4:  # a mostly-dark margin = scan-edge shadow
+            out[strip] = 255
+    return out
 
 
 def photo_coverage(png: Path, dpi: int) -> float:
@@ -206,25 +313,65 @@ def photo_coverage(png: Path, dpi: int) -> float:
     return float((blocks > 0.35).mean())
 
 
-def photo_page_pdf(src_p: Path, page_no: int, out_pdf: Path, work: Path,
-                   dpi: int, photo_dpi: int, quality: int) -> bool:
-    """A continuous-tone page: re-render it in COLOR at photo_dpi, keep colour if the
-    page actually has colour (else grayscale to save space), JPEG, wrap to a 1-page
-    PDF sized (via embedded dpi) to match the bitonal pages. Returns True if colour."""
+def _is_color(a: np.ndarray) -> bool:
+    """True if the page has genuine colour, robust to a uniform yellow/sepia paper
+    cast. White-balance each channel to its 95th percentile (removing the cast), then
+    require real chroma on actual marks (non-near-white pixels). A sepia B&W scan goes
+    neutral -> False; a colour cover/diagram keeps its saturation -> True. (A naive
+    max-minus-min test flags every yellowed page as 'colour'.) a: HxWx3 int array."""
+    a = a.astype(np.float32)
+    wp = np.maximum(np.percentile(a.reshape(-1, 3), 95, axis=0), 1.0)
+    b = np.clip(a * (255.0 / wp), 0, 255)
+    mx, mn = b.max(2), b.min(2)
+    marks = mn < 200
+    if int(marks.sum()) < 50:
+        return False
+    return float(((mx - mn)[marks] > 45).mean()) > 0.06
+
+
+def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
+                  detect_photos: bool, photo_thresh: float, photo_dpi: int,
+                  blank_ink: float = 0.0008) -> PageClass:
+    """Route one rendered grayscale page to a PageType. Cheap signals: ink fraction
+    (BLANK), tiled continuous-tone coverage (PHOTO vs LINE), and — for photo pages —
+    a colour render + cast-robust colour test (PHOTO_GRAY vs PHOTO_COLOR). The colour
+    PNG is rendered once here and handed to the strategy via PageClass.color_png."""
+    g = np.asarray(Image.open(png).convert('L'))
+    if float((g < 100).mean()) < blank_ink:
+        return PageClass(PT_BLANK, None)
+    if not detect_photos or photo_coverage(png, dpi) <= photo_thresh:
+        return PageClass(PT_LINE, None)
+    # continuous-tone page: render colour once, decide gray vs colour
     d = photo_dpi or dpi
     cpng = work / f'color{page_no}.png'
     subprocess.run([GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={page_no}', f'-dLastPage={page_no}',
                     '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(cpng), win_long(src_p)],
                    capture_output=True)
-    im = Image.open(cpng).convert('RGB')
-    a = np.asarray(im).astype(np.int16)
-    is_color = float(((a.max(2) - a.min(2)) > 30).mean()) > 0.02
+    if not cpng.exists():
+        return PageClass(PT_LINE, None)  # colour render failed -> treat as line
+    a = np.asarray(Image.open(cpng).convert('RGB')).astype(np.int16)
+    return PageClass(PT_PHOTO_COLOR if _is_color(a) else PT_PHOTO_GRAY, cpng)
+
+
+def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
+                  d: int, quality: int, clean: bool, descreen: float = 0.6):
+    """Strategy for PHOTO_GRAY / PHOTO_COLOR: JPEG the pre-rendered colour page and wrap
+    it to a 1-page PDF sized (via embedded dpi) to match the bitonal pages. Colour pages
+    are kept as-is; grayscale (B&W photo/mixed/stipple) pages get descreen + paper-whitening
+    + dark scan-edge cleanup (skipped on a full-bleed photo with little paper) via _clean_paper."""
+    im = Image.open(pc.color_png).convert('RGB')
+    if pc.type == PT_PHOTO_COLOR:
+        out_im = im
+    else:
+        g = np.asarray(im.convert('L'))
+        if clean and float((g > 200).mean()) > 0.10:  # paper present -> document page, not full-bleed
+            g = _clean_paper(g, d, descreen)
+        out_im = Image.fromarray(g)
     jpg = work / f'photo{page_no}.jpg'
-    (im if is_color else im.convert('L')).save(jpg, 'JPEG', quality=quality, dpi=(d, d))
-    cpng.unlink(missing_ok=True)
+    out_im.save(jpg, 'JPEG', quality=quality, dpi=(d, d))
+    pc.color_png.unlink(missing_ok=True)
     with open(out_pdf, 'wb') as f:
         f.write(img2pdf.convert(str(jpg)))
-    return is_color
 
 
 def has_text(pdf: Path, sample: int = 6, min_chars: int = 40) -> bool:
@@ -265,7 +412,8 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
 
 def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool, thresh: int,
                       min_size: int, photo_thresh: float, photo_dpi: int, jpeg_quality: int,
-                      k: int = 10) -> float:
+                      adaptive: bool = True, sauvola_k: float = 0.30, photo_clean: bool = True,
+                      photo_descreen: float = 0.6, k: int = 10) -> float:
     """Estimate the whole-file compressed/original ratio by running the per-page
     pipeline on k evenly-spaced SAMPLE pages only (cheap 'will this compress?'
     pre-check). Returns projected ratio; ~0 if unreadable (-> just try compressing).
@@ -290,22 +438,18 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool, thresh
         if not png.exists():
             continue
         got += 1
-        if photo_coverage(png, dpi) > photo_thresh:
-            d = photo_dpi or dpi
-            cpng = sub / f'c{p}.png'
-            subprocess.run([GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={p}', f'-dLastPage={p}',
-                            '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(cpng), win_long(src_p)],
-                           capture_output=True)
-            im = Image.open(cpng).convert('RGB'); a = np.asarray(im).astype(np.int16)
-            col = ((a.max(2) - a.min(2)) > 30).mean() > 0.02
-            jpg = sub / f'j{p}.jpg'
-            (im if col else im.convert('L')).save(jpg, 'JPEG', quality=jpeg_quality, dpi=(d, d))
-            comp += jpg.stat().st_size
-        else:
-            if despeckle:
-                despeckle_png(png, thresh, min_size)
+        pc = classify_page(png, p, src_p, sub, dpi, True, photo_thresh, photo_dpi)
+        if pc.type in _PT_BITONAL:
+            if adaptive or despeckle:
+                binarize_png(png, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
             r = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), png.name], cwd=sub, capture_output=True)
             comp += len(r.stdout)
+        else:
+            d = photo_dpi or dpi
+            jpg = sub / f'j{p}.jpg'
+            photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_clean, photo_descreen)
+            # photo_seg_pdf writes photo{p}.jpg then a tiny PDF wrapper; size ~ the JPEG
+            comp += (sub / f'photo{p}.jpg').stat().st_size
     shutil.rmtree(sub, ignore_errors=True)
     return ((comp / got) * n / orig) if got else 0.0
 
@@ -316,15 +460,23 @@ def compress_one(src: str, dest: str, dpi: int,
                  despeckle: bool = True, thresh: int = 125, min_size: int = 10,
                  symbol: bool = False, ocr: bool = True, language: str = 'eng',
                  detect_photos: bool = True, photo_thresh: float = 0.02,
-                 photo_dpi: int = 150, jpeg_quality: int = 50,
-                 min_savings: float = 0.10, ocr_only: bool = False,
-                 precheck: bool = True, precheck_skip: float = 0.90) -> dict:
-    """Render -> classify pages -> (bitonal JBIG2 | grayscale JPEG) -> merge -> OCR.
+                 photo_dpi: int = 150, jpeg_quality: int = 60,
+                 min_savings: float = 0.25, ocr_only: bool = False,
+                 precheck: bool = True, precheck_skip: float = 0.75,
+                 adaptive: bool = True, sauvola_k: float = 0.30,
+                 photo_clean: bool = True, photo_descreen: float = 0.6) -> dict:
+    """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
-    MIXED CONTENT (detect_photos=True): line-art/text pages are binarized to tiny
-    generic JBIG2; continuous-tone PHOTO pages (mid-tone fraction > photo_thresh)
-    are kept grayscale JPEG so they don't get wrecked by thresholding. Pages are
-    merged back in order. --no-photo / detect_photos=False forces all-bitonal.
+    PAGE-TYPE ROUTER (detect_photos=True): classify_page() sorts each page into LINE/
+    BLANK (bitonal), PHOTO_GRAY or PHOTO_COLOR; consecutive bitonal pages are grouped
+    into tiny generic JBIG2, photo pages become one JPEG each, all merged back in order.
+    --no-photo / detect_photos=False forces every page bitonal. Binarization is ADAPTIVE
+    by default (background-flatten + Sauvola: keeps faint strokes/leaders on low-contrast
+    yellowed scans, resolves gray washes cleanly); adaptive=False falls back to the fixed
+    global `thresh`. photo_clean whitens the paper and trims dark scan edges on grayscale
+    photo/mixed pages. Colour detection is cast-robust, so a sepia B&W page is kept as
+    (whitened) grayscale rather than a yellow colour JPEG. Add a page kind by extending
+    classify_page() + the router branch (see the PageType constants).
     Default is GENERIC JBIG2 (each page self-contained → renders in Chrome/Edge);
     SYMBOL mode (smaller shared dict) goes BLANK in PDFium, so it's GS/Acrobat-only
     and skips photo detection.
@@ -340,7 +492,8 @@ def compress_one(src: str, dest: str, dpi: int,
         # skip full compression and just OCR the original (avoids wasted work + growth).
         if not ocr_only and not symbol and precheck:
             proj = sample_projection(src_p, work, dpi, despeckle, thresh, min_size,
-                                     photo_thresh, photo_dpi, jpeg_quality)
+                                     photo_thresh, photo_dpi, jpeg_quality,
+                                     adaptive, sauvola_k, photo_clean, photo_descreen)
             if proj >= precheck_skip:
                 ocr_only = True
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
@@ -364,9 +517,10 @@ def compress_one(src: str, dest: str, dpi: int,
         n_color = 0
 
         def _gen_jbig2(name, k):
-            """Despeckle (if line) + generic self-contained JBIG2 for one page → .jb2 name."""
-            if despeckle:
-                despeckle_png(work / name, thresh, min_size)
+            """Binarize (adaptive/global + optional despeckle) + generic self-contained
+            JBIG2 for one page → .jb2 name."""
+            if adaptive or despeckle:
+                binarize_png(work / name, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
             jb = f'g{k:05d}.jb2'
             with open(work / jb, 'wb') as jf:
                 rr = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), name],
@@ -377,9 +531,9 @@ def compress_one(src: str, dest: str, dpi: int,
 
         if symbol:
             # SYMBOL mode: pure bitonal, one shared dictionary (GS/Acrobat only, no photo detect)
-            if despeckle:
+            if adaptive or despeckle:
                 for name in pngs:
-                    despeckle_png(work / name, thresh, min_size)
+                    binarize_png(work / name, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
             r = subprocess.run([JBIG, '-s', '-p', '-a', '-D', str(dpi), '-b', 'out', *pngs],
                                cwd=work, capture_output=True, text=True)
             if r.returncode != 0 or not (work / 'out.sym').exists():
@@ -392,22 +546,24 @@ def compress_one(src: str, dest: str, dpi: int,
                 return {'src': src_p.name, 'orig': orig, 'new': 0,
                         'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
         else:
-            # GENERIC + MIXED CONTENT: photo pages -> (colour/gray) JPEG, line pages -> JBIG2.
-            is_photo = [detect_photos and photo_coverage(work / n, dpi) > photo_thresh for n in pngs]
-            n_photo = sum(is_photo)
+            # GENERIC + PAGE-TYPE ROUTER: classify every page, then dispatch each to its
+            # strategy. Consecutive BITONAL pages (LINE/BLANK) are grouped into one
+            # multi-page JBIG2 PDF (smaller); PHOTO_* pages become one JPEG PDF each.
+            d = photo_dpi or dpi
+            classes = [classify_page(work / n, k + 1, src_p, work, dpi,
+                                     detect_photos, photo_thresh, photo_dpi)
+                       for k, n in enumerate(pngs)]
+            n_photo = sum(c.type not in _PT_BITONAL for c in classes)
+            n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
             seg_pdfs = []
             i = 0
             try:
                 while i < len(pngs):
                     seg = work / f's{i:05d}.pdf'
-                    if is_photo[i]:
-                        if photo_page_pdf(src_p, i + 1, seg, work, dpi, photo_dpi, jpeg_quality):
-                            n_color += 1
-                        i += 1
-                    else:
-                        # a run of consecutive line pages -> one multi-page JBIG2 PDF
+                    if classes[i].type in _PT_BITONAL:
+                        # a run of consecutive bitonal pages -> one multi-page JBIG2 PDF
                         jbs, j = [], i
-                        while j < len(pngs) and not is_photo[j]:
+                        while j < len(pngs) and classes[j].type in _PT_BITONAL:
                             jbs.append(_gen_jbig2(pngs[j], j)); j += 1
                         with open(seg, 'wb') as fout:
                             r = subprocess.run([PY, WRAP, '-s', *jbs], cwd=work, stdout=fout,
@@ -416,6 +572,9 @@ def compress_one(src: str, dest: str, dpi: int,
                             return {'src': src_p.name, 'orig': orig, 'new': 0,
                                     'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
                         i = j
+                    else:  # PHOTO_GRAY / PHOTO_COLOR
+                        photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_clean, photo_descreen)
+                        i += 1
                     seg_pdfs.append(seg)
             except RuntimeError as ex:
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': str(ex)}
@@ -487,8 +646,21 @@ def main():
     ap.add_argument('--workers', type=int, default=min(10, (os.cpu_count() or 4)))
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
     ap.add_argument('--no-despeckle', action='store_true', help='disable background speckle removal')
-    ap.add_argument('--threshold', type=int, default=125, help='gray<T => ink (keep low, ~125)')
+    ap.add_argument('--global-threshold', action='store_true',
+                    help='use the legacy fixed global threshold instead of adaptive binarization '
+                         '(adaptive = background-flatten + Sauvola, the default, is much better on '
+                         'low-contrast/yellowed scans)')
+    ap.add_argument('--sauvola-k', type=float, default=0.30,
+                    help='adaptive threshold sensitivity (default 0.30; lower=bolder/thicker ink, '
+                         'higher=thinner/cleaner). Ignored with --global-threshold')
+    ap.add_argument('--threshold', type=int, default=125,
+                    help='gray<T => ink for --global-threshold mode only (keep low, ~125)')
     ap.add_argument('--min-size', type=int, default=10, help='remove black blobs smaller than N px')
+    ap.add_argument('--no-photo-clean', action='store_true',
+                    help='disable paper-whitening + dark-edge cleanup on grayscale photo/mixed pages')
+    ap.add_argument('--photo-descreen', type=float, default=0.6,
+                    help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
+                         'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
     ap.add_argument('--symbol', action='store_true',
                     help='shared-dictionary mode: smaller, but BLANK in Chrome/Edge (PDFium). '
                          'Only for Ghostscript/Acrobat viewing.')
@@ -500,18 +672,18 @@ def main():
                     help='page kept as image if this fraction of tiles are continuous-tone (default 0.02)')
     ap.add_argument('--photo-dpi', type=int, default=150,
                     help='downsample photo pages to this dpi (0 = keep full render dpi; default 150)')
-    ap.add_argument('--jpeg-quality', type=int, default=50, help='JPEG quality for photo pages (default 50)')
-    ap.add_argument('--min-savings', type=float, default=0.10,
+    ap.add_argument('--jpeg-quality', type=int, default=60, help='JPEG quality for photo pages (default 60)')
+    ap.add_argument('--min-savings', type=float, default=0.25,
                     help='keep the compressed file only if it is at least this fraction smaller than '
-                         'the original; else keep the original and OCR only (default 0.10)')
+                         'the original; else keep the original and OCR only (default 0.25)')
     ap.add_argument('--ocr-only', action='store_true',
                     help='do not compress at all: copy each original and just add the OCR text layer '
                          '(skips files that already have text)')
     ap.add_argument('--no-precheck', action='store_true',
                     help='disable the sample pre-check that skips compression for files it would not shrink')
-    ap.add_argument('--precheck-threshold', type=float, default=0.90,
+    ap.add_argument('--precheck-threshold', type=float, default=0.75,
                     help='skip full compression if a sample projects the result >= this fraction of the '
-                         'original (default 0.90); the --min-savings fallback still guards the rest')
+                         'original (default 0.75); the --min-savings fallback still guards the rest')
     args = ap.parse_args()
 
     err = check_tools(want_ocr=not args.no_ocr)
@@ -544,10 +716,12 @@ def main():
               f'@ {args.workers} workers, OCR-ONLY (no compression), {ocr_desc}\n')
     else:
         photo_desc = 'no photo-detect' if (args.no_photo or args.symbol) else f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
+        bin_desc = (f'global T={args.threshold}' if args.global_threshold
+                    else f'adaptive(sauvola k={args.sauvola_k:g})')
         print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
               f'@ {args.dpi} dpi, {args.workers} workers, '
-              f'{"symbol" if args.symbol else "generic"} mode, '
-              f'{"despeckle T=" + str(args.threshold) if not args.no_despeckle else "no despeckle"}, '
+              f'{"symbol" if args.symbol else "generic"} mode, {bin_desc}, '
+              f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
               f'{photo_desc}, {ocr_desc}\n')
     if not jobs:
         print('Nothing to do.'); return
@@ -563,7 +737,9 @@ def main():
                           not args.no_ocr, args.language,
                           not args.no_photo, args.photo_threshold, args.photo_dpi, args.jpeg_quality,
                           args.min_savings, args.ocr_only,
-                          not args.no_precheck, args.precheck_threshold): s
+                          not args.no_precheck, args.precheck_threshold,
+                          not args.global_threshold, args.sauvola_k,
+                          not args.no_photo_clean, args.photo_descreen): s
                 for s, d in jobs}
         for i, fut in enumerate(cf.as_completed(futs), 1):
             res = fut.result()

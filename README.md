@@ -31,13 +31,22 @@ for the text layer.
 ## What it does, per page
 
 1. **Render** the page (Ghostscript).
-2. **Classify** it by tiling and measuring continuous-tone content:
-   - **line-art / text** → threshold + despeckle → **generic JBIG2** (tiny, crisp)
-   - **photo / halftone** → keep as **grayscale JPEG** (or **color** if the page has color, e.g. covers)
-3. Merge pages back in order.
+2. **Classify** it into a **page type** and apply that type's strategy:
+   - `LINE` / `BLANK` (text, line-art, gray-wash/shadow pages) → **background-flatten +
+     Sauvola adaptive threshold** → **generic JBIG2** (tiny, crisp)
+   - `PHOTO_GRAY` (B&W photo / halftone / stipple) → **whiten the paper + trim dark scan
+     edges** → **grayscale JPEG**
+   - `PHOTO_COLOR` (genuine color — covers, color diagrams) → **color JPEG**
+3. Merge pages back in order (consecutive bitonal pages share one JBIG2).
 4. **Skip it entirely** if a quick sample projects that compression won't shrink the
    file (already-efficient PDFs are kept as-is, never re-encoded/degraded).
 5. **OCR** — add an invisible text layer with ocrmypdf, unless the file already has one.
+
+Binarization is **adaptive by default** (local, so faint strokes and dotted leaders on
+low-contrast/yellowed scans survive and gray washes don't turn to speckle). Color
+detection is **cast-robust**, so a sepia B&W page is kept as whitened grayscale rather
+than a yellow "color" scan. To handle a new kind of page, add a page type + a
+classifier rule + a strategy (see the `PT_*` constants and `classify_page`).
 
 Runs one worker process per file (uses all cores), at below-normal priority so your
 machine stays responsive. Originals are never modified; output mirrors the source
@@ -101,14 +110,18 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu` |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--ocr-only` | off | Don't compress — copy originals and only add OCR (skips files that already have text) |
-| `--threshold T` | `125` | `gray < T` ⇒ ink (keep low, ~120–130) |
+| `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
+| `--global-threshold` | off | Legacy fixed-threshold binarization instead of adaptive (rarely better) |
+| `--threshold T` | `125` | `gray < T` ⇒ ink — **only** used with `--global-threshold` |
 | `--min-size N` | `10` | Drop black speckles smaller than N px |
 | `--no-despeckle` | off | Skip speckle removal |
+| `--no-photo-clean` | off | Don't whiten paper / trim dark edges on grayscale photo pages |
+| `--photo-descreen F` | `0.6` | Descreen strength (gaussian σ, dpi-scaled) that merges halftone grain — less dithering + smaller (`0` = off) |
 | `--photo-threshold F` | `0.02` | Fraction of continuous-tone tiles that marks a page as a photo |
 | `--photo-dpi N` | `150` | Downsample photo pages to this dpi (`0` = keep render dpi) |
-| `--jpeg-quality Q` | `50` | JPEG quality for photo pages |
-| `--min-savings F` | `0.10` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
-| `--precheck-threshold F` | `0.90` | Skip full compression if a sample projects the result ≥ this fraction of the original |
+| `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
+| `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
+| `--precheck-threshold F` | `0.75` | Skip full compression if a sample projects the result ≥ this fraction of the original |
 | `--no-precheck` | off | Always fully compress (disable the sample pre-check) |
 | `--symbol` | off | Shared-dictionary JBIG2: ~30% smaller but **blank in Chrome/Edge** (Ghostscript/Acrobat only) |
 | `--limit N` | `0` | Process only the first N files (testing) |
@@ -117,14 +130,28 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 
 ## Tuning notes (learned the hard way on real scans)
 
-- **Keep `--threshold` low (~125).** Pages with a gray shaded background wash
-  (common on foldout wiring diagrams) turn into salt-and-pepper **noise** at high
-  thresholds like 190. A low threshold sends the wash to white and keeps ink crisp.
+- **Adaptive binarization is the default and usually right.** On low-contrast/yellowed
+  scans a single global cutoff erodes faint strokes and drops dotted leaders, while a
+  high cutoff turns a gray shaded wash (common on foldout wiring diagrams) into
+  salt-and-pepper noise. The default background-flatten + Sauvola adapts locally: it
+  keeps faint ink *and* resolves the wash cleanly. A hard ink floor keeps **solid-black
+  fills** (bold display type, filled tabs) solid — Sauvola alone hollows them out.
+  `--sauvola-k` tunes boldness (lower = thicker). `--global-threshold` restores the old
+  fixed-`--threshold` behavior.
+- **Photo pages get their paper whitened.** Grayscale photo/mixed/stipple pages are
+  flat-fielded (against a bright-paper envelope, so **solid black fills stay black** and
+  aren't washed to gray) so the yellow paper goes white and the dark scan-edge border is
+  trimmed. A soft-levels tone curve then adds contrast (deeper blacks) while a highlight
+  knee keeps the photograph's bright tones from blowing out to white — so photos stay
+  rich, not washed (`--no-photo-clean` to disable, `--jpeg-quality` for detail vs size).
+  A mild **descreen** (`--photo-descreen`, default on) merges the scan's halftone dot
+  grain into smooth tone — less "dithering" on photos/shaded diagrams, and smaller files.
+- **Color detection ignores a sepia cast.** A yellowed B&W page would otherwise be
+  mistaken for "color" and kept as a large yellow JPEG; the detector white-balances
+  first, so only genuine color (covers, color diagrams) stays color.
 - **Generic (default) vs `--symbol`.** Chrome/Edge use PDFium, which renders a large
   shared JBIG2 dictionary as blank pages. Generic mode has no shared dictionary, so
   it works everywhere — at ~30% more size than symbol mode.
-- **Photos are detected per-page and kept as images.** Pure-bitonal wrecks
-  photographs; the tiled detector catches even a photo that fills only part of a page.
 - **Never grows a file.** If compression (or the sample pre-check) won't beat the
   original, the original images are kept untouched and only OCR is added.
 - **Windows long paths.** Inputs longer than 260 chars are opened via the `\\?\`
