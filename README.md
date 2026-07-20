@@ -138,7 +138,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--scan-fraction F` | `0.5` | A PDF is treated as scanned (eligible for compression) only if ≥ this fraction of sampled pages carry a full-page raster image; below this it's considered born-digital and copied untouched |
 | `--no-skip-born-digital` | off | Disable the born-digital safety check (rasterize **every** PDF, even vector/text ones) |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
-| `--timeout SECS` | `1800` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
+| `--timeout SECS` | `7200` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
 | `--no-verify-output` | off | Skip the post-write check that each output opens and its page count matches the source |
 | `--no-repair` | off | Don't attempt a Ghostscript pdfwrite repair on a malformed PDF before giving up |
 | `--no-duplicate-check` | off | Disable the default duplicate flagging (skips the per-file content hash) |
@@ -189,7 +189,7 @@ them while a run is still going):
   pre-check the real run uses, and reports the per-file plan **plus projected total
   savings**. The report/CSV are written next to the source (never inside a created dest
   tree). Run this first on a big archive to see what you're in for.
-- **`--timeout SECS`** (default 1800) — bounds the render and OCR steps per file. A
+- **`--timeout SECS`** (default 7200 = 2h) — bounds the render and OCR steps per file. A
   pathological or corrupt PDF that would otherwise hang a worker forever is marked
   `FAILED` and the batch moves on; because it leaves no output, a later re-run retries
   it. Set `0` to disable.

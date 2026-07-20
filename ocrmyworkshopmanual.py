@@ -1170,10 +1170,11 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='preview only: classify each pdf (born-digital? scanned?) and project its '
                          'compressed size, report what WOULD happen + projected savings, write NOTHING')
-    ap.add_argument('--timeout', type=int, default=1800,
+    ap.add_argument('--timeout', type=int, default=7200,
                     help='max seconds for the page-render step and for the OCR step per file; a file '
                          'that exceeds it is marked FAILED and the batch continues (0 = no timeout; '
-                         'default 1800, so one hung/corrupt pdf never stalls a large run)')
+                         'default 7200 = 2h, generous enough for the largest manuals while still '
+                         'rescuing a genuinely hung/corrupt pdf)')
     ap.add_argument('--no-verify-output', action='store_true',
                     help='skip the post-write check that each output opens and its page count matches '
                          'the source (the check flags silently-corrupt outputs in the log)')
