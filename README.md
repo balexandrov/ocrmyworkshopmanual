@@ -30,6 +30,9 @@ for the text layer.
 
 ## What it does, per page
 
+0. **Safety check first** — if a file doesn't look like a scan (it's a born-digital
+   vector/text PDF), it is **copied to the destination byte-for-byte, untouched** —
+   never rendered, binarized, or OCR'd. See [Born-digital safety](#born-digital-safety).
 1. **Render** the page (Ghostscript).
 2. **Classify** it into a **page type** and apply that type's strategy:
    - `LINE` / `BLANK` (text, line-art, gray-wash/shadow pages) → **background-flatten +
@@ -53,7 +56,9 @@ machine stays responsive. Originals are never modified; output mirrors the sourc
 tree under a sibling `"<src> (COMPRESSED)"` folder (or `--dest`). Skip-if-exists, so
 it's resumable.
 
-> ⚠️ For **scanned / image** PDFs only. Born-digital/vector PDFs would be rasterised.
+> ⚠️ For **scanned / image** PDFs only — but a built-in safety check protects
+> born-digital PDFs by copying them through untouched (see below), so it's safe to
+> point at a mixed tree. Every folder run also writes a **report log** of what happened.
 
 ---
 
@@ -84,6 +89,9 @@ isn't on PATH, point to it with `JBIG2_GS` (Ghostscript) or `JBIG2_BIN` (jbig2).
 ```bash
 # Compress + OCR a whole folder tree  ->  "<folder> (COMPRESSED)"
 python ocrmyworkshopmanual.py "/path/to/scanned/folder"
+
+# Preview a whole tree without writing anything (what would happen + projected savings)
+python ocrmyworkshopmanual.py SRC --dry-run
 
 # Test on the first few files
 python ocrmyworkshopmanual.py SRC --limit 3
@@ -124,7 +132,59 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--precheck-threshold F` | `0.75` | Skip full compression if a sample projects the result ≥ this fraction of the original |
 | `--no-precheck` | off | Always fully compress (disable the sample pre-check) |
 | `--symbol` | off | Shared-dictionary JBIG2: ~30% smaller but **blank in Chrome/Edge** (Ghostscript/Acrobat only) |
+| `--scan-fraction F` | `0.5` | A PDF is treated as scanned (eligible for compression) only if ≥ this fraction of sampled pages carry a full-page raster image; below this it's considered born-digital and copied untouched |
+| `--no-skip-born-digital` | off | Disable the born-digital safety check (rasterize **every** PDF, even vector/text ones) |
+| `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
+| `--timeout SECS` | `1800` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
+| `--no-verify-output` | off | Skip the post-write check that each output opens and its page count matches the source |
+| `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
+| `--no-log` | off | Don't write a run report log |
 | `--limit N` | `0` | Process only the first N files (testing) |
+
+---
+
+## Born-digital safety
+
+This tool rasterizes each page, which is exactly what you want for **scanned** PDFs but
+would **destroy** a born-digital (vector/text) PDF. So before touching a file it runs a
+cheap check (`looks_born_digital`): it samples pages and measures the fraction that are
+dominated by a full-page raster image. A real scan has one on ~every page; a born-digital
+file has none. If the "scan fraction" is below `--scan-fraction` (default 0.5), the file
+is **copied to the destination byte-for-byte — no render, no binarize, no OCR.**
+
+- Conservative by design: ties fall to "scanned", so a genuine scan archive is never
+  skipped. An all-raster "image PDF" (e.g. images exported to PDF) still counts as
+  scanned and gets compressed — only real vector/text content is protected.
+- A scanned PDF that already carries an OCR text layer is still detected as a scan
+  (it has full-page images) and compressed normally.
+- Disable with `--no-skip-born-digital` to force compression of everything.
+
+## Run report log
+
+After each folder run a report log is written (to the dest root by default, or `--log
+PATH`; disable with `--no-log`). It records the settings used, then **per file** what
+happened (`compressed` / `kept original` / `OCR-only` / `born-digital (copied untouched)`
+/ `FAILED`) with sizes and the born-digital scan signals, and a final **summary tally +
+total bytes saved** — so a big batch is reviewable at a glance. A machine-readable
+**`.csv` sibling** is written alongside it (one row per file: action, sizes, %, note,
+error) so you can sort/filter a collection of thousands.
+
+## Resilience & preview (for large collections)
+
+- **`--dry-run`** — preview a whole tree without writing anything: it classifies each
+  file (born-digital? scanned?), projects the compressed size via the same sample
+  pre-check the real run uses, and reports the per-file plan **plus projected total
+  savings**. The report/CSV are written next to the source (never inside a created dest
+  tree). Run this first on a big archive to see what you're in for.
+- **`--timeout SECS`** (default 1800) — bounds the render and OCR steps per file. A
+  pathological or corrupt PDF that would otherwise hang a worker forever is marked
+  `FAILED` and the batch moves on; because it leaves no output, a later re-run retries
+  it. Set `0` to disable.
+- **Output verification** (on by default; `--no-verify-output` to skip) — after writing
+  each output, it's re-opened and its page count checked against the source. A
+  silently-corrupt result is flagged loudly in the log/CSV instead of shipping unnoticed.
+- **Resumable** — outputs are skip-if-exists, so an interrupted run just continues where
+  it left off, and failed files (no output written) are retried next time.
 
 ---
 

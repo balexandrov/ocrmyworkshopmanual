@@ -13,3 +13,7 @@ tools/jbig2/
 # Work artifacts
 *.part
 *.log
+
+# Test outputs (the settings-matrix sweep). Fixtures ARE committed.
+tests/reports/
+.pytest_cache/
