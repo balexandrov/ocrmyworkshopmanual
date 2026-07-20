@@ -906,6 +906,52 @@ def _csv_row(fields: list) -> str:
     return buf.getvalue()
 
 
+# Human-friendly report columns, shared by the live-flushed CSV and the final one
+# so the two can never drift. Sizes are MB (2 dp), not raw bytes.
+REPORT_COLUMNS = ['file', 'action', 'orig size (MB)', 'new size (MB)', '%',
+                  'duplicate of', 'note', 'error']
+
+
+def _report_row(r: dict) -> list:
+    """Format one result dict as a human-friendly report row (matching REPORT_COLUMNS)."""
+    err = r.get('err')
+    o, n = r.get('orig') or 0, r.get('new') or 0
+    pct = (n * 100 // o) if (not err and o) else ''
+    return [r.get('rel', ''), _action_label(r),
+            f'{o / 1048576:.2f}' if o else '0.00',
+            f'{n / 1048576:.2f}' if (not err and n) else '',
+            pct, r.get('duplicate_of', ''), (r.get('note') or '').strip(), err or '']
+
+
+# Per-folder rollup: one summary row per source subfolder (+ a grand total).
+FOLDER_COLUMNS = ['folder', 'files', 'orig size (MB)', 'new size (MB)', '%', 'saved (MB)']
+
+
+def _folder_rows(results: list) -> list:
+    """Aggregate results by their source subfolder → one summary row each (files,
+    orig MB, new MB, %, saved MB), sorted by folder, with a final TOTAL row."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {'n': 0, 'orig': 0, 'new': 0})
+    tot = {'n': 0, 'orig': 0, 'new': 0}
+    for r in results:
+        folder = os.path.dirname(r.get('rel', '')) or '(root)'
+        for bucket in (agg[folder], tot):
+            bucket['n'] += 1
+            if not r.get('err'):
+                bucket['orig'] += r.get('orig') or 0
+                bucket['new'] += r.get('new') or 0
+
+    def row(name, a):
+        pct = (a['new'] * 100 // a['orig']) if a['orig'] else ''
+        return [name, a['n'], f"{a['orig'] / 1048576:.2f}", f"{a['new'] / 1048576:.2f}",
+                pct, f"{(a['orig'] - a['new']) / 1048576:.2f}"]
+
+    rows = [row(folder, agg[folder]) for folder in sorted(agg)]
+    if len(agg) > 1:
+        rows.append(row('(TOTAL)', tot))
+    return rows
+
+
 def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
                   t0: float, dt: float, n_found: int, skipped: int, limit: int,
                   fail: int, done: int, kept: int, dry_run: bool = False,
@@ -969,20 +1015,30 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
         L.append(f'  {word}: {mb(tot_orig):.1f} MB -> {mb(tot_new):.1f} MB '
                  f'({tot_new*100//tot_orig}% ; {saved} {mb(tot_orig-tot_new):.1f} MB)')
     L.append('')
+
+    # per-folder rollup section
+    frows = _folder_rows(results)
+    if frows:
+        L += ['-' * 78, 'Per-folder summary  (files | orig MB -> new MB | % | saved MB)', '-' * 78]
+        for folder, n, omb, nmb, pct, smb in frows:
+            L.append(f'  {folder}')
+            L.append(f'      {n} files | {omb} -> {nmb} MB | {pct}% | saved {smb} MB')
+        L.append('')
+
     log_path.write_text('\n'.join(L), encoding='utf-8')
 
-    # machine-readable sibling for filtering/sorting a large collection
-    csv_path = log_path.with_suffix('.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    # machine-readable siblings for filtering/sorting a large collection
+    with open(log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8') as f:
         w = _csv.writer(f)
-        w.writerow(['file', 'action', 'orig_bytes', 'new_bytes', 'pct_of_orig',
-                    'scan_frac', 'duplicate_of', 'note', 'error'])
+        w.writerow(REPORT_COLUMNS)
         for r in sorted(results, key=lambda x: x['rel'].lower()):
-            pct = r['new'] * 100 // r['orig'] if (not r.get('err') and r.get('orig')) else ''
-            sf = (r.get('signals') or {}).get('scan_frac', '')
-            w.writerow([r['rel'], _action_label(r), r.get('orig', ''), r.get('new', ''),
-                        pct, sf, r.get('duplicate_of', ''), (r.get('note') or '').strip(),
-                        r.get('err') or ''])
+            w.writerow(_report_row(r))
+    # per-folder summary: one row per folder (folder + aggregate numbers only)
+    with open(log_path.parent / (log_path.stem + '_by_folder.csv'), 'w', newline='',
+              encoding='utf-8') as f:
+        w = _csv.writer(f)
+        w.writerow(FOLDER_COLUMNS)
+        w.writerows(frows)
     return log_path
 
 
@@ -1220,8 +1276,7 @@ def main():
         try:
             report_log_path.parent.mkdir(parents=True, exist_ok=True)
             csv_live = open(report_log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8')
-            csv_live.write('file,action,orig_bytes,new_bytes,pct_of_orig,scan_frac,'
-                           'duplicate_of,note,error\n')
+            csv_live.write(_csv_row(REPORT_COLUMNS))
             csv_live.flush()
         except Exception as ex:
             print(f'(could not open live CSV: {ex})', file=sys.stderr); csv_live = None
@@ -1268,6 +1323,7 @@ def main():
                 if res.get('hash'):
                     if res['hash'] in seen_hash:
                         live_dup = seen_hash[res['hash']]
+                        res['duplicate_of'] = live_dup
                         dmark = f'  [dup of {live_dup}]'
                     else:
                         seen_hash[res['hash']] = res['rel']
@@ -1287,11 +1343,7 @@ def main():
                 print(f'  [{i}/{N}] {res["src"][:60]}  '
                       f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
             if csv_live:   # flush a row per file for live progress
-                pct2 = res['new'] * 100 // res['orig'] if (not res.get('err') and res.get('orig')) else ''
-                sf = (res.get('signals') or {}).get('scan_frac', '')
-                csv_live.write(_csv_row([res['rel'], _action_label(res), res.get('orig', ''),
-                                         res.get('new', ''), pct2, sf, live_dup,
-                                         (res.get('note') or '').strip(), res.get('err') or '']))
+                csv_live.write(_csv_row(_report_row(res)))
                 csv_live.flush()
 
     if csv_live:

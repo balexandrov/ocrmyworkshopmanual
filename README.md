@@ -170,9 +170,14 @@ After each folder run a report log is written (to the dest root by default, or `
 PATH`; disable with `--no-log`). It records the settings used, then **per file** what
 happened (`compressed` / `kept original` / `OCR-only` / `born-digital (copied untouched)`
 / `FAILED`) with sizes and the born-digital scan signals, and a final **summary tally +
-total bytes saved** — so a big batch is reviewable at a glance. A machine-readable
-**`.csv` sibling** is written alongside it (one row per file: action, sizes, %, note,
-error) so you can sort/filter a collection of thousands.
+total bytes saved** — so a big batch is reviewable at a glance. Two machine-readable
+**`.csv` siblings** are written alongside it and **flushed per file** (so you can open
+them while a run is still going):
+- the main `.csv` — one row per file: `file, action, orig size (MB), new size (MB), %,
+  duplicate of, note, error` (sizes in MB; filter `error` non-blank to feed `--retry-failed`).
+- a `…_by_folder.csv` — one summary row per source subfolder (`folder, files, orig size
+  (MB), new size (MB), %, saved (MB)`) plus a `(TOTAL)` row, so you can see which
+  manual-series compress well. The same rollup is printed in the `.log`.
 
 ## Resilience & preview (for large collections)
 
