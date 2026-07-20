@@ -1,0 +1,296 @@
+[
+  {
+    "file": "photo_color/FJ25 F Engine Repair Manual_p0001.pdf",
+    "type": "photo_color",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 F Engine Repair Manual.pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.554204,
+      "photo_cov": 0.8977,
+      "type": "photo_color"
+    },
+    "classifier_said": "photo_color",
+    "verified": true,
+    "note": "cruisercult FJ25 cover: vivid magenta/orange, genuine colour; cast-robust _is_color -> colour. Human-verified."
+  },
+  {
+    "file": "line/FJ25 F Engine Repair Manual_p0002.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 F Engine Repair Manual.pdf",
+    "source_page": 2,
+    "signals": {
+      "ink_frac": 0.011536,
+      "photo_cov": 0.0114,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "yellowed contents page: text + dotted leaders + faint strokes (the adaptive-Sauvola low-contrast case). Human-verified."
+  },
+  {
+    "file": "photo_gray/FJ25 F Engine Repair Manual_p0006.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 F Engine Repair Manual.pdf",
+    "source_page": 6,
+    "signals": {
+      "ink_frac": 0.126261,
+      "photo_cov": 0.1477,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "BORDERLINE mixed: text + Fig-3 solid-black manifold diagram; routed photo_gray (cov 0.148) so paper-envelope keeps solid fills black. Human-verified routing; MRC-split candidate (see mrc_split_deferred)."
+  },
+  {
+    "file": "photo_gray/FJ25 F Engine Repair Manual_p0056.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 F Engine Repair Manual.pdf",
+    "source_page": 56,
+    "signals": {
+      "ink_frac": 0.035245,
+      "photo_cov": 0.0795,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "text + real B&W halftone photo (Fig 55 cylinder boring) + table; genuine halftone -> photo_gray (soft-levels case). Human-verified."
+  },
+  {
+    "file": "photo_gray/FJ25 F Engine Repair Manual_p0028.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 F Engine Repair Manual.pdf",
+    "source_page": 28,
+    "signals": {
+      "ink_frac": 0.081485,
+      "photo_cov": 0.2045,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "SEPIA-CAST halftone photo (Fig 28 valve rocker arms): yellow paper cast (raw_chroma ~11) must NOT flag colour; cast-robust test keeps photo_gray. Human-verified FALSE-COLOUR TRAP."
+  },
+  {
+    "file": "line/1995 1HD-FT Engine Emission Control Repa_p0003.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\80 Series (1990-1998)\\Emission Control Repair Manuals\\1995 1HD-FT Engine Emission Control Repair Manual (HDJ80) [ERM111E].pdf",
+    "source_page": 3,
+    "signals": {
+      "ink_frac": 0.032557,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "1HD-FT emission title page: bold display type + solid-black section tabs (1/2/3/A) on white; ink-floor keeps solids solid. Human-verified."
+  },
+  {
+    "file": "photo_gray/1985 Land Cruiser Electrical Wiring Diag_p0009.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\60 Series (1980-1990)\\Electrical Wiring Diagrams\\1985 Land Cruiser Electrical Wiring Diagram (FJ60, BJ60, HJ60) [36713F].pdf",
+    "source_page": 9,
+    "signals": {
+      "ink_frac": 0.042965,
+      "photo_cov": 0.3918,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "BORDERLINE: landscape wiring foldout (~8533px wide) with gray vertical section-bands (cov 0.39) -> photo_gray + descreen. Line-art-dominant; MRC-split candidate. Human-verified routing."
+  },
+  {
+    "file": "line/1972 F Engine Repair Manual_p0023.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\1972 F Engine Repair Manual.pdf",
+    "source_page": 23,
+    "signals": {
+      "ink_frac": 0.040722,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "two-column trouble-shooting text; clean line/text. cruisercult 40-55. Human-verified."
+  },
+  {
+    "file": "line/2F Engine Repair Manual_p0014.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\2F Engine Repair Manual.pdf",
+    "source_page": 14,
+    "signals": {
+      "ink_frac": 0.040248,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "abbreviations table (ruled table + text); line-art. cruisercult 40-55. Human-verified."
+  },
+  {
+    "file": "line/1966 F Engine Repair Manual_p0010.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\1966 F Engine Repair Manual.pdf",
+    "source_page": 10,
+    "signals": {
+      "ink_frac": 0.014033,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "general-description spec listing; text. cruisercult 40-55. Human-verified."
+  },
+  {
+    "file": "line/FJ25 Chassis Repair Manual_p0002.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 Chassis Repair Manual.pdf",
+    "source_page": 2,
+    "signals": {
+      "ink_frac": 0.028228,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "CHASSIS FRAME text + small line diagram; text-dominant line. cruisercult 20. Human-verified."
+  },
+  {
+    "file": "line/1980 2F Engine Repair Manual (FJ60) [361_p0001.pdf",
+    "type": "line",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\60 Series (1980-1990)\\Engine Repair Manuals\\1980 2F Engine Repair Manual (FJ60) [36104E].pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.03846,
+      "photo_cov": 0.0,
+      "type": "line"
+    },
+    "classifier_said": "line",
+    "verified": true,
+    "note": "clean white title page (boxed \"2F ENGINE\"). lcw 60. Human-verified."
+  },
+  {
+    "file": "photo_gray/1972 F Engine Repair Manual_p0001.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\1972 F Engine Repair Manual.pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.653223,
+      "photo_cov": 1.0,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "dark full-bleed GRAYSCALE cover (charcoal texture, white type); genuinely monochrome -> photo_gray. cruisercult 40-55. Human-verified."
+  },
+  {
+    "file": "photo_gray/1966 F Engine Repair Manual_p0028.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\1966 F Engine Repair Manual.pdf",
+    "source_page": 28,
+    "signals": {
+      "ink_frac": 0.030266,
+      "photo_cov": 0.1023,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "STIPPLE line-drawings (Fig 2-3..2-6 disassembly) -> cov 0.10 -> photo_gray. Human read: line-art; routing is the DOCUMENTED stipple-fold (bitonal-stipple strategy deferred). cruisercult 40-55."
+  },
+  {
+    "file": "photo_gray/1980 2F Engine Repair Manual (FJ60) [361_p0033.pdf",
+    "type": "photo_gray",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\60 Series (1980-1990)\\Engine Repair Manuals\\1980 2F Engine Repair Manual (FJ60) [36104E].pdf",
+    "source_page": 33,
+    "signals": {
+      "ink_frac": 0.039665,
+      "photo_cov": 0.0446,
+      "type": "photo_gray"
+    },
+    "classifier_said": "photo_gray",
+    "verified": true,
+    "note": "engine tune-up page: text + small halftone PHOTO (Fig 2-79) -> photo_gray. lcw 60. Human-verified real-photo case (new source)."
+  },
+  {
+    "file": "photo_color/1966 F Engine Repair Manual_p0001.pdf",
+    "type": "photo_color",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\40-55 Series\\1966 F Engine Repair Manual.pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.137548,
+      "photo_cov": 1.0,
+      "type": "photo_color"
+    },
+    "classifier_said": "photo_color",
+    "verified": true,
+    "note": "tan/khaki cover w/ truck illustrations; MILD low-saturation colour -> photo_color (borderline, near the colour/gray boundary). cruisercult 40-55. Human-verified."
+  },
+  {
+    "file": "photo_color/FJ25 Chassis Repair Manual_p0001.pdf",
+    "type": "photo_color",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Cruiser Cult Manuals (cruisercult.com)\\20 Series\\FJ25 Chassis Repair Manual.pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.289983,
+      "photo_cov": 0.7273,
+      "type": "photo_color"
+    },
+    "classifier_said": "photo_color",
+    "verified": true,
+    "note": "vivid green+yellow+black cover; clear genuine colour. cruisercult 20. Human-verified."
+  },
+  {
+    "file": "photo_color/1995 1HD-FT Engine Repair Manual (HDJ80)_p0001.pdf",
+    "type": "photo_color",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\80 Series (1990-1998)\\Engine Repair Manuals\\1995 1HD-FT Engine Repair Manual (HDJ80) [RM437E].pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.46137,
+      "photo_cov": 0.4962,
+      "type": "photo_color"
+    },
+    "classifier_said": "photo_color",
+    "verified": true,
+    "note": "white cover w/ blue rectangles; genuine blue -> colour. lcw 80. Human-verified."
+  },
+  {
+    "file": "photo_color/1995 1HD-FT Engine Emission Control Repa_p0001.pdf",
+    "type": "photo_color",
+    "source": "M:\\Auto\\Backup\\Auto\\Japan\\Toyota\\Land Cruiser\\Land Cruiser Workshop Manuals (landcruiserworkshop.com)\\80 Series (1990-1998)\\Emission Control Repair Manuals\\1995 1HD-FT Engine Emission Control Repair Manual (HDJ80) [ERM111E].pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.456279,
+      "photo_cov": 0.4794,
+      "type": "photo_color"
+    },
+    "classifier_said": "photo_color",
+    "verified": true,
+    "note": "blue emission-manual cover; genuine blue -> colour. lcw 80. Human-verified (p3 of this same file is the \"line\" bold-title fixture)."
+  },
+  {
+    "file": "blank/synthetic_blank_white.pdf",
+    "type": "blank",
+    "source": "synthetic:synthetic_blank_white",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 6.6e-05,
+      "photo_cov": 0.0,
+      "type": "blank"
+    },
+    "classifier_said": "blank",
+    "verified": true,
+    "note": "SYNTHETIC blank (paper=250, ink=0.000066); corpus has no real blank verso. Reproducible via make_blank_fixture.py."
+  },
+  {
+    "file": "blank/synthetic_blank_cream.pdf",
+    "type": "blank",
+    "source": "synthetic:synthetic_blank_cream",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.000103,
+      "photo_cov": 0.0,
+      "type": "blank"
+    },
+    "classifier_said": "blank",
+    "verified": true,
+    "note": "SYNTHETIC blank (paper=244, ink=0.000103); corpus has no real blank verso. Reproducible via make_blank_fixture.py."
+  }
+]
