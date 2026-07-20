@@ -65,6 +65,8 @@ Dependencies:
 
 import argparse
 import concurrent.futures as cf
+import csv
+import hashlib
 import os
 import shutil
 import subprocess
@@ -477,6 +479,21 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
     return frac < scan_fraction, sig
 
 
+def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
+    """Try to repair a malformed/corrupt PDF by rewriting it through Ghostscript's
+    pdfwrite device (which tolerates and reconstructs a lot of broken structure).
+    Returns the repaired Path on success, else None. Used as a fallback before a
+    file is given up on — one bad download shouldn't just be lost in a big batch."""
+    out = work / 'repaired.pdf'
+    try:
+        r = subprocess.run(
+            [GS, '-o', str(out), '-sDEVICE=pdfwrite', '-dQUIET', '-dNOPAUSE', '-dBATCH',
+             win_long(src_p)], capture_output=True, text=True, timeout=timeout or None)
+    except Exception:
+        return None
+    return out if (r.returncode == 0 and out.exists() and out.stat().st_size > 0) else None
+
+
 def _verify_output(dest_p: Path, expect_pages) -> str:
     """Cheap trust check on a written output: it must open as a PDF and (when we know
     the expected page count) have that many pages. Returns '' if OK, else a warning
@@ -578,7 +595,7 @@ def compress_one(src: str, dest: str, dpi: int,
                  adaptive: bool = True, sauvola_k: float = 0.30,
                  photo_clean: bool = True, photo_descreen: float = 0.6,
                  skip_born_digital: bool = True, scan_fraction: float = 0.5,
-                 timeout: int = 0, verify_output: bool = True) -> dict:
+                 timeout: int = 0, verify_output: bool = True, repair: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER (detect_photos=True): classify_page() sorts each page into LINE/
@@ -636,11 +653,26 @@ def compress_one(src: str, dest: str, dpi: int,
             res['action'] = 'ocr_only'
             return res
         # 1) render pages to grayscale PNG
-        r = subprocess.run(
-            [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-             '-sOutputFile=' + str(work / 'p%04d.png'), win_long(src_p)],
-            capture_output=True, text=True, timeout=timeout or None)
+        render_src = src_p
+        did_repair = False
+
+        def _render():
+            return subprocess.run(
+                [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                 '-sOutputFile=' + str(work / 'p%04d.png'), win_long(render_src)],
+                capture_output=True, text=True, timeout=timeout or None)
+
+        r = _render()
         pngs = sorted(p.name for p in work.glob('p*.png'))
+        if (r.returncode != 0 or not pngs) and repair:
+            # malformed PDF? try a Ghostscript pdfwrite rewrite, then render the repaired copy
+            fixed = _gs_repair(src_p, work, timeout)
+            if fixed:
+                render_src, did_repair = fixed, True
+                for old in work.glob('p*.png'):
+                    old.unlink(missing_ok=True)
+                r = _render()
+                pngs = sorted(p.name for p in work.glob('p*.png'))
         if r.returncode != 0 or not pngs:
             return {'src': src_p.name, 'orig': orig, 'new': 0,
                     'err': f'render failed rc={r.returncode} {r.stderr[:200]}'}
@@ -682,7 +714,7 @@ def compress_one(src: str, dest: str, dpi: int,
             # strategy. Consecutive BITONAL pages (LINE/BLANK) are grouped into one
             # multi-page JBIG2 PDF (smaller); PHOTO_* pages become one JPEG PDF each.
             d = photo_dpi or dpi
-            classes = [classify_page(work / n, k + 1, src_p, work, dpi,
+            classes = [classify_page(work / n, k + 1, render_src, work, dpi,
                                      detect_photos, photo_thresh, photo_dpi)
                        for k, n in enumerate(pngs)]
             n_photo = sum(c.type not in _PT_BITONAL for c in classes)
@@ -746,6 +778,8 @@ def compress_one(src: str, dest: str, dpi: int,
             note = f' [{n_photo} photo pg: {", ".join(bits)}]'
         else:
             note = ''
+        if did_repair:
+            note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
                              len(pngs), kept_original, note, timeout, verify_output)
         res['action'] = 'kept_original' if kept_original else 'compressed'
@@ -828,6 +862,7 @@ def _action_label(res: dict) -> str:
         'ocr_only': 'OCR-only (not compressed)',
         'kept_original': 'kept original',
         'compressed': 'compressed',
+        'duplicate': 'duplicate (copied output)',
     }.get(res.get('action'), 'processed')
 
 
@@ -884,7 +919,7 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
 
     L += ['', '-' * 78, 'Summary', '-' * 78]
     for label in ('compressed', 'kept original', 'OCR-only (not compressed)',
-                  'born-digital (copied untouched)', 'FAILED'):
+                  'born-digital (copied untouched)', 'duplicate (copied output)', 'FAILED'):
         L.append(f'  {label:33s}: {counts.get(label, 0)}')
     L.append(f'  {"skipped (dest already existed)":33s}: {skipped}')
     L.append('')
@@ -908,6 +943,64 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
             w.writerow([r['rel'], _action_label(r), r.get('orig', ''), r.get('new', ''),
                         pct, sf, (r.get('note') or '').strip(), r.get('err') or ''])
     return log_path
+
+
+# ── Config file / dedup / retry helpers ──────────────────────────────────────
+
+def _apply_config_defaults(ap: argparse.ArgumentParser) -> None:
+    """Load a TOML config of default option values and fold them into the parser
+    (so an explicit CLI flag still overrides). Uses --config if given, else
+    ./ocrmyworkshopmanual.toml when present. Keys are long option names with dashes
+    as underscores (e.g. `dpi = 300`, `no_ocr = true`, `dest = "OUT"`)."""
+    import tomllib
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', type=Path)
+    known, _ = pre.parse_known_args()
+    path = known.config or (Path('ocrmyworkshopmanual.toml')
+                            if Path('ocrmyworkshopmanual.toml').exists() else None)
+    if not path:
+        return
+    if not path.exists():
+        print(f'ERROR: config file not found: {path}', file=sys.stderr); sys.exit(1)
+    try:
+        with open(path, 'rb') as f:
+            cfg = tomllib.load(f)
+    except Exception as ex:
+        print(f'ERROR: could not parse config {path}: {ex}', file=sys.stderr); sys.exit(1)
+    types = {a.dest: a.type for a in ap._actions}
+    valid = set(types) - {'help', 'config', 'src'}
+    mapped, unknown = {}, []
+    for k, v in cfg.items():
+        dest = k.replace('-', '_')
+        if dest in valid:
+            if types.get(dest) is Path and isinstance(v, str):
+                v = Path(v)
+            mapped[dest] = v
+        else:
+            unknown.append(k)
+    if unknown:
+        print(f'WARNING: ignoring unknown config keys: {", ".join(unknown)}', file=sys.stderr)
+    ap.set_defaults(**mapped)
+    print(f'Config: loaded {len(mapped)} setting(s) from {path}')
+
+
+def _file_hash(path: Path, chunk: int = 1 << 20) -> str:
+    """SHA-1 of a file's bytes (for byte-identical duplicate detection)."""
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _read_failed_rels(csv_path: Path) -> list:
+    """Return the rel-paths marked FAILED (non-empty error column) in a report CSV."""
+    rels = []
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            if (row.get('error') or '').strip():
+                rels.append(row['file'])
+    return rels
 
 
 # ── Batch driver ─────────────────────────────────────────────────────────────
@@ -981,6 +1074,24 @@ def main():
     ap.add_argument('--no-verify-output', action='store_true',
                     help='skip the post-write check that each output opens and its page count matches '
                          'the source (the check flags silently-corrupt outputs in the log)')
+    ap.add_argument('--no-repair', action='store_true',
+                    help='do not attempt a Ghostscript pdfwrite repair on a malformed pdf before '
+                         'giving up on it (repair is on by default)')
+    ap.add_argument('--min-free-gb', type=float, default=1.0,
+                    help='abort before starting if the destination drive has less than this many GB '
+                         'free (default 1.0; 0 disables the check)')
+    ap.add_argument('--skip-duplicates', action='store_true',
+                    help='detect byte-identical duplicate PDFs (by content hash); process each unique '
+                         'file once and copy its output to the duplicate paths (saves compute on '
+                         'collections with repeats)')
+    ap.add_argument('--retry-failed', type=Path, default=None, metavar='REPORT.csv',
+                    help='reprocess ONLY the files marked FAILED in a previous run report .csv '
+                         '(re-runs them even if a dest exists)')
+    ap.add_argument('--config', type=Path, default=None,
+                    help='TOML config file of default option values (CLI flags override it); if omitted, '
+                         './ocrmyworkshopmanual.toml is loaded when present. Keys match long option '
+                         'names with dashes as underscores, e.g. dpi = 300, no_ocr = true')
+    _apply_config_defaults(ap)
     args = ap.parse_args()
 
     err = check_tools(want_ocr=not args.no_ocr)
@@ -992,14 +1103,53 @@ def main():
         print(f'ERROR: source folder not found: {src_root}', file=sys.stderr); sys.exit(1)
     dest_root = args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)')
 
+    # disk-space guard: abort before doing work if the dest drive is nearly full
+    if args.min_free_gb and not args.dry_run:
+        try:
+            probe = dest_root if dest_root.exists() else dest_root.parent
+            free_gb = shutil.disk_usage(str(probe)).free / 1e9
+            if free_gb < args.min_free_gb:
+                print(f'ERROR: only {free_gb:.1f} GB free on the destination drive '
+                      f'(< --min-free-gb {args.min_free_gb}); aborting before writing.',
+                      file=sys.stderr)
+                sys.exit(1)
+        except Exception:
+            pass
+
     pdfs = sorted(p for p in src_root.rglob('*.pdf'))
-    jobs = []
-    for src in pdfs:
-        dest = dest_root / src.relative_to(src_root)
-        if dest.exists():
-            continue
-        jobs.append((str(src), str(dest)))
-    skipped = len(pdfs) - len(jobs)
+    dup_copies = []   # (dup_dest, rep_dest, rel) pairs to fulfil after the run (--skip-duplicates)
+
+    if args.retry_failed:
+        if not args.retry_failed.exists():
+            print(f'ERROR: --retry-failed report not found: {args.retry_failed}',
+                  file=sys.stderr); sys.exit(1)
+        want = sorted(set(_read_failed_rels(args.retry_failed)))
+        jobs = [(str(src_root / rel), str(dest_root / rel)) for rel in want
+                if (src_root / rel).exists()]
+        skipped = len(pdfs) - len(jobs)
+        print(f'Retry-failed mode: {len(jobs)} previously-FAILED file(s) '
+              f'from {args.retry_failed.name}')
+    else:
+        jobs = []
+        seen_hash = {}   # content-hash -> representative rel (for --skip-duplicates)
+        dedup = args.skip_duplicates and not args.dry_run
+        for src in pdfs:
+            rel = src.relative_to(src_root)
+            dest = dest_root / rel
+            if dedup:
+                try:
+                    h = _file_hash(src)
+                except Exception:
+                    h = None
+                if h and h in seen_hash:
+                    dup_copies.append((str(dest), str(dest_root / seen_hash[h]), str(rel)))
+                    continue
+                if h:
+                    seen_hash[h] = rel
+            if dest.exists():
+                continue
+            jobs.append((str(src), str(dest)))
+        skipped = len(pdfs) - len(jobs) - len(dup_copies)
     if args.limit:
         jobs = jobs[:args.limit]
 
@@ -1053,17 +1203,21 @@ def main():
                               not args.global_threshold, args.sauvola_k,
                               not args.no_photo_clean, args.photo_descreen,
                               not args.no_skip_born_digital, args.scan_fraction,
-                              args.timeout, not args.no_verify_output): (s, d)
+                              args.timeout, not args.no_verify_output,
+                              not args.no_repair): (s, d)
                     for s, d in jobs}
-        tag = 'would' if args.dry_run else ''
+        N = len(jobs)
         for i, fut in enumerate(cf.as_completed(futs), 1):
             s, d = futs[fut]
             res = fut.result()
             res['rel'] = os.path.relpath(s, str(src_root))
             results.append(res)
+            elapsed = time.time() - t0
+            eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
+            eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
             if res['err']:
                 fail += 1
-                print(f'  [{i}/{len(jobs)}] FAIL {res["src"]}: {res["err"]}')
+                print(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{eta_str}')
             else:
                 done += 1
                 if res.get('kept'):
@@ -1071,8 +1225,30 @@ def main():
                 tot_orig += res['orig']; tot_new += res['new']
                 pct = res['new'] * 100 // res['orig'] if res['orig'] else 0
                 arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
-                print(f'  [{i}/{len(jobs)}] {res["src"][:66]}  '
-                      f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}')
+                print(f'  [{i}/{N}] {res["src"][:60]}  '
+                      f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{eta_str}')
+
+    # fulfil duplicates: copy each unique file's output to its byte-identical twins
+    for dup_dest, rep_dest, rel in dup_copies:
+        r = {'src': Path(rel).name, 'rel': rel, 'action': 'duplicate',
+             'orig': (src_root / rel).stat().st_size if (src_root / rel).exists() else 0,
+             'new': 0, 'kept': True, 'err': None, 'pages': None}
+        try:
+            if Path(rep_dest).exists():
+                Path(dup_dest).parent.mkdir(parents=True, exist_ok=True)
+                tmp = Path(dup_dest + '.part')
+                shutil.copyfile(rep_dest, str(tmp))
+                os.replace(str(tmp), dup_dest)
+                r['new'] = Path(dup_dest).stat().st_size
+                r['note'] = f' (duplicate of {os.path.relpath(rep_dest, str(dest_root))} — copied output)'
+                done += 1; kept += 1; tot_orig += r['orig']; tot_new += r['new']
+            else:
+                r['err'] = 'duplicate representative has no output (rep failed?)'
+                fail += 1
+            print(f'  [dup] {rel}{r.get("note", ": " + (r["err"] or ""))}')
+        except Exception as ex:
+            r['err'] = f'duplicate copy failed: {ex}'; fail += 1
+        results.append(r)
 
     dt = time.time() - t0
     n_born = sum(1 for r in results if r.get('action') == 'born_digital')
@@ -1101,6 +1277,8 @@ def main():
             'precheck_threshold': args.precheck_threshold,
             'born_digital_check': not args.no_skip_born_digital, 'scan_fraction': args.scan_fraction,
             'timeout': args.timeout, 'verify_output': not args.no_verify_output,
+            'repair': not args.no_repair, 'skip_duplicates': args.skip_duplicates,
+            'retry_failed': str(args.retry_failed) if args.retry_failed else False,
             'dry_run': args.dry_run,
         }
         try:

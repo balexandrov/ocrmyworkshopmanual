@@ -137,6 +137,11 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `1800` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
 | `--no-verify-output` | off | Skip the post-write check that each output opens and its page count matches the source |
+| `--no-repair` | off | Don't attempt a Ghostscript pdfwrite repair on a malformed PDF before giving up |
+| `--skip-duplicates` | off | Detect byte-identical duplicate PDFs (content hash); process each unique file once and copy its output to the twins |
+| `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
+| `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
+| `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
 | `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
 | `--no-log` | off | Don't write a run report log |
 | `--limit N` | `0` | Process only the first N files (testing) |
@@ -185,6 +190,38 @@ error) so you can sort/filter a collection of thousands.
   silently-corrupt result is flagged loudly in the log/CSV instead of shipping unnoticed.
 - **Resumable** — outputs are skip-if-exists, so an interrupted run just continues where
   it left off, and failed files (no output written) are retried next time.
+- **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
+  `FAILED` (e.g. after freeing disk, fixing a tool, or raising `--timeout`), without
+  re-scanning the whole tree.
+- **`--skip-duplicates`** — large collections often contain byte-identical copies of the
+  same PDF. This hashes each source, compresses each unique file **once**, and copies the
+  result to the duplicate paths — so the output tree still mirrors the input, at a
+  fraction of the compute.
+- **PDF repair** (on by default; `--no-repair` to disable) — if a file is too malformed to
+  render, it's rewritten through Ghostscript's `pdfwrite` and retried once before being
+  given up on. One bad download shouldn't be silently lost.
+- **`--min-free-gb N`** (default 1.0) — aborts up front if the destination drive is nearly
+  full, instead of failing partway through a long run.
+
+## Config file
+
+Instead of retyping flags, drop an `ocrmyworkshopmanual.toml` next to where you run the
+tool (or point at one with `--config`). Keys are the long option names with dashes as
+underscores; any explicit CLI flag still overrides the file.
+
+```toml
+# ocrmyworkshopmanual.toml
+dpi = 200
+workers = 8
+language = "eng+deu"
+jpeg_quality = 60
+skip_duplicates = true
+min_free_gb = 5.0
+# no_ocr = true
+# scan_fraction = 0.5
+```
+
+See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
 
 ---
 
