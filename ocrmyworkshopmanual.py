@@ -888,6 +888,24 @@ def _flag_duplicates(results: list) -> int:
     return sets
 
 
+def _report_path(log_path, dest_root: Path, report_dir, t0: float, dry_run: bool) -> Path:
+    """The report .log path: an explicit --log if given, else a timestamped file in
+    `report_dir` (dry-run: beside the source) or the dest root."""
+    if log_path:
+        return Path(log_path)
+    ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
+    suffix = '_DRYRUN' if dry_run else ''
+    return (report_dir or dest_root) / f'_ocrmyworkshopmanual_report_{ts}{suffix}.log'
+
+
+def _csv_row(fields: list) -> str:
+    """One correctly-quoted CSV line (used for the per-file live-flushed CSV)."""
+    import io
+    buf = io.StringIO()
+    csv.writer(buf).writerow(fields)
+    return buf.getvalue()
+
+
 def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
                   t0: float, dt: float, n_found: int, skipped: int, limit: int,
                   fail: int, done: int, kept: int, dry_run: bool = False,
@@ -898,10 +916,7 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
     Returns the .log path. In dry_run mode sizes are projections, not actuals."""
     from collections import Counter
     import csv as _csv
-    ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
-    suffix = '_DRYRUN' if dry_run else ''
-    log_path = Path(log_path) if log_path else \
-        (report_dir or dest_root) / f'_ocrmyworkshopmanual_report_{ts}{suffix}.log'
+    log_path = _report_path(log_path, dest_root, report_dir, t0, dry_run)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts = Counter(_action_label(r) for r in results)
@@ -1195,6 +1210,22 @@ def main():
     done = fail = kept = 0
     tot_orig = tot_new = 0
     results = []  # accumulated for the run log
+
+    # open the report CSV up front and flush a row per file, so progress is visible
+    # live (the full .log + a final complete .csv are (re)written at the end).
+    report_dir = src_root.parent if args.dry_run else None
+    report_log_path = _report_path(args.log, dest_root, report_dir, t0, args.dry_run)
+    csv_live = None
+    if not args.no_log:
+        try:
+            report_log_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_live = open(report_log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8')
+            csv_live.write('file,action,orig_bytes,new_bytes,pct_of_orig,scan_frac,'
+                           'duplicate_of,note,error\n')
+            csv_live.flush()
+        except Exception as ex:
+            print(f'(could not open live CSV: {ex})', file=sys.stderr); csv_live = None
+
     with cf.ProcessPoolExecutor(max_workers=args.workers,
                                 initializer=set_below_normal_priority) as ex:
         if args.dry_run:
@@ -1220,14 +1251,15 @@ def main():
                               not args.no_repair): (s, d)
                     for s, d in jobs}
         N = len(jobs)
-        dup_check = not args.no_duplicate_check
+        # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
+        dup_check = not args.no_duplicate_check and not args.dry_run
         seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
         for i, fut in enumerate(cf.as_completed(futs), 1):
             s, d = futs[fut]
             res = fut.result()
             res['rel'] = os.path.relpath(s, str(src_root))
             results.append(res)
-            dmark = ''
+            dmark, live_dup = '', ''
             if dup_check:
                 try:
                     res['hash'] = _file_hash(Path(s))
@@ -1235,7 +1267,8 @@ def main():
                     res['hash'] = None
                 if res.get('hash'):
                     if res['hash'] in seen_hash:
-                        dmark = f'  [dup of {seen_hash[res["hash"]]}]'
+                        live_dup = seen_hash[res['hash']]
+                        dmark = f'  [dup of {live_dup}]'
                     else:
                         seen_hash[res['hash']] = res['rel']
             elapsed = time.time() - t0
@@ -1253,8 +1286,17 @@ def main():
                 arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
                 print(f'  [{i}/{N}] {res["src"][:60]}  '
                       f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
+            if csv_live:   # flush a row per file for live progress
+                pct2 = res['new'] * 100 // res['orig'] if (not res.get('err') and res.get('orig')) else ''
+                sf = (res.get('signals') or {}).get('scan_frac', '')
+                csv_live.write(_csv_row([res['rel'], _action_label(res), res.get('orig', ''),
+                                         res.get('new', ''), pct2, sf, live_dup,
+                                         (res.get('note') or '').strip(), res.get('err') or '']))
+                csv_live.flush()
 
-    dup_sets = _flag_duplicates(results) if not args.no_duplicate_check else 0
+    if csv_live:
+        csv_live.close()
+    dup_sets = _flag_duplicates(results) if dup_check else 0
     dt = time.time() - t0
     n_born = sum(1 for r in results if r.get('action') == 'born_digital')
     verb = 'Previewed' if args.dry_run else 'processed'
@@ -1291,9 +1333,9 @@ def main():
             'dry_run': args.dry_run,
         }
         try:
-            # in dry-run write the report beside the source, not inside a created dest tree
-            report_dir = src_root.parent if args.dry_run else None
-            log_path = write_run_log(args.log, dest_root, src_root, results, settings,
+            # reuse the same path the live CSV was written to (report_dir/report_log_path
+            # were computed before the run); write_run_log (re)writes the full .log + .csv
+            log_path = write_run_log(report_log_path, dest_root, src_root, results, settings,
                                      t0, dt, len(pdfs), skipped, args.limit, fail, done, kept,
                                      dry_run=args.dry_run, report_dir=report_dir)
             print(f'Log: {log_path}  (+ .csv)')
