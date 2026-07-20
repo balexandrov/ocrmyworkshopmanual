@@ -25,6 +25,7 @@ writes a report log (which file, what was done, final stats); disable with --no-
 
 Usage:
   python ocrmyworkshopmanual.py "M:\\path\\to\\folder"           # compress + OCR a tree
+  python ocrmyworkshopmanual.py "one_manual.pdf"                # a single file -> sibling (COMPRESSED).pdf
   python ocrmyworkshopmanual.py SRC --dry-run                    # preview only, write nothing
   python ocrmyworkshopmanual.py SRC --dest OUT --workers 10
   python ocrmyworkshopmanual.py SRC --limit 3                    # test first N files
@@ -1105,9 +1106,12 @@ def _read_failed_rels(csv_path: Path) -> list:
 def main():
     ap = argparse.ArgumentParser(
         description='Compress scanned PDFs to small generic-JBIG2 and add a searchable OCR text layer.')
-    ap.add_argument('src', type=Path, help='source folder tree of scanned PDFs')
+    ap.add_argument('src', type=Path,
+                    help='source: a folder tree of scanned PDFs, OR a single .pdf file')
     ap.add_argument('--dest', type=Path, default=None,
-                    help='output root (default: sibling "<src> (COMPRESSED)")')
+                    help='output root for a folder (default: sibling "<src> (COMPRESSED)"), '
+                         'or the output path/folder for a single-file src (default: sibling '
+                         '"<name> (COMPRESSED).pdf")')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
     ap.add_argument('--workers', type=int, default=min(10, (os.cpu_count() or 4)))
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
@@ -1197,9 +1201,27 @@ def main():
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
 
     src_root = args.src
-    if not src_root.is_dir():
-        print(f'ERROR: source folder not found: {src_root}', file=sys.stderr); sys.exit(1)
-    dest_root = args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)')
+    # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
+    # the filename; default output is a sibling "<name> (COMPRESSED).pdf".
+    single_dest = None
+    if src_root.is_file():
+        if src_root.suffix.lower() != '.pdf':
+            print(f'ERROR: not a PDF: {src_root}', file=sys.stderr); sys.exit(1)
+        rel_base = src_root.parent
+        if args.dest:
+            single_dest = args.dest if args.dest.suffix.lower() == '.pdf' \
+                else args.dest / src_root.name
+        else:
+            single_dest = src_root.with_name(f'{src_root.stem} (COMPRESSED){src_root.suffix}')
+        dest_root = single_dest.parent
+        pdfs = [src_root]
+    elif src_root.is_dir():
+        rel_base = src_root
+        dest_root = args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)')
+        pdfs = sorted(p for p in src_root.rglob('*.pdf'))
+    else:
+        print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
+              file=sys.stderr); sys.exit(1)
 
     # disk-space guard: abort before doing work if the dest drive is nearly full
     if args.min_free_gb and not args.dry_run:
@@ -1214,9 +1236,10 @@ def main():
         except Exception:
             pass
 
-    pdfs = sorted(p for p in src_root.rglob('*.pdf'))
-
-    if args.retry_failed:
+    if single_dest is not None:
+        jobs = [] if single_dest.exists() else [(str(src_root), str(single_dest))]
+        skipped = len(pdfs) - len(jobs)
+    elif args.retry_failed:
         if not args.retry_failed.exists():
             print(f'ERROR: --retry-failed report not found: {args.retry_failed}',
                   file=sys.stderr); sys.exit(1)
@@ -1229,7 +1252,7 @@ def main():
     else:
         jobs = []
         for src in pdfs:
-            dest = dest_root / src.relative_to(src_root)
+            dest = dest_root / src.relative_to(rel_base)
             if dest.exists():
                 continue
             jobs.append((str(src), str(dest)))
@@ -1312,7 +1335,7 @@ def main():
         for i, fut in enumerate(cf.as_completed(futs), 1):
             s, d = futs[fut]
             res = fut.result()
-            res['rel'] = os.path.relpath(s, str(src_root))
+            res['rel'] = os.path.relpath(s, str(rel_base))
             results.append(res)
             dmark, live_dup = '', ''
             if dup_check:
