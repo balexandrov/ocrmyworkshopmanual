@@ -1113,7 +1113,9 @@ def main():
                          'or the output path/folder for a single-file src (default: sibling '
                          '"<name> (COMPRESSED).pdf")')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
-    ap.add_argument('--workers', type=int, default=min(10, (os.cpu_count() or 4)))
+    ap.add_argument('--workers', type=int, default=(os.cpu_count() or 4),
+                    help='parallel worker processes (default: one per logical core, '
+                         'or 4 if the core count cannot be detected)')
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
     ap.add_argument('--no-despeckle', action='store_true', help='disable background speckle removal')
     ap.add_argument('--global-threshold', action='store_true',

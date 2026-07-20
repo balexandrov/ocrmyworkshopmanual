@@ -117,7 +117,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `src` (positional) | — | Source folder tree of scanned PDFs (required) |
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
-| `--workers N` | `min(10, cores)` | Files processed in parallel |
+| `--workers N` | one per core (or 4) | Files processed in parallel |
 | `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu` |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--ocr-only` | off | Don't compress — copy originals and only add OCR (skips files that already have text) |
