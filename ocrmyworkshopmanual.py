@@ -862,8 +862,30 @@ def _action_label(res: dict) -> str:
         'ocr_only': 'OCR-only (not compressed)',
         'kept_original': 'kept original',
         'compressed': 'compressed',
-        'duplicate': 'duplicate (copied output)',
     }.get(res.get('action'), 'processed')
+
+
+def _flag_duplicates(results: list) -> int:
+    """Annotate results that are byte-identical (share a content hash). Does NOT skip
+    or merge anything — every file is still fully processed and gets its own output;
+    twins (which may legitimately belong to different manuals) are only FLAGGED in the
+    report so you're aware of them. Returns the number of duplicate sets found."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in results:
+        if r.get('hash'):
+            groups[r['hash']].append(r)
+    sets = 0
+    for members in groups.values():
+        if len(members) > 1:
+            sets += 1
+            rels = sorted(m['rel'] for m in members)
+            for m in members:
+                others = [x for x in rels if x != m['rel']]
+                m['duplicate_of'] = '; '.join(others)
+                m['note'] = (m.get('note') or '') + \
+                    f' [DUPLICATE — same content as: {", ".join(others)}]'
+    return sets
 
 
 def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
@@ -919,9 +941,12 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
 
     L += ['', '-' * 78, 'Summary', '-' * 78]
     for label in ('compressed', 'kept original', 'OCR-only (not compressed)',
-                  'born-digital (copied untouched)', 'duplicate (copied output)', 'FAILED'):
+                  'born-digital (copied untouched)', 'FAILED'):
         L.append(f'  {label:33s}: {counts.get(label, 0)}')
     L.append(f'  {"skipped (dest already existed)":33s}: {skipped}')
+    n_dup = sum(1 for r in results if r.get('duplicate_of'))
+    if n_dup:
+        L.append(f'  {"duplicate files (flagged, still processed)":33s}: {n_dup}')
     L.append('')
     if tot_orig:
         word = 'Projected total' if dry_run else 'Total size'
@@ -936,12 +961,13 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.writer(f)
         w.writerow(['file', 'action', 'orig_bytes', 'new_bytes', 'pct_of_orig',
-                    'scan_frac', 'note', 'error'])
+                    'scan_frac', 'duplicate_of', 'note', 'error'])
         for r in sorted(results, key=lambda x: x['rel'].lower()):
             pct = r['new'] * 100 // r['orig'] if (not r.get('err') and r.get('orig')) else ''
             sf = (r.get('signals') or {}).get('scan_frac', '')
             w.writerow([r['rel'], _action_label(r), r.get('orig', ''), r.get('new', ''),
-                        pct, sf, (r.get('note') or '').strip(), r.get('err') or ''])
+                        pct, sf, r.get('duplicate_of', ''), (r.get('note') or '').strip(),
+                        r.get('err') or ''])
     return log_path
 
 
@@ -1080,10 +1106,11 @@ def main():
     ap.add_argument('--min-free-gb', type=float, default=1.0,
                     help='abort before starting if the destination drive has less than this many GB '
                          'free (default 1.0; 0 disables the check)')
-    ap.add_argument('--skip-duplicates', action='store_true',
-                    help='detect byte-identical duplicate PDFs (by content hash); process each unique '
-                         'file once and copy its output to the duplicate paths (saves compute on '
-                         'collections with repeats)')
+    ap.add_argument('--no-duplicate-check', action='store_true',
+                    help='disable the default duplicate flagging (which hashes each processed file and '
+                         'notes in the report when two files are byte-identical). Files are ALWAYS '
+                         'processed and get their own output — duplicates are only flagged, never '
+                         'skipped (byte-identical files can legitimately belong to different manuals)')
     ap.add_argument('--retry-failed', type=Path, default=None, metavar='REPORT.csv',
                     help='reprocess ONLY the files marked FAILED in a previous run report .csv '
                          '(re-runs them even if a dest exists)')
@@ -1117,7 +1144,6 @@ def main():
             pass
 
     pdfs = sorted(p for p in src_root.rglob('*.pdf'))
-    dup_copies = []   # (dup_dest, rep_dest, rel) pairs to fulfil after the run (--skip-duplicates)
 
     if args.retry_failed:
         if not args.retry_failed.exists():
@@ -1131,25 +1157,12 @@ def main():
               f'from {args.retry_failed.name}')
     else:
         jobs = []
-        seen_hash = {}   # content-hash -> representative rel (for --skip-duplicates)
-        dedup = args.skip_duplicates and not args.dry_run
         for src in pdfs:
-            rel = src.relative_to(src_root)
-            dest = dest_root / rel
-            if dedup:
-                try:
-                    h = _file_hash(src)
-                except Exception:
-                    h = None
-                if h and h in seen_hash:
-                    dup_copies.append((str(dest), str(dest_root / seen_hash[h]), str(rel)))
-                    continue
-                if h:
-                    seen_hash[h] = rel
+            dest = dest_root / src.relative_to(src_root)
             if dest.exists():
                 continue
             jobs.append((str(src), str(dest)))
-        skipped = len(pdfs) - len(jobs) - len(dup_copies)
+        skipped = len(pdfs) - len(jobs)
     if args.limit:
         jobs = jobs[:args.limit]
 
@@ -1207,17 +1220,30 @@ def main():
                               not args.no_repair): (s, d)
                     for s, d in jobs}
         N = len(jobs)
+        dup_check = not args.no_duplicate_check
+        seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
         for i, fut in enumerate(cf.as_completed(futs), 1):
             s, d = futs[fut]
             res = fut.result()
             res['rel'] = os.path.relpath(s, str(src_root))
             results.append(res)
+            dmark = ''
+            if dup_check:
+                try:
+                    res['hash'] = _file_hash(Path(s))
+                except Exception:
+                    res['hash'] = None
+                if res.get('hash'):
+                    if res['hash'] in seen_hash:
+                        dmark = f'  [dup of {seen_hash[res["hash"]]}]'
+                    else:
+                        seen_hash[res['hash']] = res['rel']
             elapsed = time.time() - t0
             eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
             eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
             if res['err']:
                 fail += 1
-                print(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{eta_str}')
+                print(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{dmark}{eta_str}')
             else:
                 done += 1
                 if res.get('kept'):
@@ -1226,30 +1252,9 @@ def main():
                 pct = res['new'] * 100 // res['orig'] if res['orig'] else 0
                 arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
                 print(f'  [{i}/{N}] {res["src"][:60]}  '
-                      f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{eta_str}')
+                      f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
 
-    # fulfil duplicates: copy each unique file's output to its byte-identical twins
-    for dup_dest, rep_dest, rel in dup_copies:
-        r = {'src': Path(rel).name, 'rel': rel, 'action': 'duplicate',
-             'orig': (src_root / rel).stat().st_size if (src_root / rel).exists() else 0,
-             'new': 0, 'kept': True, 'err': None, 'pages': None}
-        try:
-            if Path(rep_dest).exists():
-                Path(dup_dest).parent.mkdir(parents=True, exist_ok=True)
-                tmp = Path(dup_dest + '.part')
-                shutil.copyfile(rep_dest, str(tmp))
-                os.replace(str(tmp), dup_dest)
-                r['new'] = Path(dup_dest).stat().st_size
-                r['note'] = f' (duplicate of {os.path.relpath(rep_dest, str(dest_root))} — copied output)'
-                done += 1; kept += 1; tot_orig += r['orig']; tot_new += r['new']
-            else:
-                r['err'] = 'duplicate representative has no output (rep failed?)'
-                fail += 1
-            print(f'  [dup] {rel}{r.get("note", ": " + (r["err"] or ""))}')
-        except Exception as ex:
-            r['err'] = f'duplicate copy failed: {ex}'; fail += 1
-        results.append(r)
-
+    dup_sets = _flag_duplicates(results) if not args.no_duplicate_check else 0
     dt = time.time() - t0
     n_born = sum(1 for r in results if r.get('action') == 'born_digital')
     verb = 'Previewed' if args.dry_run else 'processed'
@@ -1261,6 +1266,10 @@ def main():
         saved = 'would save' if args.dry_run else 'saved'
         print(f'{word}: {mb(tot_orig):.0f} MB -> {mb(tot_new):.0f} MB '
               f'({tot_new*100//tot_orig}% ; {saved} {mb(tot_orig-tot_new):.0f} MB)')
+    if dup_sets:
+        n_dup_files = sum(1 for r in results if r.get('duplicate_of'))
+        print(f'Duplicates: {n_dup_files} file(s) in {dup_sets} set(s) flagged '
+              f'(byte-identical; all still processed — see report)')
     print('Output: (dry-run — nothing written)' if args.dry_run else f'Output: {dest_root}')
 
     if not args.no_log:
@@ -1277,7 +1286,7 @@ def main():
             'precheck_threshold': args.precheck_threshold,
             'born_digital_check': not args.no_skip_born_digital, 'scan_fraction': args.scan_fraction,
             'timeout': args.timeout, 'verify_output': not args.no_verify_output,
-            'repair': not args.no_repair, 'skip_duplicates': args.skip_duplicates,
+            'repair': not args.no_repair, 'duplicate_check': not args.no_duplicate_check,
             'retry_failed': str(args.retry_failed) if args.retry_failed else False,
             'dry_run': args.dry_run,
         }

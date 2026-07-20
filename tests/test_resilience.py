@@ -76,6 +76,25 @@ def test_file_hash_identical_and_different(tmp_path):
     assert U.owm._file_hash(a) != U.owm._file_hash(c)
 
 
+def test_flag_duplicates_annotates_but_keeps_all():
+    """Duplicates are FLAGGED, never skipped — every result stays, twins get a note
+    (they may legitimately belong to different manuals)."""
+    results = [
+        {'rel': 'a.pdf', 'hash': 'H1', 'note': ''},
+        {'rel': 'm/b.pdf', 'hash': 'H1', 'note': ' [1 photo]'},
+        {'rel': 'c.pdf', 'hash': 'H2', 'note': ''},
+        {'rel': 'd.pdf'},   # no hash (duplicate check was off / unreadable)
+    ]
+    sets = U.owm._flag_duplicates(results)
+    assert sets == 1                              # one duplicate group (H1)
+    assert len(results) == 4                      # nothing removed
+    assert 'DUPLICATE' in results[0]['note'] and 'm/b.pdf' in results[0]['note']
+    assert 'DUPLICATE' in results[1]['note'] and 'a.pdf' in results[1]['note']
+    assert results[1]['note'].startswith(' [1 photo]')   # original note preserved
+    assert results[0]['duplicate_of'] == 'm/b.pdf'
+    assert 'duplicate_of' not in results[2]       # unique file untouched
+
+
 def test_read_failed_rels(tmp_path):
     csv = tmp_path / 'r.csv'
     csv.write_text('file,action,orig_bytes,new_bytes,pct_of_orig,scan_frac,note,error\n'

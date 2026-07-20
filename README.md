@@ -138,7 +138,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--timeout SECS` | `1800` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
 | `--no-verify-output` | off | Skip the post-write check that each output opens and its page count matches the source |
 | `--no-repair` | off | Don't attempt a Ghostscript pdfwrite repair on a malformed PDF before giving up |
-| `--skip-duplicates` | off | Detect byte-identical duplicate PDFs (content hash); process each unique file once and copy its output to the twins |
+| `--no-duplicate-check` | off | Disable the default duplicate flagging (skips the per-file content hash) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
@@ -193,10 +193,12 @@ error) so you can sort/filter a collection of thousands.
 - **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
   `FAILED` (e.g. after freeing disk, fixing a tool, or raising `--timeout`), without
   re-scanning the whole tree.
-- **`--skip-duplicates`** — large collections often contain byte-identical copies of the
-  same PDF. This hashes each source, compresses each unique file **once**, and copies the
-  result to the duplicate paths — so the output tree still mirrors the input, at a
-  fraction of the compute.
+- **Duplicate flagging** (on by default; `--no-duplicate-check` to skip) — large
+  collections often contain byte-identical copies of the same PDF. Each file's content
+  hash is computed as it's processed and, when two files match, **both are flagged** in
+  the report (console `[dup of …]`, a `duplicate_of` CSV column, and a note). Duplicates
+  are **never skipped or merged** — a byte-identical file can legitimately belong to a
+  different manual, so every file is still fully processed and gets its own output.
 - **PDF repair** (on by default; `--no-repair` to disable) — if a file is too malformed to
   render, it's rewritten through Ghostscript's `pdfwrite` and retried once before being
   given up on. One bad download shouldn't be silently lost.
@@ -215,8 +217,8 @@ dpi = 200
 workers = 8
 language = "eng+deu"
 jpeg_quality = 60
-skip_duplicates = true
 min_free_gb = 5.0
+# no_duplicate_check = true   # turn OFF the default duplicate flagging
 # no_ocr = true
 # scan_fraction = 0.5
 ```

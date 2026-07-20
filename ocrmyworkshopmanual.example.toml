@@ -36,7 +36,7 @@ scan_fraction = 0.5       # below this fraction of full-page-image pages => born
 # ── resilience / large collections ────────────────────────────────────────────
 timeout = 1800            # per-file render/OCR ceiling in seconds (0 = off)
 min_free_gb = 1.0         # abort if the dest drive has less than this free (0 = off)
-# skip_duplicates = false # dedupe byte-identical PDFs
+# no_duplicate_check = false  # true = turn off the default byte-identical duplicate flagging
 # no_repair = false       # true = don't try to repair malformed PDFs
 # no_verify_output = false
 # no_log = false
