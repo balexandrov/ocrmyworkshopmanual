@@ -66,6 +66,21 @@ def test_timeout_fails_gracefully(tmp_path):
     assert not dest.exists(), 'a timed-out file must not leave a dest output'
 
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_bright_colour_page_not_classified_blank(tmp_path):
+    """Regression: a bright-colour page (orange, no dark pixels -> grayscale
+    luminance all >= 100) must NOT be called BLANK (which would destroy it as
+    bitonal). The blank test requires low photo-coverage, so it routes to colour."""
+    pdf = U.make_color_pdf(tmp_path / 'orange.pdf')
+    work = U.workdir()
+    try:
+        t, sig = U.classify(pdf, 1, 200, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    assert t != U.owm.PT_BLANK, f'bright colour page wrongly classified blank: {sig}'
+    assert t == U.owm.PT_PHOTO_COLOR, f'expected photo_color, got {t}: {sig}'
+
+
 # ── config file / dedup / retry / repair ─────────────────────────────────────
 
 def test_file_hash_identical_and_different(tmp_path):

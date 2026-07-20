@@ -97,6 +97,27 @@ def workdir(prefix: str = 'owmtest_') -> Path:
     return Path(tempfile.mkdtemp(prefix=prefix))
 
 
+def make_color_pdf(path: Path, size=(1000, 1400)) -> Path:
+    """Make a 1-page BRIGHT-colour PDF (orange bars on white) with NO dark pixels —
+    its grayscale luminance is all >= 100. Reproduces the regression where such a
+    page was mis-classified BLANK by the dark-pixel-only ink test and destroyed as
+    bitonal. Should classify as PT_PHOTO_COLOR."""
+    import numpy as np
+    import img2pdf
+    from PIL import Image
+    w, h = size
+    a = np.full((h, w, 3), 255, np.uint8)
+    a[80:280, 80:920] = (230, 110, 60)      # luminance ~140, saturated orange
+    a[360:660, 80:520] = (240, 150, 90)
+    a[360:520, 560:900] = (235, 130, 80)
+    jpg = path.with_suffix('.jpg')
+    Image.fromarray(a).save(jpg, 'JPEG', quality=90, dpi=(200, 200))
+    with open(path, 'wb') as f:
+        f.write(img2pdf.convert(str(jpg), dpi=200))
+    jpg.unlink(missing_ok=True)
+    return path
+
+
 def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25) -> Path:
     """Hand-build a valid born-digital PDF: vector Helvetica text, NO raster images.
     Used to test the born-digital safety check (looks_born_digital / copy-through).

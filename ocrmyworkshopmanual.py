@@ -342,11 +342,17 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
     """Route one rendered grayscale page to a PageType. Cheap signals: ink fraction
     (BLANK), tiled continuous-tone coverage (PHOTO vs LINE), and — for photo pages —
     a colour render + cast-robust colour test (PHOTO_GRAY vs PHOTO_COLOR). The colour
-    PNG is rendered once here and handed to the strategy via PageClass.color_png."""
+    PNG is rendered once here and handed to the strategy via PageClass.color_png.
+
+    A page is only BLANK when it has neither ink NOR continuous-tone coverage: bright
+    colour pages (an orange/pastel cover) convert to a grayscale luminance that is all
+    >= 100, so the ink test alone would call them blank and destroy them as bitonal —
+    the coverage guard keeps them on the photo/colour path."""
     g = np.asarray(Image.open(png).convert('L'))
-    if float((g < 100).mean()) < blank_ink:
+    cov = photo_coverage(png, dpi) if detect_photos else 0.0
+    if float((g < 100).mean()) < blank_ink and cov <= photo_thresh:
         return PageClass(PT_BLANK, None)
-    if not detect_photos or photo_coverage(png, dpi) <= photo_thresh:
+    if not detect_photos or cov <= photo_thresh:
         return PageClass(PT_LINE, None)
     # continuous-tone page: render colour once, decide gray vs colour
     d = photo_dpi or dpi
