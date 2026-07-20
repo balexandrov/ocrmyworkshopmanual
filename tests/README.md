@@ -16,6 +16,7 @@ tests/
   test_classify.py      DETECTION test: classify_page() == folder label
   test_settings_matrix.py  SETTINGS sweep (script) + sanity gates (pytest)
   test_born_digital.py  SAFETY test: born-digital PDFs detected + copied untouched
+  test_resilience.py    timeout aborts gracefully / output verify / dry-run preview
 ```
 
 Current corpus (real Land Cruiser FSM pages unless noted): **line 7** (7 sources),
