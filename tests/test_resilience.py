@@ -133,6 +133,22 @@ def test_cli_overrides_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_single_file_cli(tmp_path):
+    """`src` may be a single .pdf: the CLI processes just that file and writes a
+    sibling '<name> (COMPRESSED).pdf' by default."""
+    import subprocess as sp
+    pdfs = U.fixture_pdfs('line') or U.fixture_pdfs('photo_gray')
+    if not pdfs:
+        pytest.skip('no fixtures')
+    src = tmp_path / 'x.pdf'
+    src.write_bytes(pdfs[0].read_bytes())
+    r = sp.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
+                str(src), '--no-ocr', '--no-log'], capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stderr[-500:]
+    assert (tmp_path / 'x (COMPRESSED).pdf').exists(), f'no sibling output; stdout:\n{r.stdout}'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_gs_repair_recovers_truncated(tmp_path):
     pdfs = U.fixture_pdfs('line') or U.fixture_pdfs('photo_gray')
     if not pdfs:

@@ -90,6 +90,9 @@ isn't on PATH, point to it with `JBIG2_GS` (Ghostscript) or `JBIG2_BIN` (jbig2).
 # Compress + OCR a whole folder tree  ->  "<folder> (COMPRESSED)"
 python ocrmyworkshopmanual.py "/path/to/scanned/folder"
 
+# Process a SINGLE file (writes a sibling "<name> (COMPRESSED).pdf")
+python ocrmyworkshopmanual.py "one_manual.pdf"
+
 # Preview a whole tree without writing anything (what would happen + projected savings)
 python ocrmyworkshopmanual.py SRC --dry-run
 
