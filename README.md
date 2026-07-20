@@ -30,6 +30,9 @@ for the text layer.
 
 ## What it does, per page
 
+0. **Safety check first** — if a file doesn't look like a scan (it's a born-digital
+   vector/text PDF), it is **copied to the destination byte-for-byte, untouched** —
+   never rendered, binarized, or OCR'd. See [Born-digital safety](#born-digital-safety).
 1. **Render** the page (Ghostscript).
 2. **Classify** it into a **page type** and apply that type's strategy:
    - `LINE` / `BLANK` (text, line-art, gray-wash/shadow pages) → **background-flatten +
@@ -53,7 +56,9 @@ machine stays responsive. Originals are never modified; output mirrors the sourc
 tree under a sibling `"<src> (COMPRESSED)"` folder (or `--dest`). Skip-if-exists, so
 it's resumable.
 
-> ⚠️ For **scanned / image** PDFs only. Born-digital/vector PDFs would be rasterised.
+> ⚠️ For **scanned / image** PDFs only — but a built-in safety check protects
+> born-digital PDFs by copying them through untouched (see below), so it's safe to
+> point at a mixed tree. Every folder run also writes a **report log** of what happened.
 
 ---
 
@@ -124,7 +129,37 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--precheck-threshold F` | `0.75` | Skip full compression if a sample projects the result ≥ this fraction of the original |
 | `--no-precheck` | off | Always fully compress (disable the sample pre-check) |
 | `--symbol` | off | Shared-dictionary JBIG2: ~30% smaller but **blank in Chrome/Edge** (Ghostscript/Acrobat only) |
+| `--scan-fraction F` | `0.5` | A PDF is treated as scanned (eligible for compression) only if ≥ this fraction of sampled pages carry a full-page raster image; below this it's considered born-digital and copied untouched |
+| `--no-skip-born-digital` | off | Disable the born-digital safety check (rasterize **every** PDF, even vector/text ones) |
+| `--log PATH` | timestamped file in dest | Where to write the run report log |
+| `--no-log` | off | Don't write a run report log |
 | `--limit N` | `0` | Process only the first N files (testing) |
+
+---
+
+## Born-digital safety
+
+This tool rasterizes each page, which is exactly what you want for **scanned** PDFs but
+would **destroy** a born-digital (vector/text) PDF. So before touching a file it runs a
+cheap check (`looks_born_digital`): it samples pages and measures the fraction that are
+dominated by a full-page raster image. A real scan has one on ~every page; a born-digital
+file has none. If the "scan fraction" is below `--scan-fraction` (default 0.5), the file
+is **copied to the destination byte-for-byte — no render, no binarize, no OCR.**
+
+- Conservative by design: ties fall to "scanned", so a genuine scan archive is never
+  skipped. An all-raster "image PDF" (e.g. images exported to PDF) still counts as
+  scanned and gets compressed — only real vector/text content is protected.
+- A scanned PDF that already carries an OCR text layer is still detected as a scan
+  (it has full-page images) and compressed normally.
+- Disable with `--no-skip-born-digital` to force compression of everything.
+
+## Run report log
+
+After each folder run a report log is written (to the dest root by default, or `--log
+PATH`; disable with `--no-log`). It records the settings used, then **per file** what
+happened (`compressed` / `kept original` / `OCR-only` / `born-digital (copied untouched)`
+/ `FAILED`) with sizes and the born-digital scan signals, and a final **summary tally +
+total bytes saved** — so a big batch is reviewable at a glance.
 
 ---
 

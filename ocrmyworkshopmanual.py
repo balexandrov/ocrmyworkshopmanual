@@ -18,7 +18,10 @@ One worker process per file → uses all cores. Originals are never touched; out
 mirrors the source tree under a sibling "(COMPRESSED)" folder (or --dest).
 Skip-if-exists, so it is resumable. Typical result on clean B&W scans: ~8-12% of
 original, crisp, and full-text searchable.
-NOTE: for SCANNED/image PDFs only. Born-digital/vector PDFs would be rasterised.
+NOTE: for SCANNED/image PDFs only. A SAFETY CHECK (looks_born_digital) detects
+born-digital/vector/text PDFs and copies them to dest byte-for-byte, untouched
+(never rasterised); disable with --no-skip-born-digital. Every folder run also
+writes a report log (which file, what was done, final stats); disable with --no-log.
 
 Usage:
   python ocrmyworkshopmanual.py "M:\\path\\to\\folder"           # compress + OCR a tree
@@ -384,6 +387,95 @@ def has_text(pdf: Path, sample: int = 6, min_chars: int = 40) -> bool:
         return False
 
 
+def _largest_image_dpi(page) -> float:
+    """Effective DPI of the LARGEST single raster image on a page:
+    sqrt(image_pixel_area / page_area_in_sq_inches). A full-page scan yields the
+    scan resolution (~72-600); a small logo/figure on a born-digital page yields a
+    tiny number (a page-filling image and a stamp-sized one are worlds apart here).
+    Recurses into Form XObjects. Returns 0.0 if the page has no image."""
+    try:
+        mb = page.mediabox
+        area_in = max((float(mb.width) / 72.0) * (float(mb.height) / 72.0), 1e-6)
+    except Exception:
+        return 0.0
+    largest = 0
+
+    def walk(res, depth=0):
+        nonlocal largest
+        if not res or depth > 4:
+            return
+        try:
+            xo = res.get_object().get('/XObject')
+            if not xo:
+                return
+            xo = xo.get_object()
+            for name in xo:
+                obj = xo[name].get_object()
+                sub = obj.get('/Subtype')
+                if sub == '/Image':
+                    largest = max(largest, int(obj.get('/Width', 0)) * int(obj.get('/Height', 0)))
+                elif sub == '/Form':
+                    walk(obj.get('/Resources'), depth + 1)
+        except Exception:
+            return
+
+    try:
+        walk(page.get('/Resources'))
+    except Exception:
+        pass
+    return (largest / area_in) ** 0.5 if largest else 0.0
+
+
+def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
+                       sample: int = 8, min_chars: int = 100, dpi_floor: int = 50):
+    """SAFETY heuristic: is this a born-digital (vector/text) PDF rather than a scan?
+    A scanned page is dominated by a full-page raster image; a born-digital page is
+    text/vector with at most small images. We sample pages and count 'scan pages'
+    (those carrying a full-page image, DPI-equiv >= dpi_floor). The file is called
+    born-digital when the scan-page fraction is below `scan_fraction`.
+
+    Deliberately conservative toward NEVER skipping a real scan: a genuine scanned
+    archive has a full-page image on ~every page (scan_frac ~1.0), while a born-
+    digital file has ~none (scan_frac ~0.0), so the two separate cleanly and ties
+    fall to 'scanned'. An all-raster 'image PDF' (e.g. images exported to PDF) reads
+    as scanned and is compressed — only genuine vector/text content is protected.
+    Returns (is_born_digital, signals_dict) — signals go to the run log for review."""
+    sig = {'sampled': 0, 'scan_pages': 0, 'text_pages': 0, 'scan_frac': 0.0, 'chars': 0}
+    try:
+        r = PdfReader(str(src_p))
+        n = len(r.pages)
+    except Exception as ex:
+        sig['error'] = f'unreadable ({ex})'
+        return False, sig                      # let the normal path try (and error-report) it
+    if n == 0:
+        sig['error'] = 'no pages'
+        return False, sig
+    k = min(sample, n)
+    idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
+    scan = text = readable = 0
+    for i in idxs:
+        try:
+            page = r.pages[i]
+        except Exception:
+            continue
+        readable += 1
+        try:
+            nchars = len((page.extract_text() or '').strip())
+        except Exception:
+            nchars = 0
+        sig['chars'] += nchars
+        if _largest_image_dpi(page) >= dpi_floor:
+            scan += 1
+        elif nchars >= min_chars:
+            text += 1
+    if readable == 0:
+        sig['error'] = 'no readable pages'
+        return False, sig
+    frac = scan / readable
+    sig.update(sampled=readable, scan_pages=scan, text_pages=text, scan_frac=round(frac, 3))
+    return frac < scan_fraction, sig
+
+
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
@@ -464,7 +556,8 @@ def compress_one(src: str, dest: str, dpi: int,
                  min_savings: float = 0.25, ocr_only: bool = False,
                  precheck: bool = True, precheck_skip: float = 0.75,
                  adaptive: bool = True, sauvola_k: float = 0.30,
-                 photo_clean: bool = True, photo_descreen: float = 0.6) -> dict:
+                 photo_clean: bool = True, photo_descreen: float = 0.6,
+                 skip_born_digital: bool = True, scan_fraction: float = 0.5) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER (detect_photos=True): classify_page() sorts each page into LINE/
@@ -487,6 +580,21 @@ def compress_one(src: str, dest: str, dpi: int,
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jb_'))
     try:
+        # SAFETY: never rasterise a born-digital (vector/text) PDF. If the file does
+        # not look like a scan, copy it through to dest byte-for-byte, untouched
+        # (no render, no binarize, no OCR) — this tool is for scanned/image PDFs only.
+        if skip_born_digital:
+            born, bsig = looks_born_digital(src_p, scan_fraction)
+            if born:
+                dest_p.parent.mkdir(parents=True, exist_ok=True)
+                tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
+                shutil.copyfile(str(src_p), str(tmp_out))
+                os.replace(str(tmp_out), str(dest_p))
+                return {'src': src_p.name, 'orig': orig, 'new': dest_p.stat().st_size,
+                        'pages': bsig.get('sampled'), 'kept': True, 'err': None,
+                        'action': 'born_digital', 'signals': bsig,
+                        'note': f' (born-digital: copied untouched; '
+                                f'scan_frac={bsig.get("scan_frac")})'}
         note0 = ' (OCR-only, not compressed)' if ocr_only else ''
         # cheap pre-check: sample-compress a few pages; if it won't beat the original,
         # skip full compression and just OCR the original (avoids wasted work + growth).
@@ -501,8 +609,10 @@ def compress_one(src: str, dest: str, dpi: int,
             # No (worthwhile) compression: keep the original images, just add the OCR layer.
             base = work / 'orig.pdf'
             shutil.copyfile(str(src_p), str(base))
-            return _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                                  len(PdfReader(str(base)).pages), True, note0)
+            res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
+                                 len(PdfReader(str(base)).pages), True, note0)
+            res['action'] = 'ocr_only'
+            return res
         # 1) render pages to grayscale PNG
         r = subprocess.run(
             [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
@@ -614,8 +724,10 @@ def compress_one(src: str, dest: str, dpi: int,
             note = f' [{n_photo} photo pg: {", ".join(bits)}]'
         else:
             note = ''
-        return _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                              len(pngs), kept_original, note)
+        res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
+                             len(pngs), kept_original, note)
+        res['action'] = 'kept_original' if kept_original else 'compressed'
+        return res
     except Exception as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': repr(ex)}
     finally:
@@ -632,6 +744,78 @@ def win_long(p) -> str:
 
 
 def mb(n): return n / 1048576
+
+
+# ── Run log ──────────────────────────────────────────────────────────────────
+
+def _action_label(res: dict) -> str:
+    """Human label for what happened to one file (drives both the per-file line and
+    the summary tally in the run log)."""
+    if res.get('err'):
+        return 'FAILED'
+    return {
+        'born_digital': 'born-digital (copied untouched)',
+        'ocr_only': 'OCR-only (not compressed)',
+        'kept_original': 'kept original',
+        'compressed': 'compressed',
+    }.get(res.get('action'), 'processed')
+
+
+def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
+                  t0: float, dt: float, n_found: int, skipped: int, limit: int,
+                  fail: int, done: int, kept: int) -> Path:
+    """Write a human-readable report of the folder run: which file, what was done
+    (with the born-digital scan signals), and the final work stats. Returns its path."""
+    from collections import Counter
+    ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
+    log_path = Path(log_path) if log_path else dest_root / f'_ocrmyworkshopmanual_report_{ts}.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    counts = Counter(_action_label(r) for r in results)
+    tot_orig = sum(r['orig'] for r in results if not r.get('err'))
+    tot_new = sum(r['new'] for r in results if not r.get('err'))
+
+    L = ['=' * 78, 'ocrmyworkshopmanual — run report', '=' * 78,
+         f'Started : {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0))}',
+         f'Finished: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0 + dt))}',
+         f'Elapsed : {dt/60:.1f} min',
+         f'Source  : {src_root}',
+         f'Dest    : {dest_root}',
+         f'Tools   : GS={GS} | jbig2={JBIG}',
+         'Settings: ' + ', '.join(f'{k}={v}' for k, v in settings.items()),
+         '',
+         f'PDFs found: {n_found} | already done (skipped, dest existed): {skipped}'
+         + (f' | --limit {limit}' if limit else '')
+         + f' | processed this run: {len(results)}',
+         '', '-' * 78, 'Per-file (this run):', '-' * 78]
+
+    for r in sorted(results, key=lambda x: x['rel'].lower()):
+        if r.get('err'):
+            L.append(f'[FAILED]  {r["rel"]}')
+            L.append(f'           error: {r["err"]}')
+            continue
+        pct = r['new'] * 100 // r['orig'] if r.get('orig') else 0
+        L.append(f'[{_action_label(r)}]  {r["rel"]}')
+        L.append(f'           {mb(r["orig"]):.2f} -> {mb(r["new"]):.2f} MB ({pct}%){r.get("note", "")}')
+        sg = r.get('signals')
+        if sg:
+            L.append(f'           scan signals: scan_frac={sg.get("scan_frac")} '
+                     f'scan_pages={sg.get("scan_pages")}/{sg.get("sampled")} '
+                     f'text_pages={sg.get("text_pages")} chars={sg.get("chars")}'
+                     + (f' [{sg["error"]}]' if sg.get('error') else ''))
+
+    L += ['', '-' * 78, 'Summary', '-' * 78]
+    for label in ('compressed', 'kept original', 'OCR-only (not compressed)',
+                  'born-digital (copied untouched)', 'FAILED'):
+        L.append(f'  {label:33s}: {counts.get(label, 0)}')
+    L.append(f'  {"skipped (dest already existed)":33s}: {skipped}')
+    L.append('')
+    if tot_orig:
+        L.append(f'  Total size: {mb(tot_orig):.1f} MB -> {mb(tot_new):.1f} MB '
+                 f'({tot_new*100//tot_orig}% ; saved {mb(tot_orig-tot_new):.1f} MB)')
+    L.append('')
+    log_path.write_text('\n'.join(L), encoding='utf-8')
+    return log_path
 
 
 # ── Batch driver ─────────────────────────────────────────────────────────────
@@ -684,6 +868,17 @@ def main():
     ap.add_argument('--precheck-threshold', type=float, default=0.75,
                     help='skip full compression if a sample projects the result >= this fraction of the '
                          'original (default 0.75); the --min-savings fallback still guards the rest')
+    ap.add_argument('--no-skip-born-digital', action='store_true',
+                    help='disable the born-digital SAFETY check (which by default copies any pdf that '
+                         'does not look like a scan straight to dest, untouched); with this flag EVERY '
+                         'pdf is rasterised/compressed, including vector/text ones')
+    ap.add_argument('--scan-fraction', type=float, default=0.5,
+                    help='a pdf is treated as SCANNED (eligible for compression) only if at least this '
+                         'fraction of sampled pages carry a full-page raster image; below this it is '
+                         'considered born-digital and copied through untouched (default 0.5)')
+    ap.add_argument('--log', type=Path, default=None,
+                    help='path for the run report log (default: a timestamped file in the dest root)')
+    ap.add_argument('--no-log', action='store_true', help='do not write a run report log')
     args = ap.parse_args()
 
     err = check_tools(want_ocr=not args.no_ocr)
@@ -711,9 +906,11 @@ def main():
     print(f'Source      : {src_root}')
     print(f'Dest        : {dest_root}')
     ocr_desc = f'OCR({args.language})' if not args.no_ocr else 'no OCR'
+    bd_desc = ('no born-digital check' if args.no_skip_born_digital
+               else f'born-digital-safe (scan-frac>={args.scan_fraction:g})')
     if args.ocr_only:
         print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
-              f'@ {args.workers} workers, OCR-ONLY (no compression), {ocr_desc}\n')
+              f'@ {args.workers} workers, OCR-ONLY (no compression), {ocr_desc}, {bd_desc}\n')
     else:
         photo_desc = 'no photo-detect' if (args.no_photo or args.symbol) else f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
         bin_desc = (f'global T={args.threshold}' if args.global_threshold
@@ -722,7 +919,7 @@ def main():
               f'@ {args.dpi} dpi, {args.workers} workers, '
               f'{"symbol" if args.symbol else "generic"} mode, {bin_desc}, '
               f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
-              f'{photo_desc}, {ocr_desc}\n')
+              f'{photo_desc}, {ocr_desc}, {bd_desc}\n')
     if not jobs:
         print('Nothing to do.'); return
 
@@ -730,6 +927,7 @@ def main():
     t0 = time.time()
     done = fail = kept = 0
     tot_orig = tot_new = 0
+    results = []  # accumulated for the run log
     with cf.ProcessPoolExecutor(max_workers=args.workers,
                                 initializer=set_below_normal_priority) as ex:
         futs = {ex.submit(compress_one, s, d, args.dpi,
@@ -739,10 +937,14 @@ def main():
                           args.min_savings, args.ocr_only,
                           not args.no_precheck, args.precheck_threshold,
                           not args.global_threshold, args.sauvola_k,
-                          not args.no_photo_clean, args.photo_descreen): s
+                          not args.no_photo_clean, args.photo_descreen,
+                          not args.no_skip_born_digital, args.scan_fraction): (s, d)
                 for s, d in jobs}
         for i, fut in enumerate(cf.as_completed(futs), 1):
+            s, d = futs[fut]
             res = fut.result()
+            res['rel'] = os.path.relpath(s, str(src_root))
+            results.append(res)
             if res['err']:
                 fail += 1
                 print(f'  [{i}/{len(jobs)}] FAIL {res["src"]}: {res["err"]}')
@@ -756,12 +958,34 @@ def main():
                       f'{mb(res["orig"]):.0f}->{mb(res["new"]):.0f} MB ({pct}%){res.get("note", "")}')
 
     dt = time.time() - t0
+    n_born = sum(1 for r in results if r.get('action') == 'born_digital')
     print(f'\nDone in {dt/60:.1f} min. processed {done} ({done - kept} compressed, '
-          f'{kept} kept-original/OCR-only), failed {fail}')
+          f'{kept} kept-original/OCR-only incl. {n_born} born-digital copied), failed {fail}')
     if tot_orig:
         print(f'Total: {mb(tot_orig):.0f} MB -> {mb(tot_new):.0f} MB '
               f'({tot_new*100//tot_orig}% ; saved {mb(tot_orig-tot_new):.0f} MB)')
     print(f'Output: {dest_root}')
+
+    if not args.no_log:
+        settings = {
+            'dpi': args.dpi, 'workers': args.workers, 'mode': 'symbol' if args.symbol else 'generic',
+            'binarization': f'global T={args.threshold}' if args.global_threshold
+                            else f'adaptive sauvola-k={args.sauvola_k:g}',
+            'despeckle': not args.no_despeckle, 'min_size': args.min_size,
+            'photo_detect': not (args.no_photo or args.symbol),
+            'photo_threshold': args.photo_threshold, 'photo_dpi': args.photo_dpi,
+            'jpeg_quality': args.jpeg_quality, 'photo_clean': not args.no_photo_clean,
+            'photo_descreen': args.photo_descreen, 'ocr': ocr_desc, 'ocr_only': args.ocr_only,
+            'min_savings': args.min_savings, 'precheck': not args.no_precheck,
+            'precheck_threshold': args.precheck_threshold,
+            'born_digital_check': not args.no_skip_born_digital, 'scan_fraction': args.scan_fraction,
+        }
+        try:
+            log_path = write_run_log(args.log, dest_root, src_root, results, settings,
+                                     t0, dt, len(pdfs), skipped, args.limit, fail, done, kept)
+            print(f'Log: {log_path}')
+        except Exception as ex:
+            print(f'(could not write run log: {ex})', file=sys.stderr)
 
 
 if __name__ == '__main__':
