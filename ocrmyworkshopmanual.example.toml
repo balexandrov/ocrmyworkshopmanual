@@ -1,0 +1,42 @@
+# Example config for ocrmyworkshopmanual.
+#
+# Copy to "ocrmyworkshopmanual.toml" next to where you run the tool (it's auto-loaded),
+# or point at it with --config PATH. Keys are the long option names with dashes replaced
+# by underscores. Any explicit CLI flag overrides the value here. Uncomment what you want.
+
+# ── core ──────────────────────────────────────────────────────────────────────
+dpi = 200                 # render resolution (native scans are usually ~200-220)
+workers = 8               # files processed in parallel
+# dest = "D:/compressed"  # output root (default: sibling "<src> (COMPRESSED)")
+# limit = 0               # process only the first N files (0 = all)
+
+# ── OCR ───────────────────────────────────────────────────────────────────────
+language = "eng"          # Tesseract language(s), e.g. "eng+fra+deu"
+# no_ocr = false          # true = skip the searchable text layer
+# ocr_only = false        # true = don't compress, only add OCR
+
+# ── binarization (line/text pages) ────────────────────────────────────────────
+sauvola_k = 0.30          # lower = bolder/thicker ink, higher = thinner/cleaner
+# global_threshold = false
+# threshold = 125
+# min_size = 10
+
+# ── photo/colour pages ────────────────────────────────────────────────────────
+jpeg_quality = 60
+photo_dpi = 150
+photo_descreen = 0.6
+# no_photo_clean = false
+
+# ── don't-degrade / routing ───────────────────────────────────────────────────
+min_savings = 0.25
+precheck_threshold = 0.75
+scan_fraction = 0.5       # below this fraction of full-page-image pages => born-digital
+# no_skip_born_digital = false
+
+# ── resilience / large collections ────────────────────────────────────────────
+timeout = 1800            # per-file render/OCR ceiling in seconds (0 = off)
+min_free_gb = 1.0         # abort if the dest drive has less than this free (0 = off)
+# skip_duplicates = false # dedupe byte-identical PDFs
+# no_repair = false       # true = don't try to repair malformed PDFs
+# no_verify_output = false
+# no_log = false

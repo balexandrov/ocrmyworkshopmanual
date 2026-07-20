@@ -2,10 +2,15 @@
   - per-step timeout aborts a file gracefully (never hangs the batch)
   - output verification flags a wrong page count / unopenable output
   - dry-run preview_one predicts the action and writes nothing
+  - config file, duplicate hashing, retry-CSV parsing, malformed-PDF repair
 """
+import argparse
 import shutil
+import sys
+from pathlib import Path
 
 import pytest
+from pypdf import PdfReader
 
 import _util as U
 
@@ -59,3 +64,66 @@ def test_timeout_fails_gracefully(tmp_path):
                              timeout=0.001)
     assert res.get('err') and 'timed out' in res['err'], res
     assert not dest.exists(), 'a timed-out file must not leave a dest output'
+
+
+# ── config file / dedup / retry / repair ─────────────────────────────────────
+
+def test_file_hash_identical_and_different(tmp_path):
+    a = U.make_born_digital_pdf(tmp_path / 'a.pdf', npages=2)
+    b = tmp_path / 'b.pdf'; b.write_bytes(a.read_bytes())      # exact copy
+    c = U.make_born_digital_pdf(tmp_path / 'c.pdf', npages=3)  # different
+    assert U.owm._file_hash(a) == U.owm._file_hash(b)
+    assert U.owm._file_hash(a) != U.owm._file_hash(c)
+
+
+def test_read_failed_rels(tmp_path):
+    csv = tmp_path / 'r.csv'
+    csv.write_text('file,action,orig_bytes,new_bytes,pct_of_orig,scan_frac,note,error\n'
+                   'ok.pdf,compressed,10,1,10,,,\n'
+                   'bad.pdf,FAILED,10,0,,,,timed out\n'
+                   'sub/also_bad.pdf,FAILED,10,0,,,,render failed\n', encoding='utf-8')
+    assert U.owm._read_failed_rels(csv) == ['bad.pdf', 'sub/also_bad.pdf']
+
+
+def test_config_defaults_applied(tmp_path, monkeypatch):
+    cfg = tmp_path / 'c.toml'
+    cfg.write_text('dpi = 321\nno_ocr = true\nsauvola_k = 0.22\n', encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['prog', '--config', str(cfg)])
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', type=Path)
+    ap.add_argument('--dpi', type=int, default=200)
+    ap.add_argument('--sauvola-k', type=float, default=0.30)
+    ap.add_argument('--no-ocr', action='store_true')
+    U.owm._apply_config_defaults(ap)
+    args = ap.parse_args([])           # no CLI flags -> config values become the defaults
+    assert args.dpi == 321
+    assert args.no_ocr is True
+    assert abs(args.sauvola_k - 0.22) < 1e-9
+
+
+def test_cli_overrides_config(tmp_path, monkeypatch):
+    cfg = tmp_path / 'c.toml'
+    cfg.write_text('dpi = 321\n', encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['prog', '--config', str(cfg), '--dpi', '150'])
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', type=Path)
+    ap.add_argument('--dpi', type=int, default=200)
+    U.owm._apply_config_defaults(ap)
+    args = ap.parse_args(['--dpi', '150'])
+    assert args.dpi == 150             # explicit CLI wins over the config default
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_gs_repair_recovers_truncated(tmp_path):
+    pdfs = U.fixture_pdfs('line') or U.fixture_pdfs('photo_gray')
+    if not pdfs:
+        pytest.skip('no fixtures')
+    broken = tmp_path / 'broken.pdf'
+    broken.write_bytes(pdfs[0].read_bytes()[:-900])   # drop trailer/xref -> malformed
+    work = U.workdir()
+    try:
+        fixed = U.owm._gs_repair(broken, work)
+        assert fixed is not None and fixed.exists(), 'repair should recover a truncated PDF'
+        assert len(PdfReader(str(fixed)).pages) >= 1, 'repaired PDF should open with pages'
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
