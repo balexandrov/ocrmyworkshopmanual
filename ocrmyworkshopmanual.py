@@ -822,6 +822,43 @@ def win_long(p) -> str:
 def mb(n): return n / 1048576
 
 
+def _default_workers() -> int:
+    """Default worker count = PHYSICAL cores. The heavy per-page binarize is
+    memory-bandwidth-bound, so hyperthread siblings (the extra logical cores) add
+    little and oversubscribing them just thrashes cache/bandwidth and slows the run.
+    Detected per-platform without extra deps; falls back to logical count, then 4."""
+    try:
+        if sys.platform == 'darwin':
+            out = subprocess.run(['sysctl', '-n', 'hw.physicalcpu'],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            if out.isdigit() and int(out) > 0:
+                return int(out)
+        elif sys.platform.startswith('linux'):
+            pairs, phys, core = set(), None, None
+            with open('/proc/cpuinfo') as f:
+                for line in f:
+                    if line.startswith('physical id'):
+                        phys = line.split(':')[1].strip()
+                    elif line.startswith('core id'):
+                        core = line.split(':')[1].strip()
+                    elif not line.strip() and phys is not None and core is not None:
+                        pairs.add((phys, core)); phys = core = None
+            if phys is not None and core is not None:
+                pairs.add((phys, core))
+            if pairs:
+                return len(pairs)
+        elif os.name == 'nt':
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                 '(Get-CIMInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum'],
+                capture_output=True, text=True, timeout=15).stdout.strip()
+            if out.isdigit() and int(out) > 0:
+                return int(out)
+    except Exception:
+        pass
+    return os.cpu_count() or 4
+
+
 # ── Dry-run preview (runs in a worker process) ────────────────────────────────
 
 def preview_one(src: str, dpi: int, despeckle: bool, thresh: int, min_size: int,
@@ -1129,9 +1166,11 @@ def main():
                          'or the output path/folder for a single-file src (default: sibling '
                          '"<name> (COMPRESSED).pdf")')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
-    ap.add_argument('--workers', type=int, default=(os.cpu_count() or 4),
-                    help='parallel worker processes (default: one per logical core, '
-                         'or 4 if the core count cannot be detected)')
+    ap.add_argument('--workers', type=int, default=_default_workers(),
+                    help='parallel worker processes (default: one per PHYSICAL core — the '
+                         'CPU-bound binarize is memory-bandwidth-bound, so logical/hyperthread '
+                         'cores add little and oversubscribing them thrashes; falls back to '
+                         'logical count, then 4, if physical cores cannot be detected)')
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
     ap.add_argument('--no-despeckle', action='store_true', help='disable background speckle removal')
     ap.add_argument('--global-threshold', action='store_true',
