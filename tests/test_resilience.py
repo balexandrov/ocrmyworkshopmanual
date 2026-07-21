@@ -148,6 +148,29 @@ def test_cli_overrides_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_in_place_overwrites_scan_leaves_others(tmp_path):
+    """--in-place (dest == src): a scanned PDF is overwritten with its smaller
+    compressed self; a born-digital PDF is left byte-for-byte untouched."""
+    scan = tmp_path / 'scan.pdf'
+    pdfs = U.fixture_pdfs('line') or U.fixture_pdfs('photo_gray')
+    if not pdfs:
+        pytest.skip('no fixtures')
+    scan.write_bytes(pdfs[0].read_bytes())
+    orig = scan.stat().st_size
+    res = U.owm.compress_one(str(scan), str(scan), 200, ocr=False, in_place=True)
+    assert res.get('err') is None and res.get('action') == 'compressed', res
+    assert scan.exists() and scan.stat().st_size < orig, 'in-place should shrink the scan'
+    assert len(PdfReader(str(scan)).pages) >= 1
+
+    born = tmp_path / 'born.pdf'
+    U.make_born_digital_pdf(born, npages=2)
+    before = born.read_bytes()
+    res = U.owm.compress_one(str(born), str(born), 200, ocr=False, in_place=True)
+    assert res.get('action') == 'born_digital', res
+    assert born.read_bytes() == before, 'born-digital must be left byte-identical in place'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_single_file_cli(tmp_path):
     """`src` may be a single .pdf: the CLI processes just that file and writes a
     sibling '<name> (COMPRESSED).pdf' by default."""
