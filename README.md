@@ -116,6 +116,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 |---|---|---|
 | `src` (positional) | — | Source folder tree of scanned PDFs (required) |
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
+| `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4) |
 | `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu` |
@@ -150,6 +151,35 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--limit N` | `0` | Process only the first N files (testing) |
 
 ---
+
+## In-place mode
+
+`--in-place` compresses an existing library **where it sits** instead of building a
+mirrored `(COMPRESSED)` tree — useful when reorganizing a second output folder is more
+hassle than it's worth. **It overwrites the source PDFs, so back up first** (the tool
+is built around you being able to restore from an archive if needed).
+
+What it does and doesn't touch:
+- **PDFs that compress** → overwritten with the smaller, searchable version.
+- **Born-digital, already-optimal, or unchanged** PDFs → **left exactly as-is** (never rewritten).
+- **Non-PDF files and the folder structure** → untouched.
+- The run **report** is written to the **tool folder** (`reports/` next to the script),
+  not among your manuals.
+
+Safety mechanics:
+- Each file is compressed to scratch, **verified** (opens + correct page count), and only
+  then **atomically swapped** over the original (`os.replace`). A failed verify keeps the
+  original.
+- **Temp locations:** the heavy scratch (page renders, binarize, JBIG2, OCR) goes in the
+  **system temp dir** (`%TEMP%`/`$TMPDIR`), *not* on your manuals drive, and is deleted
+  per file. The only thing written beside a manual is a short-lived `<name>.pdf.part`
+  staging file (required for an atomic same-volume swap), gone in a fraction of a second.
+- Re-runs are safe: already-compressed files project ≥100% and are left untouched.
+
+```bash
+python ocrmyworkshopmanual.py "M:\manuals" --in-place          # whole tree, overwrite
+python ocrmyworkshopmanual.py "one_manual.pdf" --in-place      # single file
+```
 
 ## Born-digital safety
 

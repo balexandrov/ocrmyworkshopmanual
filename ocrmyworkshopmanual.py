@@ -26,6 +26,7 @@ writes a report log (which file, what was done, final stats); disable with --no-
 Usage:
   python ocrmyworkshopmanual.py "M:\\path\\to\\folder"           # compress + OCR a tree
   python ocrmyworkshopmanual.py "one_manual.pdf"                # a single file -> sibling (COMPRESSED).pdf
+  python ocrmyworkshopmanual.py SRC --in-place                   # OVERWRITE the source PDFs (back up first)
   python ocrmyworkshopmanual.py SRC --dry-run                    # preview only, write nothing
   python ocrmyworkshopmanual.py SRC --dest OUT --workers 10
   python ocrmyworkshopmanual.py SRC --limit 3                    # test first N files
@@ -527,11 +528,15 @@ def _verify_output(dest_p: Path, expect_pages) -> str:
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
-                   timeout: int = 0, verify: bool = True) -> dict:
+                   timeout: int = 0, verify: bool = True, in_place: bool = False) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
-    0=off) bounds the OCR step; `verify` re-opens the output and checks its page count."""
+    0=off) bounds the OCR step; `verify` re-opens the OUTPUT and checks its page count
+    BEFORE placing it. With `in_place` (dest_p == src_p): if the result is identical to
+    the source (kept original + no OCR added) the file is left untouched; and a failed
+    verify keeps the original rather than overwriting it with a bad file."""
     final = base
+    ocr_added = False
     if ocr:
         if has_text(base):
             note += ' (had text, OCR skipped)'
@@ -544,14 +549,24 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                 timeout=timeout or None)
             if r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
                 final = ocr_pdf
+                ocr_added = True
             else:
                 note += ' (OCR FAILED)'
+    # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched
+    if in_place and kept and not ocr_added:
+        return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
+                'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
+    # verify the output BEFORE overwriting anything
+    if verify:
+        warn = _verify_output(final, pages)
+        if warn and in_place:   # never overwrite the original with a bad file
+            return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
+                    'note': note, 'kept': True, 'err': 'output failed verify, original kept' + warn}
+        note += warn
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
     shutil.copyfile(str(final), str(tmp_out))
     os.replace(str(tmp_out), str(dest_p))
-    if verify:
-        note += _verify_output(dest_p, pages)
     return {'src': src_p.name, 'orig': orig, 'new': dest_p.stat().st_size,
             'pages': pages, 'note': note, 'kept': kept, 'err': None}
 
@@ -612,7 +627,8 @@ def compress_one(src: str, dest: str, dpi: int,
                  adaptive: bool = True, sauvola_k: float = 0.30,
                  photo_clean: bool = True, photo_descreen: float = 0.6,
                  skip_born_digital: bool = True, scan_fraction: float = 0.5,
-                 timeout: int = 0, verify_output: bool = True, repair: bool = True) -> dict:
+                 timeout: int = 0, verify_output: bool = True, repair: bool = True,
+                 in_place: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER (detect_photos=True): classify_page() sorts each page into LINE/
@@ -641,15 +657,17 @@ def compress_one(src: str, dest: str, dpi: int,
         if skip_born_digital:
             born, bsig = looks_born_digital(src_p, scan_fraction)
             if born:
-                dest_p.parent.mkdir(parents=True, exist_ok=True)
-                tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
-                shutil.copyfile(str(src_p), str(tmp_out))
-                os.replace(str(tmp_out), str(dest_p))
-                return {'src': src_p.name, 'orig': orig, 'new': dest_p.stat().st_size,
+                if not in_place:   # in-place: leave the original vector PDF exactly as-is
+                    dest_p.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
+                    shutil.copyfile(str(src_p), str(tmp_out))
+                    os.replace(str(tmp_out), str(dest_p))
+                where = 'left untouched' if in_place else 'copied untouched'
+                return {'src': src_p.name, 'orig': orig,
+                        'new': orig if in_place else dest_p.stat().st_size,
                         'pages': bsig.get('sampled'), 'kept': True, 'err': None,
                         'action': 'born_digital', 'signals': bsig,
-                        'note': f' (born-digital: copied untouched; '
-                                f'scan_frac={bsig.get("scan_frac")})'}
+                        'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'}
         note0 = ' (OCR-only, not compressed)' if ocr_only else ''
         # cheap pre-check: sample-compress a few pages; if it won't beat the original,
         # skip full compression and just OCR the original (avoids wasted work + growth).
@@ -666,7 +684,7 @@ def compress_one(src: str, dest: str, dpi: int,
             shutil.copyfile(str(src_p), str(base))
             res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
                                  len(PdfReader(str(base)).pages), True, note0,
-                                 timeout, verify_output)
+                                 timeout, verify_output, in_place)
             res['action'] = 'ocr_only'
             return res
         # 1) render pages to grayscale PNG
@@ -798,7 +816,7 @@ def compress_one(src: str, dest: str, dpi: int,
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                             len(pngs), kept_original, note, timeout, verify_output)
+                             len(pngs), kept_original, note, timeout, verify_output, in_place)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:
@@ -1165,6 +1183,12 @@ def main():
                     help='output root for a folder (default: sibling "<src> (COMPRESSED)"), '
                          'or the output path/folder for a single-file src (default: sibling '
                          '"<name> (COMPRESSED).pdf")')
+    ap.add_argument('--in-place', action='store_true',
+                    help='OVERWRITE each PDF with its compressed/OCR result IN PLACE (no output '
+                         'tree). Non-PDF files, folder structure, born-digital PDFs and '
+                         'already-optimal files are left untouched; unchanged files are not '
+                         'rewritten. DESTRUCTIVE — back up first. The report is written to the '
+                         'tool folder, not among the manuals. Cannot be combined with --dest.')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
     ap.add_argument('--workers', type=int, default=_default_workers(),
                     help='parallel worker processes (default: one per PHYSICAL core — the '
@@ -1259,6 +1283,8 @@ def main():
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
 
     src_root = args.src
+    if args.in_place and args.dest:
+        print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
     # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
     # the filename; default output is a sibling "<name> (COMPRESSED).pdf".
     single_dest = None
@@ -1266,17 +1292,20 @@ def main():
         if src_root.suffix.lower() != '.pdf':
             print(f'ERROR: not a PDF: {src_root}', file=sys.stderr); sys.exit(1)
         rel_base = src_root.parent
-        if args.dest:
+        pdfs = [src_root]
+        if args.in_place:
+            dest_root = rel_base
+        elif args.dest:
             single_dest = args.dest if args.dest.suffix.lower() == '.pdf' \
                 else args.dest / src_root.name
+            dest_root = single_dest.parent
         else:
             single_dest = src_root.with_name(f'{src_root.stem} (COMPRESSED){src_root.suffix}')
-        dest_root = single_dest.parent
-        pdfs = [src_root]
+            dest_root = single_dest.parent
     elif src_root.is_dir():
         rel_base = src_root
-        dest_root = args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)')
         pdfs = sorted(p for p in src_root.rglob('*.pdf'))
+        dest_root = rel_base if args.in_place else (args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)'))
     else:
         print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
               file=sys.stderr); sys.exit(1)
@@ -1294,7 +1323,12 @@ def main():
         except Exception:
             pass
 
-    if single_dest is not None:
+    if args.in_place:
+        # overwrite each PDF where it sits; no skip-if-exists (dest == src). Already-optimal
+        # files are detected per-file and left untouched by the pipeline, so re-runs are safe.
+        jobs = [(str(p), str(p)) for p in pdfs]
+        skipped = 0
+    elif single_dest is not None:
         jobs = [] if single_dest.exists() else [(str(src_root), str(single_dest))]
         skipped = len(pdfs) - len(jobs)
     elif args.retry_failed:
@@ -1321,7 +1355,7 @@ def main():
     print(f'Ghostscript : {GS}')
     print(f'jbig2enc    : {JBIG}')
     print(f'Source      : {src_root}')
-    print(f'Dest        : {dest_root}')
+    print(f'Dest        : {"IN-PLACE (overwrites source PDFs)" if args.in_place else dest_root}')
     ocr_desc = f'OCR({args.language})' if not args.no_ocr else 'no OCR'
     bd_desc = ('no born-digital check' if args.no_skip_born_digital
                else f'born-digital-safe (scan-frac>={args.scan_fraction:g})')
@@ -1341,6 +1375,9 @@ def main():
         print('Nothing to do.'); return
     if args.dry_run:
         print('*** DRY-RUN: previewing only — nothing will be written. ***\n')
+    elif args.in_place:
+        print('*** IN-PLACE: source PDFs will be OVERWRITTEN with their compressed/OCR '
+              'result. Non-PDFs, structure, born-digital & already-optimal files untouched. ***\n')
 
     set_below_normal_priority()
     t0 = time.time()
@@ -1350,7 +1387,8 @@ def main():
 
     # open the report CSV up front and flush a row per file, so progress is visible
     # live (the full .log + a final complete .csv are (re)written at the end).
-    report_dir = src_root.parent if args.dry_run else None
+    report_dir = (SCRIPT_DIR / 'reports') if args.in_place else \
+        (src_root.parent if args.dry_run else None)
     report_log_path = _report_path(args.log, dest_root, report_dir, t0, args.dry_run)
     csv_live = None
     if not args.no_log:
@@ -1384,7 +1422,7 @@ def main():
                               not args.no_photo_clean, args.photo_descreen,
                               not args.no_skip_born_digital, args.scan_fraction,
                               args.timeout, not args.no_verify_output,
-                              not args.no_repair): (s, d)
+                              not args.no_repair, args.in_place): (s, d)
                     for s, d in jobs}
         N = len(jobs)
         # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
@@ -1445,10 +1483,12 @@ def main():
         n_dup_files = sum(1 for r in results if r.get('duplicate_of'))
         print(f'Duplicates: {n_dup_files} file(s) in {dup_sets} set(s) flagged '
               f'(byte-identical; all still processed — see report)')
-    print('Output: (dry-run — nothing written)' if args.dry_run else f'Output: {dest_root}')
+    print('Output: (dry-run — nothing written)' if args.dry_run else
+          ('Output: IN-PLACE (source PDFs overwritten)' if args.in_place else f'Output: {dest_root}'))
 
     if not args.no_log:
         settings = {
+            'in_place': args.in_place,
             'dpi': args.dpi, 'workers': args.workers, 'mode': 'symbol' if args.symbol else 'generic',
             'binarization': f'global T={args.threshold}' if args.global_threshold
                             else f'adaptive sauvola-k={args.sauvola_k:g}',

@@ -17,3 +17,6 @@ tools/jbig2/
 # Test outputs (the settings-matrix sweep). Fixtures ARE committed.
 tests/reports/
 .pytest_cache/
+
+# Run reports written to the tool folder (e.g. --in-place mode)
+/reports/
