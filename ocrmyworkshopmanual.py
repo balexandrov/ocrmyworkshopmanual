@@ -206,14 +206,24 @@ def check_tools(want_ocr: bool):
 
 # ── Per-page cleanup ─────────────────────────────────────────────────────────
 
-def _flatten_bg(g: np.ndarray, win: int) -> np.ndarray:
+def _flatten_bg(g: np.ndarray, win: int, f: int = 4) -> np.ndarray:
     """Flatten uneven paper: estimate the background field (grey-closing fills the
     ink/detail, a box blur smooths what's left) and divide the page by it, so a
     yellow cast, binding-shadow washes and edge darkening all normalise toward white.
-    Returns uint8 gray. Large detail (e.g. a photo) exceeds the window and is kept."""
-    bg = ndimage.grey_closing(g, size=(win, win)).astype(np.float32)
-    bg = np.maximum(ndimage.uniform_filter(bg, win), 1.0)
-    return np.clip(g.astype(np.float32) / bg * 255.0, 0, 255).astype(np.uint8)
+    Returns uint8 gray. Large detail (e.g. a photo) exceeds the window and is kept.
+
+    The background field is low-frequency, so it is estimated on an f× downscaled
+    copy and upscaled back — on large-format pages (tens of MP) this is several times
+    faster than grey-closing at full resolution, for a pixel-identical result (the
+    divide itself stays full-res)."""
+    h, w = g.shape
+    sm = np.asarray(Image.fromarray(g).resize((max(1, w // f), max(1, h // f)), Image.BILINEAR))
+    ws = max(3, round(win / f))
+    bg = ndimage.grey_closing(sm, size=(ws, ws)).astype(np.float32)
+    bg = np.maximum(ndimage.uniform_filter(bg, ws), 1.0)
+    bg = np.asarray(Image.fromarray(np.clip(bg, 0, 255).astype(np.uint8))
+                    .resize((w, h), Image.BILINEAR)).astype(np.float32)
+    return np.clip(g.astype(np.float32) / np.maximum(bg, 1.0) * 255.0, 0, 255).astype(np.uint8)
 
 
 def _sauvola_ink(g: np.ndarray, win: int, k: float, R: float = 128.0) -> np.ndarray:
@@ -222,7 +232,7 @@ def _sauvola_ink(g: np.ndarray, win: int, k: float, R: float = 128.0) -> np.ndar
     mask (True where ink). Because the cutoff adapts per region, faint low-contrast
     strokes survive where a single global threshold erodes them, and a mid-gray wash
     resolves cleanly instead of breaking into salt-and-pepper speckle."""
-    gf = g.astype(np.float64)
+    gf = g.astype(np.float32)   # float32 halves the box-filter cost; precision is ample here
     m = ndimage.uniform_filter(gf, win)
     s = np.sqrt(np.maximum(ndimage.uniform_filter(gf * gf, win) - m * m, 0.0))
     return g < m * (1.0 + k * (s / R - 1.0))
