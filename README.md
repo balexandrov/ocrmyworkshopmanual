@@ -182,6 +182,30 @@ python ocrmyworkshopmanual.py "M:\manuals" --in-place          # whole tree, ove
 python ocrmyworkshopmanual.py "one_manual.pdf" --in-place      # single file
 ```
 
+## Finding what to compress (`scan_candidates.py`)
+
+On a big, mixed archive it helps to know **which folders are even worth compressing**
+before you point the tool at anything. `scan_candidates.py` walks a tree and ranks the
+folders that hold *scanned* PDFs which would actually benefit — ones that are **big
+(≥50 MB)** and/or **missing an OCR text layer**. It's **read-only** and never renders a
+page: it reuses this tool's own `looks_born_digital` / `has_text` heuristics (so its
+verdicts match what a real run would do) plus a `%PDF-` magic-byte gate to skip files
+that only *look* like PDFs (HTML error pages saved with a `.pdf` name, etc.).
+
+```bash
+python scan_candidates.py "M:\manuals" --workers 16
+```
+
+Writes into `./reports`:
+
+- `scan_candidates.csv` — candidate folders, biggest-first, with per-folder counts
+  (scanned / big / missing-OCR), sizes, and the reason each qualified
+- `scan_candidates.txt` — just the candidate folder paths (a feed list)
+- `scan_all_folders.csv` / `scan_files.csv` — the full picture (every folder / every PDF)
+
+Typical flow: scan → skim the ranked CSV → compress the folders you want (e.g. with
+`--in-place`).
+
 ## Born-digital safety
 
 This tool rasterizes each page, which is exactly what you want for **scanned** PDFs but
