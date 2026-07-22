@@ -119,7 +119,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4) |
-| `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu` |
+| `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu`. Use `auto` to detect each file's script from the image (Tesseract OSD) and pick the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng` |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--ocr-only` | off | Don't compress — copy originals and only add OCR (skips files that already have text) |
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
@@ -148,6 +148,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
 | `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
 | `--no-log` | off | Don't write a run report log |
+| `--no-recurse` | off | Process only PDFs **directly** in the source folder, not subfolders |
 | `--limit N` | `0` | Process only the first N files (testing) |
 
 ---
