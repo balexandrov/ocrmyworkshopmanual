@@ -155,10 +155,37 @@ JBIG = _find_jbig2_binary()
 WRAP = _find_wrapper()
 PY = sys.executable
 
+
+def _find_ocrmypdf_cmd():
+    """The command prefix used to invoke ocrmypdf. Prefer the installed console
+    script (`ocrmypdf` / `ocrmypdf.exe`): on some Windows setups `python -m ocrmypdf`
+    hangs on import, while the console-script launcher runs fine. Fall back to
+    `-m ocrmypdf` only if no script is found. Override with env JBIG2_OCRMYPDF."""
+    env = os.environ.get('JBIG2_OCRMYPDF')
+    if env:
+        return [env]
+    exe = shutil.which('ocrmypdf')
+    if not exe:
+        d = Path(sys.executable).parent
+        for name in ('ocrmypdf.exe', 'ocrmypdf'):
+            if (d / name).exists():
+                exe = str(d / name)
+                break
+    return [exe] if exe else [PY, '-m', 'ocrmypdf']
+
+
+OCRMYPDF = _find_ocrmypdf_cmd()
+
 # make Tesseract discoverable even if PATH wasn't refreshed this session
 for _d in (r'C:\Program Files\Tesseract-OCR', r'C:\Program Files (x86)\Tesseract-OCR'):
     if os.path.isdir(_d) and _d not in os.environ.get('PATH', ''):
         os.environ['PATH'] = _d + os.pathsep + os.environ.get('PATH', '')
+
+TESS = shutil.which('tesseract')
+
+# Tesseract OSD script name -> ocrmypdf language. Cyrillic docs often carry some
+# English too, so pair rus+eng. Scripts without an installed pack fall back to eng.
+_SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng'}
 
 
 def set_below_normal_priority():
@@ -177,8 +204,8 @@ def set_below_normal_priority():
 
 def _ocrmypdf_ok():
     try:
-        return subprocess.run([PY, '-m', 'ocrmypdf', '--version'],
-                              capture_output=True).returncode == 0
+        return subprocess.run(OCRMYPDF + ['--version'],
+                              capture_output=True, timeout=120).returncode == 0
     except Exception:
         return False
 
@@ -526,6 +553,51 @@ def _verify_output(dest_p: Path, expect_pages) -> str:
     return ''
 
 
+def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
+    """Guess the OCR language from page CONTENT (not filenames) via Tesseract OSD
+    script detection — which reads a rendered image and reports its writing system
+    without needing a text layer first, so it works on image-only scans. Renders a
+    few evenly-spaced sample pages, tallies the dominant script (confidence-weighted)
+    and maps it to a language. Falls back to 'eng' if detection is unavailable/unsure."""
+    if not TESS or not GS:
+        return 'eng'
+    try:
+        n = max(len(PdfReader(str(pdf)).pages), 1)
+    except Exception:
+        n = 1
+    k = min(4, n)
+    idxs = sorted({1 + round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
+    scores: dict = {}
+    for pageno in idxs:
+        png = work / f'osd_{pageno}.png'
+        try:
+            subprocess.run([GS, '-sDEVICE=pnggray', '-r200', '-dNOPAUSE', '-dBATCH',
+                            '-dQUIET', f'-dFirstPage={pageno}', f'-dLastPage={pageno}',
+                            '-sOutputFile=' + str(png), win_long(pdf)],
+                           capture_output=True, timeout=timeout or 120)
+            if not png.exists():
+                continue
+            r = subprocess.run([TESS, str(png), 'stdout', '--psm', '0'],
+                               capture_output=True, text=True, timeout=timeout or 120)
+        except Exception:
+            continue
+        script, conf = None, 0.0
+        for line in (r.stdout or '').splitlines():
+            s = line.strip()
+            if s.startswith('Script:'):
+                script = s.split(':', 1)[1].strip()
+            elif s.startswith('Script confidence:'):
+                try:
+                    conf = float(s.split(':', 1)[1].strip())
+                except ValueError:
+                    conf = 0.0
+        if script:
+            scores[script] = scores.get(script, 0.0) + conf
+    if not scores:
+        return 'eng'
+    return _SCRIPT_LANG.get(max(scores, key=scores.get), 'eng')
+
+
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
                    timeout: int = 0, verify: bool = True, in_place: bool = False) -> dict:
@@ -541,9 +613,12 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         if has_text(base):
             note += ' (had text, OCR skipped)'
         else:
+            if language == 'auto':
+                language = _detect_language(base, work, timeout)
+                note += f' (lang:{language})'
             ocr_pdf = work / 'ocr.pdf'
             r = subprocess.run(
-                [PY, '-m', 'ocrmypdf', '--language', language, '--optimize', '0',
+                OCRMYPDF + ['--language', language, '--optimize', '0',
                  '--output-type', 'pdf', '--skip-text', '--quiet', '--jobs', '1',
                  str(base), str(ocr_pdf)], capture_output=True, text=True,
                 timeout=timeout or None)
@@ -1196,6 +1271,8 @@ def main():
                          'cores add little and oversubscribing them thrashes; falls back to '
                          'logical count, then 4, if physical cores cannot be detected)')
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
+    ap.add_argument('--no-recurse', action='store_true',
+                    help='process only PDFs directly in the source folder, not subfolders')
     ap.add_argument('--no-despeckle', action='store_true', help='disable background speckle removal')
     ap.add_argument('--global-threshold', action='store_true',
                     help='use the legacy fixed global threshold instead of adaptive binarization '
@@ -1216,7 +1293,9 @@ def main():
                     help='shared-dictionary mode: smaller, but BLANK in Chrome/Edge (PDFium). '
                          'Only for Ghostscript/Acrobat viewing.')
     ap.add_argument('--no-ocr', action='store_true', help='skip the searchable OCR text layer')
-    ap.add_argument('--language', default='eng', help='Tesseract OCR language(s), e.g. eng or eng+fra+spa+deu')
+    ap.add_argument('--language', default='eng',
+                    help='Tesseract OCR language(s), e.g. eng or eng+fra+spa+deu; '
+                         "'auto' detects each file's script (Latin->eng, Cyrillic->rus+eng) via Tesseract OSD")
     ap.add_argument('--no-photo', action='store_true',
                     help='force all pages bitonal (skip photo detection; photos will look bad)')
     ap.add_argument('--photo-threshold', type=float, default=0.02,
@@ -1304,7 +1383,8 @@ def main():
             dest_root = single_dest.parent
     elif src_root.is_dir():
         rel_base = src_root
-        pdfs = sorted(p for p in src_root.rglob('*.pdf'))
+        globber = src_root.glob if args.no_recurse else src_root.rglob
+        pdfs = sorted(p for p in globber('*.pdf'))
         dest_root = rel_base if args.in_place else (args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)'))
     else:
         print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
