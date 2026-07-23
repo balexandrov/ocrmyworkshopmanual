@@ -86,7 +86,7 @@ ocrmyworkshopmanual --version
 | Tool | Purpose | Install |
 |---|---|---|
 | Ghostscript | render pages | Windows: [ghostscript.com](https://www.ghostscript.com/) · Debian/Ubuntu: `apt install ghostscript` · macOS: `brew install ghostscript` |
-| jbig2enc (`jbig2`) | bitonal compression | Debian/Ubuntu: `apt install jbig2enc` · macOS: `brew install jbig2enc` · Windows: [releases](https://github.com/agl/jbig2enc/releases) (unzip, add `bin/` to PATH) |
+| jbig2enc (`jbig2`) | bitonal compression | No Debian/Ubuntu apt package ships the `jbig2` CLI (only the library) — build from source: `apt install build-essential autoconf automake libtool libleptonica-dev`, then clone [agl/jbig2enc](https://github.com/agl/jbig2enc), `./autogen.sh && ./configure && make && sudo make install` · macOS: `brew install jbig2enc` · Windows: [releases](https://github.com/agl/jbig2enc/releases) (unzip, add `bin/` to PATH) |
 | Tesseract OCR | text layer | Windows: [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki) · Debian/Ubuntu: `apt install tesseract-ocr` · macOS: `brew install tesseract` |
 
 The `jbig2topdf.py` wrapper ships in `tools/` — you don't need to find it. If a tool

@@ -28,10 +28,24 @@ jobs:
       # Ghostscript + jbig2enc are the two external binaries the pipeline
       # shells out to; both are found automatically via shutil.which (`gs`,
       # `jbig2`) once on PATH, no extra config needed.
-      - name: Install system dependencies (Ghostscript, jbig2enc)
+      - name: Install Ghostscript
         run: |
           sudo apt-get update
-          sudo apt-get install -y ghostscript jbig2enc
+          sudo apt-get install -y ghostscript
+
+      # No Debian/Ubuntu apt package ships the jbig2 CLI binary (only the
+      # libjbig2enc-dev/libjbig2enc0t64 library packages exist) -- build it
+      # from source, following upstream's own tested recipe.
+      - name: Build and install jbig2enc
+        run: |
+          sudo apt-get install -y build-essential autoconf automake libtool libleptonica-dev
+          git clone --depth 1 https://github.com/agl/jbig2enc.git /tmp/jbig2enc
+          cd /tmp/jbig2enc
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+          jbig2 -V
 
       - name: Install Python dependencies
         run: |
