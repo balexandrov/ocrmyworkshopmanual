@@ -1,5 +1,7 @@
 # ocrmyworkshopmanual
 
+[![CI](https://github.com/balexandrov/ocrmyworkshopmanual/actions/workflows/ci.yml/badge.svg)](https://github.com/balexandrov/ocrmyworkshopmanual/actions/workflows/ci.yml)
+
 Turn a folder of **scanned, image-only PDFs** into small, **searchable** PDFs —
 without wrecking photos or breaking in browsers.
 

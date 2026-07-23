@@ -29,6 +29,9 @@ dependencies = [
     "img2pdf",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
 Homepage = "https://github.com/balexandrov/ocrmyworkshopmanual"
 Repository = "https://github.com/balexandrov/ocrmyworkshopmanual"
