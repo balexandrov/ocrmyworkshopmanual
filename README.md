@@ -341,8 +341,15 @@ grayscale-JPEG ~47%, `ocrmypdf --optimize 3` ~37%.
 
 - Best on scanned line-art/text; photo-heavy documents stay larger (they must, to
   keep the photos). Color/photo-heavy files may be kept as-is.
-- Developed and tested on Windows; the code is cross-platform (paths, `os.nice`) but
-  Linux/macOS are less exercised — reports welcome.
+- Developed on Windows and in daily production use there; CI runs the test suite on
+  Linux (Ubuntu, Python 3.10/3.11) on every push, but macOS isn't automated yet —
+  reports welcome.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup (including an optional
+dev container), how to run the tests, and the design philosophy behind this
+project's deliberately small CLI surface.
 
 ## License
 

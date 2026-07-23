@@ -1,0 +1,11 @@
+# Keeps the devcontainer build context small and fast (the repo's own .venv/
+# alone is ~300+ MB and is never needed inside the container).
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.git/
+.pytest_cache/
+reports/
+tests/reports/
