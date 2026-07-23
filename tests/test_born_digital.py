@@ -45,17 +45,3 @@ def test_compress_one_copies_born_digital_untouched(tmp_path):
     assert res.get('action') == 'born_digital', res
     assert res.get('err') is None, res
     assert dest.read_bytes() == src.read_bytes(), 'born-digital output is not byte-identical to input'
-
-
-def test_no_skip_born_digital_flag_disables_the_safety_branch(tmp_path):
-    """With skip_born_digital=False the safety net is off: the file goes through the
-    normal path, so its action is never 'born_digital'. (The bytes may still match the
-    original — the normal path's own precheck/min-savings don't-degrade logic can keep
-    the original — so we assert on the branch taken, not on byte-difference.)"""
-    if _missing:
-        pytest.skip(_missing)
-    src = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=2)
-    dest = tmp_path / 'out' / 'src.pdf'
-    res = U.owm.compress_one(str(src), str(dest), 200, ocr=False, skip_born_digital=False)
-    assert res.get('action') != 'born_digital', res
-    assert res.get('err') is None and dest.exists(), res

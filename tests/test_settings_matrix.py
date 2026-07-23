@@ -37,12 +37,9 @@ DPI = 200
 # Bitonal (line/blank): binarization knobs. Each combo -> a binarized PNG + its
 # generic-JBIG2 size (bytes) — the two things that decide crispness vs file size.
 BITONAL_COMBOS = [
-    dict(mode='adaptive', sauvola_k=0.20),
-    dict(mode='adaptive', sauvola_k=0.30),   # current default
-    dict(mode='adaptive', sauvola_k=0.40),
-    dict(mode='global', threshold=110),
-    dict(mode='global', threshold=125),      # legacy default
-    dict(mode='global', threshold=140),
+    dict(sauvola_k=0.20),
+    dict(sauvola_k=0.30),   # current default
+    dict(sauvola_k=0.40),
 ]
 
 # Grayscale photo/mixed: quality x descreen x paper-clean.
@@ -65,15 +62,12 @@ def _bitonal_row(pdf, combo, art_dir):
         if not U.render_gray(pdf, 1, DPI, png):
             return None
         raw_black = float((np.asarray(Image.open(png).convert('L')) < 128).mean())
-        adaptive = combo['mode'] == 'adaptive'
-        U.owm.binarize_png(png, adaptive, combo.get('threshold', 125), 10, True, DPI,
-                           combo.get('sauvola_k', 0.30))
+        U.owm.binarize_png(png, 10, True, DPI, combo.get('sauvola_k', 0.30))
         ink_kept = float((np.asarray(Image.open(png)) == 0).mean())
         r = subprocess.run([U.owm.JBIG, '-p', '-a', '-D', str(DPI), png.name],
                            cwd=work, capture_output=True)
         jb2 = len(r.stdout)
-        tag = (f"{combo['mode']}_k{combo['sauvola_k']}" if adaptive
-               else f"global_t{combo['threshold']}")
+        tag = f"adaptive_k{combo['sauvola_k']}"
         art_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(png, art_dir / f'{tag}.png')
         return {'combo': tag, 'out_bytes': jb2, 'raw_black_frac': round(raw_black, 4),
@@ -181,7 +175,7 @@ def test_default_settings_produce_a_valid_output(page_type, pdf):
     art_dir = U.workdir()
     try:
         if page_type in ('line', 'blank'):
-            m = _bitonal_row(pdf, dict(mode='adaptive', sauvola_k=0.30), art_dir)
+            m = _bitonal_row(pdf, dict(sauvola_k=0.30), art_dir)
         elif page_type == 'photo_gray':
             m = _photo_row(pdf, page_type, dict(quality=60, descreen=0.6, clean=True), art_dir)
         else:

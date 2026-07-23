@@ -64,7 +64,8 @@ it's resumable.
 
 ## Install
 
-**Python 3.10+**, then:
+**Python 3.10+** (3.11+ if you use `--config`/an `ocrmyworkshopmanual.toml` — TOML
+parsing needs the stdlib `tomllib`, only added in 3.11; everything else works on 3.10), then:
 
 ```bash
 pip install -r requirements.txt
@@ -123,8 +124,6 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--ocr-only` | off | Don't compress — copy originals and only add OCR (skips files that already have text) |
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
-| `--global-threshold` | off | Legacy fixed-threshold binarization instead of adaptive (rarely better) |
-| `--threshold T` | `125` | `gray < T` ⇒ ink — **only** used with `--global-threshold` |
 | `--min-size N` | `10` | Drop black speckles smaller than N px |
 | `--no-despeckle` | off | Skip speckle removal |
 | `--no-photo-clean` | off | Don't whiten paper / trim dark edges on grayscale photo pages |
@@ -133,23 +132,25 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--photo-dpi N` | `150` | Downsample photo pages to this dpi (`0` = keep render dpi) |
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
-| `--precheck-threshold F` | `0.75` | Skip full compression if a sample projects the result ≥ this fraction of the original |
-| `--no-precheck` | off | Always fully compress (disable the sample pre-check) |
-| `--symbol` | off | Shared-dictionary JBIG2: ~30% smaller but **blank in Chrome/Edge** (Ghostscript/Acrobat only) |
-| `--scan-fraction F` | `0.5` | A PDF is treated as scanned (eligible for compression) only if ≥ this fraction of sampled pages carry a full-page raster image; below this it's considered born-digital and copied untouched |
-| `--no-skip-born-digital` | off | Disable the born-digital safety check (rasterize **every** PDF, even vector/text ones) |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `7200` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
-| `--no-verify-output` | off | Skip the post-write check that each output opens and its page count matches the source |
-| `--no-repair` | off | Don't attempt a Ghostscript pdfwrite repair on a malformed PDF before giving up |
 | `--no-duplicate-check` | off | Disable the default duplicate flagging (skips the per-file content hash) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
 | `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
 | `--no-log` | off | Don't write a run report log |
-| `--no-recurse` | off | Process only PDFs **directly** in the source folder, not subfolders |
 | `--limit N` | `0` | Process only the first N files (testing) |
+
+A few things are **not** configurable on purpose, to keep the tool's guarantees simple
+and hard to accidentally weaken: binarization is always the adaptive Sauvola threshold
+(no legacy global-threshold mode), JBIG2 is always generic self-contained pages (no
+shared-dictionary "symbol" mode, which renders blank in Chrome/Edge), the born-digital
+safety check and the pre-write output verification always run, a malformed PDF always
+gets one repair attempt, the pre-check that skips not-worth-it compression always runs,
+photo detection always runs, and the source tree is always walked recursively. None of
+these have a legitimate reason to be turned off — see [Born-digital safety](#born-digital-safety)
+and [Resilience & preview](#resilience--preview-for-large-collections) below.
 
 ---
 
@@ -212,15 +213,17 @@ This tool rasterizes each page, which is exactly what you want for **scanned** P
 would **destroy** a born-digital (vector/text) PDF. So before touching a file it runs a
 cheap check (`looks_born_digital`): it samples pages and measures the fraction that are
 dominated by a full-page raster image. A real scan has one on ~every page; a born-digital
-file has none. If the "scan fraction" is below `--scan-fraction` (default 0.5), the file
-is **copied to the destination byte-for-byte — no render, no binarize, no OCR.**
+file has none. If that "scan fraction" is below 0.5 (fixed, not a flag — a real file is
+essentially always overwhelmingly one or the other, so this isn't a knob worth exposing),
+the file is **copied to the destination byte-for-byte — no render, no binarize, no OCR.**
 
 - Conservative by design: ties fall to "scanned", so a genuine scan archive is never
   skipped. An all-raster "image PDF" (e.g. images exported to PDF) still counts as
   scanned and gets compressed — only real vector/text content is protected.
 - A scanned PDF that already carries an OCR text layer is still detected as a scan
   (it has full-page images) and compressed normally.
-- Disable with `--no-skip-born-digital` to force compression of everything.
+- Always on — there's no flag to force-rasterize a file this check calls born-digital,
+  because doing so would defeat the one thing this safety check exists for.
 
 ## Run report log
 
@@ -248,9 +251,10 @@ them while a run is still going):
   pathological or corrupt PDF that would otherwise hang a worker forever is marked
   `FAILED` and the batch moves on; because it leaves no output, a later re-run retries
   it. Set `0` to disable.
-- **Output verification** (on by default; `--no-verify-output` to skip) — after writing
-  each output, it's re-opened and its page count checked against the source. A
-  silently-corrupt result is flagged loudly in the log/CSV instead of shipping unnoticed.
+- **Output verification** (always on) — after writing each output, it's re-opened and
+  its page count checked against the source. A silently-corrupt result is flagged
+  loudly in the log/CSV instead of shipping unnoticed (and with `--in-place`, a failed
+  verify keeps the original rather than overwriting it with a bad file).
 - **Resumable** — outputs are skip-if-exists, so an interrupted run just continues where
   it left off, and failed files (no output written) are retried next time.
 - **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
@@ -262,9 +266,9 @@ them while a run is still going):
   the report (console `[dup of …]`, a `duplicate_of` CSV column, and a note). Duplicates
   are **never skipped or merged** — a byte-identical file can legitimately belong to a
   different manual, so every file is still fully processed and gets its own output.
-- **PDF repair** (on by default; `--no-repair` to disable) — if a file is too malformed to
-  render, it's rewritten through Ghostscript's `pdfwrite` and retried once before being
-  given up on. One bad download shouldn't be silently lost.
+- **PDF repair** (always on) — if a file is too malformed to render, it's rewritten
+  through Ghostscript's `pdfwrite` and retried once before being given up on. One bad
+  download shouldn't be silently lost.
 - **`--min-free-gb N`** (default 1.0) — aborts up front if the destination drive is nearly
   full, instead of failing partway through a long run.
 
@@ -292,14 +296,14 @@ See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
 
 ## Tuning notes (learned the hard way on real scans)
 
-- **Adaptive binarization is the default and usually right.** On low-contrast/yellowed
+- **Adaptive binarization is the only mode — on purpose.** On low-contrast/yellowed
   scans a single global cutoff erodes faint strokes and drops dotted leaders, while a
   high cutoff turns a gray shaded wash (common on foldout wiring diagrams) into
-  salt-and-pepper noise. The default background-flatten + Sauvola adapts locally: it
+  salt-and-pepper noise. The background-flatten + Sauvola approach adapts locally: it
   keeps faint ink *and* resolves the wash cleanly. A hard ink floor keeps **solid-black
   fills** (bold display type, filled tabs) solid — Sauvola alone hollows them out.
-  `--sauvola-k` tunes boldness (lower = thicker). `--global-threshold` restores the old
-  fixed-`--threshold` behavior.
+  `--sauvola-k` tunes boldness (lower = thicker); there's no fixed-threshold fallback
+  mode, since it was strictly worse on the scans this tool targets.
 - **Photo pages get their paper whitened.** Grayscale photo/mixed/stipple pages are
   flat-fielded (against a bright-paper envelope, so **solid black fills stay black** and
   aren't washed to gray) so the yellow paper goes white and the dark scan-edge border is
@@ -311,9 +315,10 @@ See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
 - **Color detection ignores a sepia cast.** A yellowed B&W page would otherwise be
   mistaken for "color" and kept as a large yellow JPEG; the detector white-balances
   first, so only genuine color (covers, color diagrams) stays color.
-- **Generic (default) vs `--symbol`.** Chrome/Edge use PDFium, which renders a large
-  shared JBIG2 dictionary as blank pages. Generic mode has no shared dictionary, so
-  it works everywhere — at ~30% more size than symbol mode.
+- **Generic JBIG2 only — no shared-dictionary mode.** Chrome/Edge use PDFium, which
+  renders a large shared JBIG2 dictionary as blank pages. A "symbol" mode using that
+  shared dictionary would be ~30% smaller, but a compressed manual that goes blank in
+  the most common PDF viewers isn't a trade worth offering.
 - **Never grows a file.** If compression (or the sample pre-check) won't beat the
   original, the original images are kept untouched and only OCR is added.
 - **Windows long paths.** Inputs longer than 260 chars are opened via the `\\?\`
