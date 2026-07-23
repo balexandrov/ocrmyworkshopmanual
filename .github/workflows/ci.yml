@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the tool's stated floor; 3.11 is the floor for --config
+        # (tomllib is stdlib only from 3.11+) -- both are exercised here so a
+        # regression in either compatibility path is caught.
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Ghostscript + jbig2enc are the two external binaries the pipeline
+      # shells out to; both are found automatically via shutil.which (`gs`,
+      # `jbig2`) once on PATH, no extra config needed.
+      - name: Install system dependencies (Ghostscript, jbig2enc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghostscript jbig2enc
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Compile-check
+        run: python -m py_compile ocrmyworkshopmanual.py scan_candidates.py
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Verify packaging (pyproject.toml)
+        run: |
+          pip install --no-deps -e .
+          ocrmyworkshopmanual --version
