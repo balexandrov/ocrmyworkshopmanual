@@ -34,7 +34,7 @@ def test_preview_one_born_digital_writes_nothing(tmp_path):
     src = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=3)
     before = set(tmp_path.iterdir())
     res = U.owm.preview_one(str(src), 200, True, 10, False, 0.02, 150, 60,
-                            0.25, 0.30, True, 0.6)
+                            0.25, 0.30, 0.6)
     assert res['action'] == 'born_digital' and res['err'] is None
     assert res['new'] == res['orig']                      # predicts no size change
     assert set(tmp_path.iterdir()) == before              # nothing written
@@ -46,7 +46,7 @@ def test_preview_one_scanned_projects_smaller(tmp_path):
     if not pdfs:
         pytest.skip('no line fixtures')
     res = U.owm.preview_one(str(pdfs[0]), 200, True, 10, False, 0.02, 150, 60,
-                            0.25, 0.30, True, 0.6)
+                            0.25, 0.30, 0.6)
     assert res['err'] is None
     assert res['action'] in ('compressed', 'kept_original', 'ocr_only')
     assert res['new'] <= res['orig']

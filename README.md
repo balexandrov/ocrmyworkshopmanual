@@ -71,6 +71,14 @@ parsing needs the stdlib `tomllib`, only added in 3.11; everything else works on
 pip install -r requirements.txt
 ```
 
+Or install it as a package (adds an `ocrmyworkshopmanual` console command; editable
+install keeps running from this source tree):
+
+```bash
+pip install -e .
+ocrmyworkshopmanual --version
+```
+
 **External tools** (must be on your `PATH`):
 
 | Tool | Purpose | Install |
@@ -126,15 +134,13 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px |
 | `--no-despeckle` | off | Skip speckle removal |
-| `--no-photo-clean` | off | Don't whiten paper / trim dark edges on grayscale photo pages |
-| `--photo-descreen F` | `0.6` | Descreen strength (gaussian σ, dpi-scaled) that merges halftone grain — less dithering + smaller (`0` = off) |
+| `--photo-descreen F` | `0.6` | Descreen strength (gaussian σ, dpi-scaled) that merges halftone grain — less dithering + smaller (`0` = off; paper-whitening/edge-trim always run regardless) |
 | `--photo-threshold F` | `0.02` | Fraction of continuous-tone tiles that marks a page as a photo |
 | `--photo-dpi N` | `150` | Downsample photo pages to this dpi (`0` = keep render dpi) |
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `7200` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
-| `--no-duplicate-check` | off | Disable the default duplicate flagging (skips the per-file content hash) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
@@ -148,8 +154,10 @@ and hard to accidentally weaken: binarization is always the adaptive Sauvola thr
 shared-dictionary "symbol" mode, which renders blank in Chrome/Edge), the born-digital
 safety check and the pre-write output verification always run, a malformed PDF always
 gets one repair attempt, the pre-check that skips not-worth-it compression always runs,
-photo detection always runs, and the source tree is always walked recursively. None of
-these have a legitimate reason to be turned off — see [Born-digital safety](#born-digital-safety)
+photo detection always runs, the source tree is always walked recursively, grayscale
+photo pages are always paper-whitened/edge-trimmed, and duplicate files are always
+flagged (hashing every file is cheap next to actually compressing it). None of these
+have a legitimate reason to be turned off — see [Born-digital safety](#born-digital-safety)
 and [Resilience & preview](#resilience--preview-for-large-collections) below.
 
 ---
@@ -260,7 +268,7 @@ them while a run is still going):
 - **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
   `FAILED` (e.g. after freeing disk, fixing a tool, or raising `--timeout`), without
   re-scanning the whole tree.
-- **Duplicate flagging** (on by default; `--no-duplicate-check` to skip) — large
+- **Duplicate flagging** (always on) — large
   collections often contain byte-identical copies of the same PDF. Each file's content
   hash is computed as it's processed and, when two files match, **both are flagged** in
   the report (console `[dup of …]`, a `duplicate_of` CSV column, and a note). Duplicates
@@ -285,9 +293,7 @@ workers = 8
 language = "eng+deu"
 jpeg_quality = 60
 min_free_gb = 5.0
-# no_duplicate_check = true   # turn OFF the default duplicate flagging
 # no_ocr = true
-# scan_fraction = 0.5
 ```
 
 See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
@@ -304,14 +310,16 @@ See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
   fills** (bold display type, filled tabs) solid — Sauvola alone hollows them out.
   `--sauvola-k` tunes boldness (lower = thicker); there's no fixed-threshold fallback
   mode, since it was strictly worse on the scans this tool targets.
-- **Photo pages get their paper whitened.** Grayscale photo/mixed/stipple pages are
+- **Photo pages always get their paper whitened.** Grayscale photo/mixed/stipple pages are
   flat-fielded (against a bright-paper envelope, so **solid black fills stay black** and
   aren't washed to gray) so the yellow paper goes white and the dark scan-edge border is
   trimmed. A soft-levels tone curve then adds contrast (deeper blacks) while a highlight
   knee keeps the photograph's bright tones from blowing out to white — so photos stay
-  rich, not washed (`--no-photo-clean` to disable, `--jpeg-quality` for detail vs size).
-  A mild **descreen** (`--photo-descreen`, default on) merges the scan's halftone dot
-  grain into smooth tone — less "dithering" on photos/shaded diagrams, and smaller files.
+  rich, not washed (`--jpeg-quality` for detail vs size). This only ever helps, so it's
+  always on — there's no legitimate case for a scanned photo page to skip it.
+  A mild **descreen** (`--photo-descreen`, default on, `0` = off) merges the scan's
+  halftone dot grain into smooth tone — less "dithering" on photos/shaded diagrams, and
+  smaller files.
 - **Color detection ignores a sepia cast.** A yellowed B&W page would otherwise be
   mistaken for "color" and kept as a large yellow JPEG; the detector white-balances
   first, so only genuine color (covers, color diagrams) stays color.
