@@ -118,6 +118,8 @@ def test_read_failed_rels(tmp_path):
     assert U.owm._read_failed_rels(csv) == ['bad.pdf', 'sub/also_bad.pdf']
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11),
+                    reason='TOML config support needs Python 3.11+ (stdlib tomllib)')
 def test_config_defaults_applied(tmp_path, monkeypatch):
     cfg = tmp_path / 'c.toml'
     cfg.write_text('dpi = 321\nno_ocr = true\nsauvola_k = 0.22\n', encoding='utf-8')
@@ -134,6 +136,8 @@ def test_config_defaults_applied(tmp_path, monkeypatch):
     assert abs(args.sauvola_k - 0.22) < 1e-9
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11),
+                    reason='TOML config support needs Python 3.11+ (stdlib tomllib)')
 def test_cli_overrides_config(tmp_path, monkeypatch):
     cfg = tmp_path / 'c.toml'
     cfg.write_text('dpi = 321\n', encoding='utf-8')
