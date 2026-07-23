@@ -20,7 +20,7 @@ Skip-if-exists, so it is resumable. Typical result on clean B&W scans: ~8-12% of
 original, crisp, and full-text searchable.
 NOTE: for SCANNED/image PDFs only. A SAFETY CHECK (looks_born_digital) detects
 born-digital/vector/text PDFs and copies them to dest byte-for-byte, untouched
-(never rasterised); disable with --no-skip-born-digital. Every folder run also
+(never rasterised) — always on, no flag to disable it. Every folder run also
 writes a report log (which file, what was done, final stats); disable with --no-log.
 
 Usage:
@@ -33,7 +33,6 @@ Usage:
   python ocrmyworkshopmanual.py SRC --no-ocr                     # compress only
   python ocrmyworkshopmanual.py SRC --ocr-only                   # add text layer only, no compression
   python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu   # multilingual OCR
-  python ocrmyworkshopmanual.py SRC --symbol                     # smaller, GS/Acrobat only
 
 Page-type router: classify_page() sorts each page into a PageType (PT_LINE/PT_BLANK
   bitonal, PT_PHOTO_GRAY, PT_PHOTO_COLOR) and the router dispatches it to that type's
@@ -42,15 +41,15 @@ Page-type router: classify_page() sorts each page into a PageType (PT_LINE/PT_BL
 Tuning notes (learned on Toyota FSM scans):
   OCR (default on) adds a searchable text layer via ocrmypdf; --no-ocr to skip.
                    Needs Tesseract on PATH and ocrmypdf installed.
-  GENERIC (default) vs --symbol: symbol mode shares one glyph dictionary across
-                   all pages → ~30% smaller, BUT PDFium (Chrome/Edge) renders a
-                   large shared dictionary as BLANK pages. Generic works everywhere.
+  GENERIC JBIG2 only: each page is a self-contained JBIG2 stream (no shared glyph
+                   dictionary), so it renders everywhere — PDFium (Chrome/Edge)
+                   renders a shared dictionary as BLANK pages, so that mode isn't offered.
   --dpi 200        good speed/quality balance for on-screen viewing (~native ~220).
-  ADAPTIVE (default) binarization = background-flatten + Sauvola: keeps faint strokes
-                   and dotted leaders on low-contrast/yellowed scans and resolves a
-                   gray shaded wash (foldout wiring diagrams) cleanly, where a fixed
-                   global threshold either erodes ink or (high) makes salt-and-pepper.
-                   --sauvola-k tunes boldness; --global-threshold restores fixed --threshold.
+  ADAPTIVE binarization (the only mode) = background-flatten + Sauvola: keeps faint
+                   strokes and dotted leaders on low-contrast/yellowed scans and
+                   resolves a gray shaded wash (foldout wiring diagrams) cleanly,
+                   where a fixed global threshold either erodes ink or (high) makes
+                   salt-and-pepper. --sauvola-k tunes boldness.
   photo pages      grayscale photo/mixed pages are paper-whitened + edge-trimmed
                    (--no-photo-clean off); colour detection is cast-robust so a sepia
                    B&W page stays whitened-grayscale, not a yellow colour JPEG.
@@ -232,6 +231,28 @@ def check_tools(want_ocr: bool):
     return None
 
 
+def _validate_numeric_args(args) -> str:
+    """Return an error string if a numeric option is out of a sane range, else None.
+    Catches typos/mistakes early with a clear message instead of a confusing failure
+    deep in a subprocess (Ghostscript, jbig2enc, Tesseract) partway through a run."""
+    checks = [
+        (args.dpi > 0, '--dpi must be > 0'),
+        (args.workers >= 1, '--workers must be >= 1'),
+        (1 <= args.jpeg_quality <= 100, '--jpeg-quality must be between 1 and 100'),
+        (args.sauvola_k > 0, '--sauvola-k must be > 0'),
+        (args.min_size >= 0, '--min-size must be >= 0'),
+        (0.0 <= args.photo_threshold <= 1.0, '--photo-threshold must be between 0 and 1'),
+        (args.photo_dpi >= 0, '--photo-dpi must be >= 0 (0 = keep render dpi)'),
+        (0.0 <= args.min_savings <= 1.0, '--min-savings must be between 0 and 1'),
+        (args.photo_descreen >= 0, '--photo-descreen must be >= 0 (0 = off)'),
+        (args.timeout >= 0, '--timeout must be >= 0 (0 = no timeout)'),
+        (args.min_free_gb >= 0, '--min-free-gb must be >= 0 (0 = disabled)'),
+        (args.limit >= 0, '--limit must be >= 0 (0 = no limit)'),
+    ]
+    bad = [msg for ok, msg in checks if not ok]
+    return '; '.join(bad) if bad else None
+
+
 # ── Per-page cleanup ─────────────────────────────────────────────────────────
 
 def _flatten_bg(g: np.ndarray, win: int, f: int = 4) -> np.ndarray:
@@ -266,25 +287,22 @@ def _sauvola_ink(g: np.ndarray, win: int, k: float, R: float = 128.0) -> np.ndar
     return g < m * (1.0 + k * (s / R - 1.0))
 
 
-def binarize_png(path: Path, adaptive: bool, thresh: int, min_size: int,
-                 despeckle: bool, dpi: int, sauvola_k: float = 0.30, ink_floor: int = 100):
-    """In place: turn a grayscale page PNG into a 1-bit PNG. ADAPTIVE (default) does
-    background-flatten + Sauvola, so low-contrast/yellowed scans keep their faint
-    strokes and dotted leaders and a gray wash doesn't speckle; GLOBAL uses a fixed
-    `thresh` (legacy, --global-threshold). Then optionally drops black connected
-    components smaller than min_size px (scan speckle). Window sizes scale with dpi.
-    ink_floor: any flattened pixel darker than this is forced to ink — Sauvola alone
-    HOLLOWS OUT solid-black interiors (bold display type, filled tabs) because a big
-    uniform-dark area has ~no local variance, so this floor keeps blacks solid."""
+def binarize_png(path: Path, min_size: int, despeckle: bool, dpi: int,
+                 sauvola_k: float = 0.30, ink_floor: int = 100):
+    """In place: turn a grayscale page PNG into a 1-bit PNG via background-flatten +
+    Sauvola adaptive threshold, so low-contrast/yellowed scans keep their faint
+    strokes and dotted leaders and a gray wash doesn't speckle. Then optionally drops
+    black connected components smaller than min_size px (scan speckle). Window sizes
+    scale with dpi. ink_floor: any flattened pixel darker than this is forced to ink —
+    Sauvola alone HOLLOWS OUT solid-black interiors (bold display type, filled tabs)
+    because a big uniform-dark area has ~no local variance, so this floor keeps
+    blacks solid."""
     g = np.asarray(Image.open(path).convert('L'))
-    if adaptive:
-        flat_win = max(21, round(dpi * 0.30))  # ~background/paper scale
-        sauv_win = max(15, round(dpi * 0.20))  # ~a few characters
-        flat = _flatten_bg(g, flat_win)
-        ink = _sauvola_ink(flat, sauv_win, sauvola_k)
-        ink |= flat < ink_floor                # keep solid-black fills solid
-    else:
-        ink = g < thresh
+    flat_win = max(21, round(dpi * 0.30))  # ~background/paper scale
+    sauv_win = max(15, round(dpi * 0.20))  # ~a few characters
+    flat = _flatten_bg(g, flat_win)
+    ink = _sauvola_ink(flat, sauv_win, sauvola_k)
+    ink |= flat < ink_floor                # keep solid-black fills solid
     if despeckle:
         lbl, _ = ndimage.label(ink, structure=_STRUCT8)
         counts = np.bincount(lbl.ravel())
@@ -600,13 +618,13 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
-                   timeout: int = 0, verify: bool = True, in_place: bool = False) -> dict:
+                   timeout: int = 0, in_place: bool = False) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
-    0=off) bounds the OCR step; `verify` re-opens the OUTPUT and checks its page count
-    BEFORE placing it. With `in_place` (dest_p == src_p): if the result is identical to
-    the source (kept original + no OCR added) the file is left untouched; and a failed
-    verify keeps the original rather than overwriting it with a bad file."""
+    0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
+    checked BEFORE placing it. With `in_place` (dest_p == src_p): if the result is
+    identical to the source (kept original + no OCR added) the file is left untouched;
+    and a failed verify keeps the original rather than overwriting it with a bad file."""
     final = base
     ocr_added = False
     if ocr:
@@ -632,12 +650,11 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
                 'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
     # verify the output BEFORE overwriting anything
-    if verify:
-        warn = _verify_output(final, pages)
-        if warn and in_place:   # never overwrite the original with a bad file
-            return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
-                    'note': note, 'kept': True, 'err': 'output failed verify, original kept' + warn}
-        note += warn
+    warn = _verify_output(final, pages)
+    if warn and in_place:   # never overwrite the original with a bad file
+        return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
+                'note': note, 'kept': True, 'err': 'output failed verify, original kept' + warn}
+    note += warn
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
     shutil.copyfile(str(final), str(tmp_out))
@@ -646,9 +663,9 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             'pages': pages, 'note': note, 'kept': kept, 'err': None}
 
 
-def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool, thresh: int,
+def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
                       min_size: int, photo_thresh: float, photo_dpi: int, jpeg_quality: int,
-                      adaptive: bool = True, sauvola_k: float = 0.30, photo_clean: bool = True,
+                      sauvola_k: float = 0.30, photo_clean: bool = True,
                       photo_descreen: float = 0.6, k: int = 10) -> float:
     """Estimate the whole-file compressed/original ratio by running the per-page
     pipeline on k evenly-spaced SAMPLE pages only (cheap 'will this compress?'
@@ -676,8 +693,7 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool, thresh
         got += 1
         pc = classify_page(png, p, src_p, sub, dpi, True, photo_thresh, photo_dpi)
         if pc.type in _PT_BITONAL:
-            if adaptive or despeckle:
-                binarize_png(png, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
+            binarize_png(png, min_size, despeckle, dpi, sauvola_k)
             r = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), png.name], cwd=sub, capture_output=True)
             comp += len(r.stdout)
         else:
@@ -692,33 +708,32 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool, thresh
 
 # ── One file (runs in a worker process) ──────────────────────────────────────
 
+# If a cheap sample projects the compressed size at >= this fraction of the original,
+# full compression is skipped and the original is kept (just OCR'd) — not worth the work.
+PRECHECK_SKIP_RATIO = 0.75
+
+
 def compress_one(src: str, dest: str, dpi: int,
-                 despeckle: bool = True, thresh: int = 125, min_size: int = 10,
-                 symbol: bool = False, ocr: bool = True, language: str = 'eng',
-                 detect_photos: bool = True, photo_thresh: float = 0.02,
+                 despeckle: bool = True, min_size: int = 10,
+                 ocr: bool = True, language: str = 'eng',
+                 photo_thresh: float = 0.02,
                  photo_dpi: int = 150, jpeg_quality: int = 60,
                  min_savings: float = 0.25, ocr_only: bool = False,
-                 precheck: bool = True, precheck_skip: float = 0.75,
-                 adaptive: bool = True, sauvola_k: float = 0.30,
+                 sauvola_k: float = 0.30,
                  photo_clean: bool = True, photo_descreen: float = 0.6,
-                 skip_born_digital: bool = True, scan_fraction: float = 0.5,
-                 timeout: int = 0, verify_output: bool = True, repair: bool = True,
-                 in_place: bool = False) -> dict:
+                 timeout: int = 0, in_place: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
-    PAGE-TYPE ROUTER (detect_photos=True): classify_page() sorts each page into LINE/
-    BLANK (bitonal), PHOTO_GRAY or PHOTO_COLOR; consecutive bitonal pages are grouped
-    into tiny generic JBIG2, photo pages become one JPEG each, all merged back in order.
-    --no-photo / detect_photos=False forces every page bitonal. Binarization is ADAPTIVE
-    by default (background-flatten + Sauvola: keeps faint strokes/leaders on low-contrast
-    yellowed scans, resolves gray washes cleanly); adaptive=False falls back to the fixed
-    global `thresh`. photo_clean whitens the paper and trims dark scan edges on grayscale
-    photo/mixed pages. Colour detection is cast-robust, so a sepia B&W page is kept as
-    (whitened) grayscale rather than a yellow colour JPEG. Add a page kind by extending
-    classify_page() + the router branch (see the PageType constants).
-    Default is GENERIC JBIG2 (each page self-contained → renders in Chrome/Edge);
-    SYMBOL mode (smaller shared dict) goes BLANK in PDFium, so it's GS/Acrobat-only
-    and skips photo detection.
+    PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
+    PHOTO_GRAY or PHOTO_COLOR; consecutive bitonal pages are grouped into tiny generic
+    JBIG2 (self-contained, so it renders in Chrome/Edge), photo pages become one JPEG
+    each, all merged back in order. Binarization is background-flatten + Sauvola
+    adaptive threshold, so faint strokes/leaders on low-contrast yellowed scans survive
+    and gray washes resolve cleanly instead of speckling. photo_clean whitens the paper
+    and trims dark scan edges on grayscale photo/mixed pages. Colour detection is
+    cast-robust, so a sepia B&W page is kept as (whitened) grayscale rather than a
+    yellow colour JPEG. Add a page kind by extending classify_page() + the router
+    branch (see the PageType constants).
     -D <dpi> embeds resolution so pages are sized correctly. With ocr=True,
     ocrmypdf adds an invisible text layer at the end (--optimize 0, images intact).
     """
@@ -729,28 +744,30 @@ def compress_one(src: str, dest: str, dpi: int,
         # SAFETY: never rasterise a born-digital (vector/text) PDF. If the file does
         # not look like a scan, copy it through to dest byte-for-byte, untouched
         # (no render, no binarize, no OCR) — this tool is for scanned/image PDFs only.
-        if skip_born_digital:
-            born, bsig = looks_born_digital(src_p, scan_fraction)
-            if born:
-                if not in_place:   # in-place: leave the original vector PDF exactly as-is
-                    dest_p.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
-                    shutil.copyfile(str(src_p), str(tmp_out))
-                    os.replace(str(tmp_out), str(dest_p))
-                where = 'left untouched' if in_place else 'copied untouched'
-                return {'src': src_p.name, 'orig': orig,
-                        'new': orig if in_place else dest_p.stat().st_size,
-                        'pages': bsig.get('sampled'), 'kept': True, 'err': None,
-                        'action': 'born_digital', 'signals': bsig,
-                        'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'}
+        # Always on: a real archive is either scans or born-digital, and the default
+        # scan-fraction cleanly separates the two (see looks_born_digital), so this is
+        # not something a run should ever need to disable.
+        born, bsig = looks_born_digital(src_p)
+        if born:
+            if not in_place:   # in-place: leave the original vector PDF exactly as-is
+                dest_p.parent.mkdir(parents=True, exist_ok=True)
+                tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
+                shutil.copyfile(str(src_p), str(tmp_out))
+                os.replace(str(tmp_out), str(dest_p))
+            where = 'left untouched' if in_place else 'copied untouched'
+            return {'src': src_p.name, 'orig': orig,
+                    'new': orig if in_place else dest_p.stat().st_size,
+                    'pages': bsig.get('sampled'), 'kept': True, 'err': None,
+                    'action': 'born_digital', 'signals': bsig,
+                    'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'}
         note0 = ' (OCR-only, not compressed)' if ocr_only else ''
         # cheap pre-check: sample-compress a few pages; if it won't beat the original,
         # skip full compression and just OCR the original (avoids wasted work + growth).
-        if not ocr_only and not symbol and precheck:
-            proj = sample_projection(src_p, work, dpi, despeckle, thresh, min_size,
+        if not ocr_only:
+            proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                      photo_thresh, photo_dpi, jpeg_quality,
-                                     adaptive, sauvola_k, photo_clean, photo_descreen)
-            if proj >= precheck_skip:
+                                     sauvola_k, photo_clean, photo_descreen)
+            if proj >= PRECHECK_SKIP_RATIO:
                 ocr_only = True
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
         if ocr_only:
@@ -759,7 +776,7 @@ def compress_one(src: str, dest: str, dpi: int,
             shutil.copyfile(str(src_p), str(base))
             res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
                                  len(PdfReader(str(base)).pages), True, note0,
-                                 timeout, verify_output, in_place)
+                                 timeout, in_place)
             res['action'] = 'ocr_only'
             return res
         # 1) render pages to grayscale PNG
@@ -774,7 +791,7 @@ def compress_one(src: str, dest: str, dpi: int,
 
         r = _render()
         pngs = sorted(p.name for p in work.glob('p*.png'))
-        if (r.returncode != 0 or not pngs) and repair:
+        if r.returncode != 0 or not pngs:
             # malformed PDF? try a Ghostscript pdfwrite rewrite, then render the repaired copy
             fixed = _gs_repair(src_p, work, timeout)
             if fixed:
@@ -791,10 +808,9 @@ def compress_one(src: str, dest: str, dpi: int,
         n_color = 0
 
         def _gen_jbig2(name, k):
-            """Binarize (adaptive/global + optional despeckle) + generic self-contained
+            """Binarize (adaptive Sauvola + optional despeckle) + generic self-contained
             JBIG2 for one page → .jb2 name."""
-            if adaptive or despeckle:
-                binarize_png(work / name, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
+            binarize_png(work / name, min_size, despeckle, dpi, sauvola_k)
             jb = f'g{k:05d}.jb2'
             with open(work / jb, 'wb') as jf:
                 rr = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), name],
@@ -803,65 +819,49 @@ def compress_one(src: str, dest: str, dpi: int,
                 raise RuntimeError(f'jbig2 page {k} rc={rr.returncode} {rr.stderr[:160]}')
             return jb
 
-        if symbol:
-            # SYMBOL mode: pure bitonal, one shared dictionary (GS/Acrobat only, no photo detect)
-            if adaptive or despeckle:
-                for name in pngs:
-                    binarize_png(work / name, adaptive, thresh, min_size, despeckle, dpi, sauvola_k)
-            r = subprocess.run([JBIG, '-s', '-p', '-a', '-D', str(dpi), '-b', 'out', *pngs],
-                               cwd=work, capture_output=True, text=True)
-            if r.returncode != 0 or not (work / 'out.sym').exists():
-                return {'src': src_p.name, 'orig': orig, 'new': 0,
-                        'err': f'jbig2 failed rc={r.returncode} {r.stderr[:200]}'}
-            with open(comp, 'wb') as fout:
-                r = subprocess.run([PY, WRAP, 'out'], cwd=work, stdout=fout,
-                                   stderr=subprocess.PIPE, text=True)
-            if r.returncode != 0 or comp.stat().st_size == 0:
-                return {'src': src_p.name, 'orig': orig, 'new': 0,
-                        'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
-        else:
-            # GENERIC + PAGE-TYPE ROUTER: classify every page, then dispatch each to its
-            # strategy. Consecutive BITONAL pages (LINE/BLANK) are grouped into one
-            # multi-page JBIG2 PDF (smaller); PHOTO_* pages become one JPEG PDF each.
-            d = photo_dpi or dpi
-            classes = [classify_page(work / n, k + 1, render_src, work, dpi,
-                                     detect_photos, photo_thresh, photo_dpi)
-                       for k, n in enumerate(pngs)]
-            n_photo = sum(c.type not in _PT_BITONAL for c in classes)
-            n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
-            seg_pdfs = []
-            i = 0
-            try:
-                while i < len(pngs):
-                    seg = work / f's{i:05d}.pdf'
-                    if classes[i].type in _PT_BITONAL:
-                        # a run of consecutive bitonal pages -> one multi-page JBIG2 PDF
-                        jbs, j = [], i
-                        while j < len(pngs) and classes[j].type in _PT_BITONAL:
-                            jbs.append(_gen_jbig2(pngs[j], j)); j += 1
-                        with open(seg, 'wb') as fout:
-                            r = subprocess.run([PY, WRAP, '-s', *jbs], cwd=work, stdout=fout,
-                                               stderr=subprocess.PIPE, text=True)
-                        if r.returncode != 0 or seg.stat().st_size == 0:
-                            return {'src': src_p.name, 'orig': orig, 'new': 0,
-                                    'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
-                        i = j
-                    else:  # PHOTO_GRAY / PHOTO_COLOR
-                        photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_clean, photo_descreen)
-                        i += 1
-                    seg_pdfs.append(seg)
-            except RuntimeError as ex:
-                return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': str(ex)}
+        # PAGE-TYPE ROUTER: classify every page, then dispatch each to its strategy.
+        # Consecutive BITONAL pages (LINE/BLANK) are grouped into one multi-page
+        # generic JBIG2 PDF (self-contained, so it renders in Chrome/Edge); PHOTO_*
+        # pages each become one JPEG PDF.
+        d = photo_dpi or dpi
+        classes = [classify_page(work / n, k + 1, render_src, work, dpi,
+                                 True, photo_thresh, photo_dpi)
+                   for k, n in enumerate(pngs)]
+        n_photo = sum(c.type not in _PT_BITONAL for c in classes)
+        n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
+        seg_pdfs = []
+        i = 0
+        try:
+            while i < len(pngs):
+                seg = work / f's{i:05d}.pdf'
+                if classes[i].type in _PT_BITONAL:
+                    # a run of consecutive bitonal pages -> one multi-page JBIG2 PDF
+                    jbs, j = [], i
+                    while j < len(pngs) and classes[j].type in _PT_BITONAL:
+                        jbs.append(_gen_jbig2(pngs[j], j)); j += 1
+                    with open(seg, 'wb') as fout:
+                        r = subprocess.run([PY, WRAP, '-s', *jbs], cwd=work, stdout=fout,
+                                           stderr=subprocess.PIPE, text=True)
+                    if r.returncode != 0 or seg.stat().st_size == 0:
+                        return {'src': src_p.name, 'orig': orig, 'new': 0,
+                                'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
+                    i = j
+                else:  # PHOTO_GRAY / PHOTO_COLOR
+                    photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_clean, photo_descreen)
+                    i += 1
+                seg_pdfs.append(seg)
+        except RuntimeError as ex:
+            return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': str(ex)}
 
-            # merge segments in page order
-            if len(seg_pdfs) == 1:
-                os.replace(str(seg_pdfs[0]), str(comp))
-            else:
-                w = PdfWriter()
-                for sp in seg_pdfs:
-                    w.append(str(sp))
-                with open(comp, 'wb') as f:
-                    w.write(f)
+        # merge segments in page order
+        if len(seg_pdfs) == 1:
+            os.replace(str(seg_pdfs[0]), str(comp))
+        else:
+            w = PdfWriter()
+            for sp in seg_pdfs:
+                w.append(str(sp))
+            with open(comp, 'wb') as f:
+                w.write(f)
 
         with open(comp, 'rb') as f:
             if f.read(4) != b'%PDF':
@@ -891,7 +891,7 @@ def compress_one(src: str, dest: str, dpi: int,
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                             len(pngs), kept_original, note, timeout, verify_output, in_place)
+                             len(pngs), kept_original, note, timeout, in_place)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:
@@ -954,11 +954,10 @@ def _default_workers() -> int:
 
 # ── Dry-run preview (runs in a worker process) ────────────────────────────────
 
-def preview_one(src: str, dpi: int, despeckle: bool, thresh: int, min_size: int,
-                ocr_only: bool, detect_photos: bool, photo_thresh: float, photo_dpi: int,
-                jpeg_quality: int, min_savings: float, precheck: bool, precheck_skip: float,
-                adaptive: bool, sauvola_k: float, photo_clean: bool, photo_descreen: float,
-                skip_born_digital: bool, scan_fraction: float) -> dict:
+def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
+                ocr_only: bool, photo_thresh: float, photo_dpi: int,
+                jpeg_quality: int, min_savings: float,
+                sauvola_k: float, photo_clean: bool, photo_descreen: float) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check and the
@@ -967,20 +966,19 @@ def preview_one(src: str, dpi: int, despeckle: bool, thresh: int, min_size: int,
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jbprev_'))
     try:
-        if skip_born_digital:
-            born, bsig = looks_born_digital(src_p, scan_fraction)
-            if born:
-                return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
-                        'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
-                        'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
+        born, bsig = looks_born_digital(src_p)
+        if born:
+            return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
+                    'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
+                    'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
         if ocr_only:
             return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': None, 'kept': True,
                     'err': None, 'action': 'ocr_only', 'note': ' (OCR-only mode; not compressed)'}
-        proj = sample_projection(src_p, work, dpi, despeckle, thresh, min_size,
+        proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
-                                 adaptive, sauvola_k, photo_clean, photo_descreen)
+                                 sauvola_k, photo_clean, photo_descreen)
         est_new = int(proj * orig)
-        if precheck and proj >= precheck_skip:
+        if proj >= PRECHECK_SKIP_RATIO:
             action, note = 'ocr_only', f' (would skip compression: projected {proj*100:.0f}% of original)'
             est_new = orig
         elif proj >= (1 - min_savings):
@@ -1195,8 +1193,11 @@ def _apply_config_defaults(ap: argparse.ArgumentParser) -> None:
     """Load a TOML config of default option values and fold them into the parser
     (so an explicit CLI flag still overrides). Uses --config if given, else
     ./ocrmyworkshopmanual.toml when present. Keys are long option names with dashes
-    as underscores (e.g. `dpi = 300`, `no_ocr = true`, `dest = "OUT"`)."""
-    import tomllib
+    as underscores (e.g. `dpi = 300`, `no_ocr = true`, `dest = "OUT"`).
+    tomllib is stdlib only from Python 3.11+; the import is deferred to here (only
+    once a config file is actually in play) so a run with no config file works fine
+    on 3.10, and a run that DOES need one gets a clear error instead of crashing on
+    startup regardless of whether --config was ever used."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', type=Path)
     known, _ = pre.parse_known_args()
@@ -1206,6 +1207,13 @@ def _apply_config_defaults(ap: argparse.ArgumentParser) -> None:
         return
     if not path.exists():
         print(f'ERROR: config file not found: {path}', file=sys.stderr); sys.exit(1)
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        print('ERROR: reading a TOML config file needs Python 3.11+ (tomllib is stdlib '
+              'there); either upgrade Python or drop the --config / ocrmyworkshopmanual.toml '
+              'and pass options on the command line instead.', file=sys.stderr)
+        sys.exit(1)
     try:
         with open(path, 'rb') as f:
             cfg = tomllib.load(f)
@@ -1271,33 +1279,20 @@ def main():
                          'cores add little and oversubscribing them thrashes; falls back to '
                          'logical count, then 4, if physical cores cannot be detected)')
     ap.add_argument('--limit', type=int, default=0, help='process only first N files (test)')
-    ap.add_argument('--no-recurse', action='store_true',
-                    help='process only PDFs directly in the source folder, not subfolders')
     ap.add_argument('--no-despeckle', action='store_true', help='disable background speckle removal')
-    ap.add_argument('--global-threshold', action='store_true',
-                    help='use the legacy fixed global threshold instead of adaptive binarization '
-                         '(adaptive = background-flatten + Sauvola, the default, is much better on '
-                         'low-contrast/yellowed scans)')
     ap.add_argument('--sauvola-k', type=float, default=0.30,
                     help='adaptive threshold sensitivity (default 0.30; lower=bolder/thicker ink, '
-                         'higher=thinner/cleaner). Ignored with --global-threshold')
-    ap.add_argument('--threshold', type=int, default=125,
-                    help='gray<T => ink for --global-threshold mode only (keep low, ~125)')
+                         'higher=thinner/cleaner)')
     ap.add_argument('--min-size', type=int, default=10, help='remove black blobs smaller than N px')
     ap.add_argument('--no-photo-clean', action='store_true',
                     help='disable paper-whitening + dark-edge cleanup on grayscale photo/mixed pages')
     ap.add_argument('--photo-descreen', type=float, default=0.6,
                     help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
                          'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
-    ap.add_argument('--symbol', action='store_true',
-                    help='shared-dictionary mode: smaller, but BLANK in Chrome/Edge (PDFium). '
-                         'Only for Ghostscript/Acrobat viewing.')
     ap.add_argument('--no-ocr', action='store_true', help='skip the searchable OCR text layer')
     ap.add_argument('--language', default='eng',
                     help='Tesseract OCR language(s), e.g. eng or eng+fra+spa+deu; '
                          "'auto' detects each file's script (Latin->eng, Cyrillic->rus+eng) via Tesseract OSD")
-    ap.add_argument('--no-photo', action='store_true',
-                    help='force all pages bitonal (skip photo detection; photos will look bad)')
     ap.add_argument('--photo-threshold', type=float, default=0.02,
                     help='page kept as image if this fraction of tiles are continuous-tone (default 0.02)')
     ap.add_argument('--photo-dpi', type=int, default=150,
@@ -1309,19 +1304,6 @@ def main():
     ap.add_argument('--ocr-only', action='store_true',
                     help='do not compress at all: copy each original and just add the OCR text layer '
                          '(skips files that already have text)')
-    ap.add_argument('--no-precheck', action='store_true',
-                    help='disable the sample pre-check that skips compression for files it would not shrink')
-    ap.add_argument('--precheck-threshold', type=float, default=0.75,
-                    help='skip full compression if a sample projects the result >= this fraction of the '
-                         'original (default 0.75); the --min-savings fallback still guards the rest')
-    ap.add_argument('--no-skip-born-digital', action='store_true',
-                    help='disable the born-digital SAFETY check (which by default copies any pdf that '
-                         'does not look like a scan straight to dest, untouched); with this flag EVERY '
-                         'pdf is rasterised/compressed, including vector/text ones')
-    ap.add_argument('--scan-fraction', type=float, default=0.5,
-                    help='a pdf is treated as SCANNED (eligible for compression) only if at least this '
-                         'fraction of sampled pages carry a full-page raster image; below this it is '
-                         'considered born-digital and copied through untouched (default 0.5)')
     ap.add_argument('--log', type=Path, default=None,
                     help='path for the run report log (default: a timestamped file in the dest root)')
     ap.add_argument('--no-log', action='store_true', help='do not write a run report log')
@@ -1333,12 +1315,6 @@ def main():
                          'that exceeds it is marked FAILED and the batch continues (0 = no timeout; '
                          'default 7200 = 2h, generous enough for the largest manuals while still '
                          'rescuing a genuinely hung/corrupt pdf)')
-    ap.add_argument('--no-verify-output', action='store_true',
-                    help='skip the post-write check that each output opens and its page count matches '
-                         'the source (the check flags silently-corrupt outputs in the log)')
-    ap.add_argument('--no-repair', action='store_true',
-                    help='do not attempt a Ghostscript pdfwrite repair on a malformed pdf before '
-                         'giving up on it (repair is on by default)')
     ap.add_argument('--min-free-gb', type=float, default=1.0,
                     help='abort before starting if the destination drive has less than this many GB '
                          'free (default 1.0; 0 disables the check)')
@@ -1357,6 +1333,10 @@ def main():
     _apply_config_defaults(ap)
     args = ap.parse_args()
 
+    err = _validate_numeric_args(args)
+    if err:
+        print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
+
     err = check_tools(want_ocr=not args.no_ocr)
     if err:
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
@@ -1364,6 +1344,9 @@ def main():
     src_root = args.src
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
+    if args.no_ocr and args.ocr_only:
+        print('ERROR: --no-ocr and --ocr-only cannot be combined (one skips OCR entirely, '
+              'the other skips compression to ONLY add OCR)', file=sys.stderr); sys.exit(1)
     # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
     # the filename; default output is a sibling "<name> (COMPRESSED).pdf".
     single_dest = None
@@ -1383,8 +1366,7 @@ def main():
             dest_root = single_dest.parent
     elif src_root.is_dir():
         rel_base = src_root
-        globber = src_root.glob if args.no_recurse else src_root.rglob
-        pdfs = sorted(p for p in globber('*.pdf'))
+        pdfs = sorted(p for p in src_root.rglob('*.pdf'))
         dest_root = rel_base if args.in_place else (args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)'))
     else:
         print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
@@ -1437,18 +1419,15 @@ def main():
     print(f'Source      : {src_root}')
     print(f'Dest        : {"IN-PLACE (overwrites source PDFs)" if args.in_place else dest_root}')
     ocr_desc = f'OCR({args.language})' if not args.no_ocr else 'no OCR'
-    bd_desc = ('no born-digital check' if args.no_skip_born_digital
-               else f'born-digital-safe (scan-frac>={args.scan_fraction:g})')
+    bd_desc = 'born-digital-safe'
     if args.ocr_only:
         print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
               f'@ {args.workers} workers, OCR-ONLY (no compression), {ocr_desc}, {bd_desc}\n')
     else:
-        photo_desc = 'no photo-detect' if (args.no_photo or args.symbol) else f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
-        bin_desc = (f'global T={args.threshold}' if args.global_threshold
-                    else f'adaptive(sauvola k={args.sauvola_k:g})')
+        photo_desc = f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
+        bin_desc = f'adaptive(sauvola k={args.sauvola_k:g})'
         print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
-              f'@ {args.dpi} dpi, {args.workers} workers, '
-              f'{"symbol" if args.symbol else "generic"} mode, {bin_desc}, '
+              f'@ {args.dpi} dpi, {args.workers} workers, generic mode, {bin_desc}, '
               f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
               f'{photo_desc}, {ocr_desc}, {bd_desc}\n')
     if not jobs:
@@ -1484,25 +1463,19 @@ def main():
                                 initializer=set_below_normal_priority) as ex:
         if args.dry_run:
             futs = {ex.submit(preview_one, s, args.dpi,
-                              not args.no_despeckle, args.threshold, args.min_size, args.ocr_only,
-                              not args.no_photo, args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                              args.min_savings, not args.no_precheck, args.precheck_threshold,
-                              not args.global_threshold, args.sauvola_k,
-                              not args.no_photo_clean, args.photo_descreen,
-                              not args.no_skip_born_digital, args.scan_fraction): (s, d)
+                              not args.no_despeckle, args.min_size, args.ocr_only,
+                              args.photo_threshold, args.photo_dpi, args.jpeg_quality,
+                              args.min_savings, args.sauvola_k,
+                              not args.no_photo_clean, args.photo_descreen): (s, d)
                     for s, d in jobs}
         else:
             futs = {ex.submit(compress_one, s, d, args.dpi,
-                              not args.no_despeckle, args.threshold, args.min_size, args.symbol,
+                              not args.no_despeckle, args.min_size,
                               not args.no_ocr, args.language,
-                              not args.no_photo, args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                              args.min_savings, args.ocr_only,
-                              not args.no_precheck, args.precheck_threshold,
-                              not args.global_threshold, args.sauvola_k,
+                              args.photo_threshold, args.photo_dpi, args.jpeg_quality,
+                              args.min_savings, args.ocr_only, args.sauvola_k,
                               not args.no_photo_clean, args.photo_descreen,
-                              not args.no_skip_born_digital, args.scan_fraction,
-                              args.timeout, not args.no_verify_output,
-                              not args.no_repair, args.in_place): (s, d)
+                              args.timeout, args.in_place): (s, d)
                     for s, d in jobs}
         N = len(jobs)
         # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
@@ -1569,19 +1542,14 @@ def main():
     if not args.no_log:
         settings = {
             'in_place': args.in_place,
-            'dpi': args.dpi, 'workers': args.workers, 'mode': 'symbol' if args.symbol else 'generic',
-            'binarization': f'global T={args.threshold}' if args.global_threshold
-                            else f'adaptive sauvola-k={args.sauvola_k:g}',
+            'dpi': args.dpi, 'workers': args.workers, 'mode': 'generic',
+            'binarization': f'adaptive sauvola-k={args.sauvola_k:g}',
             'despeckle': not args.no_despeckle, 'min_size': args.min_size,
-            'photo_detect': not (args.no_photo or args.symbol),
             'photo_threshold': args.photo_threshold, 'photo_dpi': args.photo_dpi,
             'jpeg_quality': args.jpeg_quality, 'photo_clean': not args.no_photo_clean,
             'photo_descreen': args.photo_descreen, 'ocr': ocr_desc, 'ocr_only': args.ocr_only,
-            'min_savings': args.min_savings, 'precheck': not args.no_precheck,
-            'precheck_threshold': args.precheck_threshold,
-            'born_digital_check': not args.no_skip_born_digital, 'scan_fraction': args.scan_fraction,
-            'timeout': args.timeout, 'verify_output': not args.no_verify_output,
-            'repair': not args.no_repair, 'duplicate_check': not args.no_duplicate_check,
+            'min_savings': args.min_savings,
+            'timeout': args.timeout, 'duplicate_check': not args.no_duplicate_check,
             'retry_failed': str(args.retry_failed) if args.retry_failed else False,
             'dry_run': args.dry_run,
         }
