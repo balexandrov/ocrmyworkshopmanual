@@ -42,11 +42,11 @@ BITONAL_COMBOS = [
     dict(sauvola_k=0.40),
 ]
 
-# Grayscale photo/mixed: quality x descreen x paper-clean.
+# Grayscale photo/mixed: quality x descreen (paper-whitening is always on).
 PHOTO_GRAY_COMBOS = [
-    dict(quality=q, descreen=d, clean=c)
-    for q in (40, 60, 80) for d in (0.0, 0.6) for c in (True,)
-] + [dict(quality=60, descreen=0.6, clean=False)]  # what paper-clean actually buys
+    dict(quality=q, descreen=d)
+    for q in (40, 60, 80) for d in (0.0, 0.6)
+]
 
 # Colour: quality x downsample dpi.
 PHOTO_COLOR_COMBOS = [
@@ -90,11 +90,11 @@ def _photo_row(pdf, page_type, combo, art_dir):
         d = photo_dpi or DPI
         out_pdf = work / 'seg.pdf'
         U.owm.photo_seg_pdf(pc, out_pdf, work, 1, d, combo['quality'],
-                            combo.get('clean', True), combo.get('descreen', 0.6))
+                            combo.get('descreen', 0.6))
         jpg = work / 'photo1.jpg'
         jpg_bytes = jpg.stat().st_size if jpg.exists() else 0
         if page_type == 'photo_gray':
-            tag = f"q{combo['quality']}_ds{combo['descreen']}_clean{int(combo['clean'])}"
+            tag = f"q{combo['quality']}_ds{combo['descreen']}"
         else:
             tag = f"q{combo['quality']}_dpi{combo['photo_dpi']}"
         art_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +177,7 @@ def test_default_settings_produce_a_valid_output(page_type, pdf):
         if page_type in ('line', 'blank'):
             m = _bitonal_row(pdf, dict(sauvola_k=0.30), art_dir)
         elif page_type == 'photo_gray':
-            m = _photo_row(pdf, page_type, dict(quality=60, descreen=0.6, clean=True), art_dir)
+            m = _photo_row(pdf, page_type, dict(quality=60, descreen=0.6), art_dir)
         else:
             m = _photo_row(pdf, page_type, dict(quality=60, photo_dpi=150), art_dir)
     finally:

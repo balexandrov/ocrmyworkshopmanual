@@ -50,9 +50,10 @@ Tuning notes (learned on Toyota FSM scans):
                    resolves a gray shaded wash (foldout wiring diagrams) cleanly,
                    where a fixed global threshold either erodes ink or (high) makes
                    salt-and-pepper. --sauvola-k tunes boldness.
-  photo pages      grayscale photo/mixed pages are paper-whitened + edge-trimmed
-                   (--no-photo-clean off); colour detection is cast-robust so a sepia
-                   B&W page stays whitened-grayscale, not a yellow colour JPEG.
+  photo pages      grayscale photo/mixed pages are always paper-whitened + edge-trimmed
+                   (--photo-descreen 0 to skip only the halftone-smoothing blur);
+                   colour detection is cast-robust so a sepia B&W page stays
+                   whitened-grayscale, not a yellow colour JPEG.
   --min-size 10    drop black connected components smaller than N px (scan speckle).
 
 Dependencies:
@@ -84,6 +85,8 @@ from pypdf import PdfReader, PdfWriter
 from scipy import ndimage
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+
+__version__ = '0.1.0'
 
 Image.MAX_IMAGE_PIXELS = None  # trusted local scans; foldout pages can be huge
 
@@ -423,7 +426,7 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
 
 
 def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
-                  d: int, quality: int, clean: bool, descreen: float = 0.6):
+                  d: int, quality: int, descreen: float = 0.6):
     """Strategy for PHOTO_GRAY / PHOTO_COLOR: JPEG the pre-rendered colour page and wrap
     it to a 1-page PDF sized (via embedded dpi) to match the bitonal pages. Colour pages
     are kept as-is; grayscale (B&W photo/mixed/stipple) pages get descreen + paper-whitening
@@ -433,7 +436,7 @@ def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
         out_im = im
     else:
         g = np.asarray(im.convert('L'))
-        if clean and float((g > 200).mean()) > 0.10:  # paper present -> document page, not full-bleed
+        if float((g > 200).mean()) > 0.10:  # paper present -> document page, not full-bleed
             g = _clean_paper(g, d, descreen)
         out_im = Image.fromarray(g)
     jpg = work / f'photo{page_no}.jpg'
@@ -665,7 +668,7 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
 
 def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
                       min_size: int, photo_thresh: float, photo_dpi: int, jpeg_quality: int,
-                      sauvola_k: float = 0.30, photo_clean: bool = True,
+                      sauvola_k: float = 0.30,
                       photo_descreen: float = 0.6, k: int = 10) -> float:
     """Estimate the whole-file compressed/original ratio by running the per-page
     pipeline on k evenly-spaced SAMPLE pages only (cheap 'will this compress?'
@@ -699,7 +702,7 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
         else:
             d = photo_dpi or dpi
             jpg = sub / f'j{p}.jpg'
-            photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_clean, photo_descreen)
+            photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_descreen)
             # photo_seg_pdf writes photo{p}.jpg then a tiny PDF wrapper; size ~ the JPEG
             comp += (sub / f'photo{p}.jpg').stat().st_size
     shutil.rmtree(sub, ignore_errors=True)
@@ -719,8 +722,7 @@ def compress_one(src: str, dest: str, dpi: int,
                  photo_thresh: float = 0.02,
                  photo_dpi: int = 150, jpeg_quality: int = 60,
                  min_savings: float = 0.25, ocr_only: bool = False,
-                 sauvola_k: float = 0.30,
-                 photo_clean: bool = True, photo_descreen: float = 0.6,
+                 sauvola_k: float = 0.30, photo_descreen: float = 0.6,
                  timeout: int = 0, in_place: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
@@ -729,8 +731,9 @@ def compress_one(src: str, dest: str, dpi: int,
     JBIG2 (self-contained, so it renders in Chrome/Edge), photo pages become one JPEG
     each, all merged back in order. Binarization is background-flatten + Sauvola
     adaptive threshold, so faint strokes/leaders on low-contrast yellowed scans survive
-    and gray washes resolve cleanly instead of speckling. photo_clean whitens the paper
-    and trims dark scan edges on grayscale photo/mixed pages. Colour detection is
+    and gray washes resolve cleanly instead of speckling. Grayscale photo/mixed pages
+    always get their paper whitened and dark scan edges trimmed (skipped automatically
+    on a full-bleed photo with little visible paper). Colour detection is
     cast-robust, so a sepia B&W page is kept as (whitened) grayscale rather than a
     yellow colour JPEG. Add a page kind by extending classify_page() + the router
     branch (see the PageType constants).
@@ -766,7 +769,7 @@ def compress_one(src: str, dest: str, dpi: int,
         if not ocr_only:
             proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                      photo_thresh, photo_dpi, jpeg_quality,
-                                     sauvola_k, photo_clean, photo_descreen)
+                                     sauvola_k, photo_descreen)
             if proj >= PRECHECK_SKIP_RATIO:
                 ocr_only = True
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
@@ -847,7 +850,7 @@ def compress_one(src: str, dest: str, dpi: int,
                                 'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
                     i = j
                 else:  # PHOTO_GRAY / PHOTO_COLOR
-                    photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_clean, photo_descreen)
+                    photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_descreen)
                     i += 1
                 seg_pdfs.append(seg)
         except RuntimeError as ex:
@@ -957,7 +960,7 @@ def _default_workers() -> int:
 def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                 ocr_only: bool, photo_thresh: float, photo_dpi: int,
                 jpeg_quality: int, min_savings: float,
-                sauvola_k: float, photo_clean: bool, photo_descreen: float) -> dict:
+                sauvola_k: float, photo_descreen: float) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check and the
@@ -976,7 +979,7 @@ def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     'err': None, 'action': 'ocr_only', 'note': ' (OCR-only mode; not compressed)'}
         proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
-                                 sauvola_k, photo_clean, photo_descreen)
+                                 sauvola_k, photo_descreen)
         est_new = int(proj * orig)
         if proj >= PRECHECK_SKIP_RATIO:
             action, note = 'ocr_only', f' (would skip compression: projected {proj*100:.0f}% of original)'
@@ -1260,6 +1263,7 @@ def _read_failed_rels(csv_path: Path) -> list:
 def main():
     ap = argparse.ArgumentParser(
         description='Compress scanned PDFs to small generic-JBIG2 and add a searchable OCR text layer.')
+    ap.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     ap.add_argument('src', type=Path,
                     help='source: a folder tree of scanned PDFs, OR a single .pdf file')
     ap.add_argument('--dest', type=Path, default=None,
@@ -1284,8 +1288,6 @@ def main():
                     help='adaptive threshold sensitivity (default 0.30; lower=bolder/thicker ink, '
                          'higher=thinner/cleaner)')
     ap.add_argument('--min-size', type=int, default=10, help='remove black blobs smaller than N px')
-    ap.add_argument('--no-photo-clean', action='store_true',
-                    help='disable paper-whitening + dark-edge cleanup on grayscale photo/mixed pages')
     ap.add_argument('--photo-descreen', type=float, default=0.6,
                     help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
                          'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
@@ -1318,11 +1320,6 @@ def main():
     ap.add_argument('--min-free-gb', type=float, default=1.0,
                     help='abort before starting if the destination drive has less than this many GB '
                          'free (default 1.0; 0 disables the check)')
-    ap.add_argument('--no-duplicate-check', action='store_true',
-                    help='disable the default duplicate flagging (which hashes each processed file and '
-                         'notes in the report when two files are byte-identical). Files are ALWAYS '
-                         'processed and get their own output — duplicates are only flagged, never '
-                         'skipped (byte-identical files can legitimately belong to different manuals)')
     ap.add_argument('--retry-failed', type=Path, default=None, metavar='REPORT.csv',
                     help='reprocess ONLY the files marked FAILED in a previous run report .csv '
                          '(re-runs them even if a dest exists)')
@@ -1465,8 +1462,7 @@ def main():
             futs = {ex.submit(preview_one, s, args.dpi,
                               not args.no_despeckle, args.min_size, args.ocr_only,
                               args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                              args.min_savings, args.sauvola_k,
-                              not args.no_photo_clean, args.photo_descreen): (s, d)
+                              args.min_savings, args.sauvola_k, args.photo_descreen): (s, d)
                     for s, d in jobs}
         else:
             futs = {ex.submit(compress_one, s, d, args.dpi,
@@ -1474,12 +1470,12 @@ def main():
                               not args.no_ocr, args.language,
                               args.photo_threshold, args.photo_dpi, args.jpeg_quality,
                               args.min_savings, args.ocr_only, args.sauvola_k,
-                              not args.no_photo_clean, args.photo_descreen,
+                              args.photo_descreen,
                               args.timeout, args.in_place): (s, d)
                     for s, d in jobs}
         N = len(jobs)
         # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
-        dup_check = not args.no_duplicate_check and not args.dry_run
+        dup_check = not args.dry_run
         seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
         for i, fut in enumerate(cf.as_completed(futs), 1):
             s, d = futs[fut]
@@ -1546,10 +1542,10 @@ def main():
             'binarization': f'adaptive sauvola-k={args.sauvola_k:g}',
             'despeckle': not args.no_despeckle, 'min_size': args.min_size,
             'photo_threshold': args.photo_threshold, 'photo_dpi': args.photo_dpi,
-            'jpeg_quality': args.jpeg_quality, 'photo_clean': not args.no_photo_clean,
+            'jpeg_quality': args.jpeg_quality,
             'photo_descreen': args.photo_descreen, 'ocr': ocr_desc, 'ocr_only': args.ocr_only,
             'min_savings': args.min_savings,
-            'timeout': args.timeout, 'duplicate_check': not args.no_duplicate_check,
+            'timeout': args.timeout,
             'retry_failed': str(args.retry_failed) if args.retry_failed else False,
             'dry_run': args.dry_run,
         }

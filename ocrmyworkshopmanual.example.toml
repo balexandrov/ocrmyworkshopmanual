@@ -22,8 +22,7 @@ sauvola_k = 0.30          # lower = bolder/thicker ink, higher = thinner/cleaner
 # ── photo/colour pages ────────────────────────────────────────────────────────
 jpeg_quality = 60
 photo_dpi = 150
-photo_descreen = 0.6
-# no_photo_clean = false
+photo_descreen = 0.6      # 0 = skip only the halftone-smoothing blur (paper-whitening always runs)
 
 # ── don't-degrade / routing ───────────────────────────────────────────────────
 min_savings = 0.25
@@ -31,5 +30,4 @@ min_savings = 0.25
 # ── resilience / large collections ────────────────────────────────────────────
 timeout = 1800            # per-file render/OCR ceiling in seconds (0 = off)
 min_free_gb = 1.0         # abort if the dest drive has less than this free (0 = off)
-# no_duplicate_check = false  # true = turn off the default byte-identical duplicate flagging
 # no_log = false

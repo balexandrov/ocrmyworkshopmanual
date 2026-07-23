@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocrmyworkshopmanual"
+dynamic = ["version"]
+description = "Turn a folder of scanned, image-only PDFs into small, searchable PDFs (JBIG2 + OCR) without wrecking photos or breaking in browsers."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "balexandrov" }]
+keywords = ["pdf", "ocr", "jbig2", "scan", "compression", "ocrmypdf", "ghostscript"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Text Processing",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "Pillow",
+    "ocrmypdf",
+    "pypdf",
+    "img2pdf",
+]
+
+[project.urls]
+Homepage = "https://github.com/balexandrov/ocrmyworkshopmanual"
+Repository = "https://github.com/balexandrov/ocrmyworkshopmanual"
+
+[project.scripts]
+ocrmyworkshopmanual = "ocrmyworkshopmanual:main"
+scan-candidates = "scan_candidates:main"
+
+[tool.setuptools]
+py-modules = ["ocrmyworkshopmanual", "scan_candidates"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ocrmyworkshopmanual.__version__" }
