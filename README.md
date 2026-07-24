@@ -217,6 +217,32 @@ Writes into `./reports`:
 Typical flow: scan → skim the ranked CSV → compress the folders you want (e.g. with
 `--in-place`).
 
+## Combining loose pages (`combine_manual.py`)
+
+Some manuals arrive as a folder of **loose page images** (`1-1.jpg`, `1-2.jpg`,
+… `2a-1.jpg`, `2b-1.jpg`, …) and/or small per-section PDFs, rather than one file.
+`combine_manual.py` merges such a folder into a **single PDF named after the
+folder**, written next to it, and then (by default) runs it through the main tool
+to compress and add a searchable text layer.
+
+```bash
+python combine_manual.py "…\Honda\--Engines--\Haynes_ZC_Manual"
+#   -> …\Honda\--Engines--\Haynes_ZC_Manual.pdf   (combined, then compressed+OCR'd)
+
+python combine_manual.py FOLDER --dry-run       # just print the page order, write nothing
+python combine_manual.py FOLDER --no-compress   # raw combined PDF only, skip compress/OCR
+python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdata
+```
+
+- Uses only files **directly** in the folder (a `*_files` HTML-asset subdir, or a
+  stray `.htm`/`.txt`, is ignored) — images (`jpg/png/tif/…`) and loose PDFs, mixed.
+- Orders pages by a **natural sort**, so `1-2` comes before `1-11` and `2a` before
+  `2b`. Page order is the one thing that has to be right, so it **always prints the
+  order first** — run `--dry-run` to eyeball it before committing.
+- Images are wrapped losslessly (img2pdf embeds the JPEG as-is, no re-encode). As
+  usual, if the combined scan won't benefit from JBIG2 (photo-heavy Haynes-style
+  pages), the compress step keeps the images and just adds the OCR layer.
+
 ## Born-digital safety
 
 This tool rasterizes each page, which is exactly what you want for **scanned** PDFs but

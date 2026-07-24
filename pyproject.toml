@@ -39,9 +39,10 @@ Repository = "https://github.com/balexandrov/ocrmyworkshopmanual"
 [project.scripts]
 ocrmyworkshopmanual = "ocrmyworkshopmanual:main"
 scan-candidates = "scan_candidates:main"
+combine-manual = "combine_manual:main"
 
 [tool.setuptools]
-py-modules = ["ocrmyworkshopmanual", "scan_candidates"]
+py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ocrmyworkshopmanual.__version__" }
