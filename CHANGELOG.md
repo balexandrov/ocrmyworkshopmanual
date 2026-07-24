@@ -5,6 +5,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `combine_manual.py`: combine a folder of loose page images (and/or small
+  per-section PDFs) into one PDF named after the folder, in natural page order
+  (`1-2` before `1-11`, `2a` before `2b`), written as a sibling of the folder,
+  then compressed + OCR'd via the main tool by default. `--dry-run` prints the
+  page order without writing; `--no-compress` leaves the raw combined PDF.
+  Console-script entry point `combine-manual`.
+
 ## [0.1.0] - 2026-07-23
 
 First versioned baseline. The project had already been through several
