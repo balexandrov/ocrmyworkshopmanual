@@ -1264,8 +1264,9 @@ def main():
     ap = argparse.ArgumentParser(
         description='Compress scanned PDFs to small generic-JBIG2 and add a searchable OCR text layer.')
     ap.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
-    ap.add_argument('src', type=Path,
-                    help='source: a folder tree of scanned PDFs, OR a single .pdf file')
+    ap.add_argument('src', type=Path, nargs='?', default=None,
+                    help='source: a folder tree of scanned PDFs, OR a single .pdf file '
+                         '(omit when using --from-list)')
     ap.add_argument('--dest', type=Path, default=None,
                     help='output root for a folder (default: sibling "<src> (COMPRESSED)"), '
                          'or the output path/folder for a single-file src (default: sibling '
@@ -1323,6 +1324,13 @@ def main():
     ap.add_argument('--retry-failed', type=Path, default=None, metavar='REPORT.csv',
                     help='reprocess ONLY the files marked FAILED in a previous run report .csv '
                          '(re-runs them even if a dest exists)')
+    ap.add_argument('--from-list', type=Path, default=None, metavar='FILE',
+                    help='process the exact list of PDF paths in FILE (one per line; # comments ok), '
+                         'each compressed/OCR IN PLACE. For working a specific SUBSET of a huge tree '
+                         'without walking the whole thing — plain folder mode already runs one global '
+                         'worker pool across every PDF under the tree, so it is NOT folder-limited; '
+                         'reach for --from-list only when you want to hand-pick which files to do. '
+                         'Ignores the src argument.')
     ap.add_argument('--config', type=Path, default=None,
                     help='TOML config file of default option values (CLI flags override it); if omitted, '
                          './ocrmyworkshopmanual.toml is loaded when present. Keys match long option '
@@ -1338,36 +1346,63 @@ def main():
     if err:
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
 
-    src_root = args.src
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
     if args.no_ocr and args.ocr_only:
         print('ERROR: --no-ocr and --ocr-only cannot be combined (one skips OCR entirely, '
               'the other skips compression to ONLY add OCR)', file=sys.stderr); sys.exit(1)
-    # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
-    # the filename; default output is a sibling "<name> (COMPRESSED).pdf".
+    if args.from_list and args.src:
+        print('ERROR: pass EITHER a src OR --from-list, not both', file=sys.stderr); sys.exit(1)
+    if not args.from_list and not args.src:
+        print('ERROR: give a source folder/.pdf, or --from-list FILE', file=sys.stderr); sys.exit(1)
+
     single_dest = None
-    if src_root.is_file():
-        if src_root.suffix.lower() != '.pdf':
-            print(f'ERROR: not a PDF: {src_root}', file=sys.stderr); sys.exit(1)
-        rel_base = src_root.parent
-        pdfs = [src_root]
-        if args.in_place:
-            dest_root = rel_base
-        elif args.dest:
-            single_dest = args.dest if args.dest.suffix.lower() == '.pdf' \
-                else args.dest / src_root.name
-            dest_root = single_dest.parent
-        else:
-            single_dest = src_root.with_name(f'{src_root.stem} (COMPRESSED){src_root.suffix}')
-            dest_root = single_dest.parent
-    elif src_root.is_dir():
-        rel_base = src_root
-        pdfs = sorted(p for p in src_root.rglob('*.pdf'))
-        dest_root = rel_base if args.in_place else (args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)'))
+    if args.from_list:
+        # GLOBAL-POOL mode: an explicit list of PDFs, each processed IN PLACE. Everything
+        # downstream is the normal in-place path, but the job list spans all folders at once,
+        # so the single worker pool parallelises across the whole set (not per-folder).
+        if not args.from_list.exists():
+            print(f'ERROR: --from-list file not found: {args.from_list}', file=sys.stderr); sys.exit(1)
+        listed = [Path(x.strip()) for x in args.from_list.read_text(encoding='utf-8').splitlines()
+                  if x.strip() and not x.strip().startswith('#')]
+        pdfs = [p for p in listed if p.suffix.lower() == '.pdf' and p.is_file()]
+        if not pdfs:
+            print(f'ERROR: no existing .pdf paths in {args.from_list}', file=sys.stderr); sys.exit(1)
+        args.in_place = True   # listed files are compressed/OCR'd where they sit
+        try:
+            rel_base = Path(os.path.commonpath([str(p) for p in pdfs]))
+        except ValueError:      # paths on different drives -> no common base
+            rel_base = pdfs[0].parent
+        dest_root = rel_base
+        src_root = args.from_list
+        miss = len(listed) - len(pdfs)
+        print(f'From-list: {len(pdfs)} PDF(s) from {args.from_list.name}'
+              + (f'  ({miss} skipped: missing or non-.pdf)' if miss else ''))
     else:
-        print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
-              file=sys.stderr); sys.exit(1)
+        src_root = args.src
+        # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
+        # the filename; default output is a sibling "<name> (COMPRESSED).pdf".
+        if src_root.is_file():
+            if src_root.suffix.lower() != '.pdf':
+                print(f'ERROR: not a PDF: {src_root}', file=sys.stderr); sys.exit(1)
+            rel_base = src_root.parent
+            pdfs = [src_root]
+            if args.in_place:
+                dest_root = rel_base
+            elif args.dest:
+                single_dest = args.dest if args.dest.suffix.lower() == '.pdf' \
+                    else args.dest / src_root.name
+                dest_root = single_dest.parent
+            else:
+                single_dest = src_root.with_name(f'{src_root.stem} (COMPRESSED){src_root.suffix}')
+                dest_root = single_dest.parent
+        elif src_root.is_dir():
+            rel_base = src_root
+            pdfs = sorted(p for p in src_root.rglob('*.pdf'))
+            dest_root = rel_base if args.in_place else (args.dest or src_root.parent / (src_root.name + ' (COMPRESSED)'))
+        else:
+            print(f'ERROR: source not found (need a folder or a .pdf file): {src_root}',
+                  file=sys.stderr); sys.exit(1)
 
     # disk-space guard: abort before doing work if the dest drive is nearly full
     if args.min_free_gb and not args.dry_run:

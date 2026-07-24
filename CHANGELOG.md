@@ -7,6 +7,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `--from-list FILE`: compress+OCR in place exactly the PDF paths listed in
+  FILE, as one global worker pool spanning all of them. For hand-picking a
+  subset of a huge tree without walking the whole thing — note plain folder
+  mode already runs one global pool over every PDF under the tree (concurrency
+  was never folder-limited in the tool itself). `src` is now optional when
+  `--from-list` is given.
 - `combine_manual.py`: combine a folder of loose page images (and/or small
   per-section PDFs) into one PDF named after the folder, in natural page order
   (`1-2` before `1-11`, `2a` before `2b`), written as a sibling of the folder,
