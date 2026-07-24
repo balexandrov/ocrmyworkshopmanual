@@ -123,9 +123,15 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 
 ### Options
 
+> **Concurrency note:** point `src` at a folder and the whole tree is walked
+> recursively into **one** global worker pool — every PDF under it, in every
+> subfolder, is fed to `--workers` processes at once. Concurrency is **not**
+> limited per-folder; you don't need to do anything special to keep all workers
+> busy across a deep tree.
+
 | Option | Default | Meaning |
 |---|---|---|
-| `src` (positional) | — | Source folder tree of scanned PDFs (required) |
+| `src` (positional) | — | Source folder tree of scanned PDFs (recursed into one global pool). Omit only when using `--from-list` |
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
 | `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
@@ -144,6 +150,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `7200` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
+| `--from-list FILE` | — | Compress+OCR **in place** exactly the PDF paths listed in FILE (one per line), as one global pool. For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
 | `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
