@@ -7,6 +7,32 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Colour loss on colour line-art** (colour wiring diagrams / schematics). The
+  page router gated its colour test behind continuous-tone *photo* coverage, so
+  flat-colour line art (coverage ~0) was routed to the bitonal path and
+  binarized to 1-bit b&w — destroying the colour — without the colour test ever
+  running. Now a cheap colourspace pre-filter + a Ghostscript colour probe route
+  genuine colour line art to a new lossless source-page pass-through
+  (`PT_COLOR_LINE`); plain b&w and sepia pages are unaffected.
+- **Colour, hyperlinks and quality loss on MIXED (part-vector, part-scanned)
+  PDFs** — e.g. owner's manuals with a vector TOC/nav page plus scanned content:
+  - Born-digital *vector* pages inside an otherwise-scanned file are now detected
+    **per page** and passed through losslessly (`PT_VECTOR`), instead of the
+    whole file being rasterized — so their vector text, colour and hyperlinks
+    survive.
+  - High-resolution scans are re-rendered **per page at their native DPI**
+    instead of a fixed 200 dpi, so a 300/400-dpi scan is no longer downsampled
+    (a visible quality loss); low-res pages keep the fast batched render so they
+    don't bloat.
+  - **Bookmarks** (document outline) are cloned onto the rebuilt PDF (1:1 page
+    mapping) instead of being dropped.
+- **OCR language detection robustness:**
+  - Tesseract OSD mislabelled sparse English pages (wiring diagrams) as Cyrillic
+    at low confidence, yielding slow, lower-quality `rus+eng` OCR. A per-page OSD
+    confidence floor now ignores that noise; genuine Russian still detects.
+  - A detected/requested language whose pack isn't installed silently failed OCR
+    and dropped the whole text layer. The language is now filtered to installed
+    packs, degrading to `eng`/available instead of failing.
 - Very-high-page-count PDFs (multi-thousand-page manuals) failed with a Windows
   `WinError 206` ("filename or extension too long"): the JBIG2 wrapper was
   called with one command-line argument per page, overflowing the OS

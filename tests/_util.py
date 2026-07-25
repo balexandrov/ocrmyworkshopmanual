@@ -147,6 +147,39 @@ def make_color_line_pdf(path: Path, size=(1000, 1400)) -> Path:
     return path
 
 
+def make_scan_pdf(path: Path, npages: int = 3, dpi: int = 300) -> Path:
+    """Make a multi-page 'scanned' PDF: each page is a grayscale raster of black text on
+    white at `dpi` (DeviceGray image, no vector text) — i.e. a high-resolution bitonal
+    scan that JBIG2 compresses hugely and whose native DPI can exceed the render floor."""
+    import img2pdf
+    from PIL import Image, ImageDraw, ImageFont
+    from pypdf import PdfReader, PdfWriter
+    wpx, hpx = round(8.5 * dpi), round(11 * dpi)
+    try:
+        font = ImageFont.truetype('arial.ttf', round(dpi * 0.13))
+    except Exception:
+        font = ImageFont.load_default()
+    wr = PdfWriter()
+    for i in range(npages):
+        im = Image.new('L', (wpx, hpx), 255)
+        d = ImageDraw.Draw(im)
+        for ln in range(40):
+            d.text((round(dpi * 0.5), round(dpi * 0.5) + ln * round(dpi * 0.21)),
+                   f'Scan page {i + 1} line {ln}: high-resolution service manual text.',
+                   fill=0, font=font)
+        pg_png = path.with_name(f'{path.stem}_s{i}.png')
+        im.save(pg_png, dpi=(dpi, dpi))
+        pg_pdf = path.with_name(f'{path.stem}_s{i}.pdf')
+        with open(pg_pdf, 'wb') as f:
+            f.write(img2pdf.convert(str(pg_png), dpi=dpi))
+        wr.append(str(pg_pdf))
+        pg_png.unlink(missing_ok=True)
+        pg_pdf.unlink(missing_ok=True)
+    with open(path, 'wb') as f:
+        wr.write(f)
+    return path
+
+
 def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25) -> Path:
     """Hand-build a valid born-digital PDF: vector Helvetica text, NO raster images.
     Used to test the born-digital safety check (looks_born_digital / copy-through).
