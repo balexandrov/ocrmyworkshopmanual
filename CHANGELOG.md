@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Hardened the batch run against partial-failure modes found in the field:
+  - A worker dying (`BrokenProcessPool` from an OOM/OS-kill/native crash) no
+    longer aborts the whole run with an opaque traceback — the affected files
+    are marked FAILED (originals untouched) and the run finishes with a
+    complete report you can `--retry-failed`.
+  - Console output is now crash-safe: if stdout closes (e.g. a `| head`
+    reader exits), progress printing is swallowed instead of killing the run —
+    the per-file report CSV is the durable record.
+  - `Ctrl-C` writes the partial report for work done so far and exits 130.
+  - Startup sweeps stale render-scratch dirs (`jb_*` / `jbprev_*`) left in the
+    temp dir by earlier killed runs (a killed worker skips its cleanup), age-
+    gated so a concurrently-running instance's active scratch is never touched.
+  - A failed atomic swap no longer leaves a stray `.part` file behind.
+  - The end-of-run summary calls out failures and points at `--retry-failed`.
+
 ### Added
 
 - `--from-list FILE`: compress+OCR in place exactly the PDF paths listed in

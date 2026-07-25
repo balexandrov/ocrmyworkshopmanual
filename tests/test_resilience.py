@@ -82,6 +82,34 @@ def test_bright_colour_page_not_classified_blank(tmp_path):
 
 # ── config file / dedup / retry / repair ─────────────────────────────────────
 
+def test_say_survives_broken_stdout(monkeypatch, capsys):
+    """_say must never raise when stdout is broken (the closed-pipe case that a
+    `| head` reader triggers) — a dropped progress line can't be allowed to abort
+    a long run."""
+    import io
+
+    class BrokenOut(io.StringIO):
+        def write(self, *a, **k):
+            raise BrokenPipeError(32, 'broken pipe')
+    monkeypatch.setattr(sys, 'stdout', BrokenOut())
+    U.owm._say('this write would raise')   # must NOT propagate
+
+
+def test_sweep_stale_scratch_removes_old_keeps_fresh(tmp_path, monkeypatch):
+    """Startup sweep removes render-scratch left by killed runs (mtime older than the
+    cutoff) but never touches a fresh dir (an actively-rendering concurrent run)."""
+    import os
+    monkeypatch.setattr(U.owm.tempfile, 'gettempdir', lambda: str(tmp_path))
+    old = tmp_path / 'jb_old'; old.mkdir(); (old / 'p.png').write_bytes(b'x')
+    fresh = tmp_path / 'jb_fresh'; fresh.mkdir(); (fresh / 'p.png').write_bytes(b'x')
+    prev = tmp_path / 'jbprev_old'; prev.mkdir()
+    old_t = __import__('time').time() - 8 * 3600         # 8h old
+    os.utime(old, (old_t, old_t)); os.utime(prev, (old_t, old_t))
+    U.owm._sweep_stale_scratch(max_age_h=6.0)
+    assert not old.exists() and not prev.exists(), 'stale scratch not swept'
+    assert fresh.exists(), 'fresh (active) scratch wrongly swept'
+
+
 def test_file_hash_identical_and_different(tmp_path):
     a = U.make_born_digital_pdf(tmp_path / 'a.pdf', npages=2)
     b = tmp_path / 'b.pdf'; b.write_bytes(a.read_bytes())      # exact copy
