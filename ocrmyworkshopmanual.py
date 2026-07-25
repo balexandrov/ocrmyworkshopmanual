@@ -104,7 +104,17 @@ PT_PHOTO_COLOR = 'photo_color' # genuine colour (covers, colour diagrams) -> col
 PT_COLOR_LINE = 'color_line'   # colour LINE ART (colour wiring diagrams / schematics): low
                                # continuous-tone coverage but real colour -> lossless source-
                                # page pass-through (NEVER binarize, so the colour survives)
-_PT_BITONAL = (PT_BLANK, PT_LINE)  # types that share the grouped-JBIG2 path
+PT_VECTOR = 'vector'           # born-digital / vector page (no full-page raster: TOC, nav,
+                               # text) inside an otherwise-scanned PDF -> lossless source-page
+                               # pass-through, so its text, colour and hyperlinks survive
+_PT_BITONAL = (PT_BLANK, PT_LINE)      # types that share the grouped-JBIG2 path
+_PT_PASSTHROUGH = (PT_COLOR_LINE, PT_VECTOR)  # types copied through from the source, untouched
+
+# A page whose largest raster image is below this effective DPI has no full-page scan
+# on it -> treat it as a born-digital/vector page and pass it through untouched.
+VECTOR_DPI_FLOOR = 50
+# Cap for auto-raising the render DPI to a scan's native resolution (avoid huge foldouts).
+MAX_RENDER_DPI = 400
 
 # DPI for the cheap colour PROBE that rescues colour line art from the bitonal path.
 # Only low enough to let _is_color() see chroma; the page itself is passed through at
@@ -586,6 +596,22 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
     colour pages (an orange/pastel cover) convert to a grayscale luminance that is all
     >= 100, so the ink test alone would call them blank and destroy them as bitonal —
     the coverage guard keeps them on the photo/colour path."""
+    if page is None:
+        try:
+            page = PdfReader(str(src_p)).pages[page_no - 1]
+        except Exception:
+            page = None
+
+    # BORN-DIGITAL / VECTOR page (TOC, nav, text — no full-page raster) inside an
+    # otherwise-scanned PDF: never rasterize it. Pass it through untouched so its vector
+    # text, colour and hyperlinks survive (rasterizing to b&w destroys all three).
+    if page is not None:
+        try:
+            if _largest_image_dpi(page) < VECTOR_DPI_FLOOR:
+                return PageClass(PT_VECTOR, None)
+        except Exception:
+            pass
+
     g = np.asarray(Image.open(png).convert('L'))
     cov = photo_coverage(png, dpi) if detect_photos else 0.0
 
@@ -601,14 +627,8 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
     # LOW-coverage LINE ART: rescue genuine COLOUR (colour wiring diagrams / schematics)
     # before it is binarized. The metadata pre-filter skips the probe for plain
     # grayscale scans (the common case), so this adds no render there.
-    if detect_photos:
-        if page is None:
-            try:
-                page = PdfReader(str(src_p)).pages[page_no - 1]
-            except Exception:
-                page = None
-        if _page_color_capable(page) and _page_has_color(work, src_p, page_no, dpi):
-            return PageClass(PT_COLOR_LINE, None)
+    if detect_photos and _page_color_capable(page) and _page_has_color(work, src_p, page_no, dpi):
+        return PageClass(PT_COLOR_LINE, None)
 
     if float((g < 100).mean()) < blank_ink and cov <= photo_thresh:
         return PageClass(PT_BLANK, None)
@@ -661,6 +681,43 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
         with open(out_pdf, 'wb') as f:
             f.write(img2pdf.convert(str(tmp), dpi=200))
     tmp.unlink(missing_ok=True)
+
+
+def _clone_outline(src_reader, comp_path: Path) -> bool:
+    """Best-effort: copy the source PDF's bookmarks (document outline) onto the rebuilt
+    PDF, remapped 1:1 by page index (page count and order are preserved). Rasterise-and-
+    rebuild otherwise drops bookmarks. Never raises — bookmarks are a nice-to-have, not
+    worth failing a whole file over. Returns True if an outline was written."""
+    try:
+        outline = src_reader.outline
+        if not outline:
+            return False
+        w = PdfWriter(clone_from=str(comp_path))
+        npages = len(w.pages)
+
+        def walk(items, parent=None):
+            prev = None
+            for it in items:
+                if isinstance(it, list):
+                    walk(it, prev)
+                    continue
+                try:
+                    pnum = src_reader.get_destination_page_number(it)
+                except Exception:
+                    pnum = None
+                if pnum is None or pnum < 0 or pnum >= npages:
+                    continue
+                title = getattr(it, 'title', None) or (it.get('/Title') if hasattr(it, 'get') else None)
+                prev = w.add_outline_item(str(title or 'untitled'), pnum, parent=parent)
+
+        walk(outline)
+        tmp = comp_path.with_name(comp_path.stem + '_ol.pdf')
+        with open(tmp, 'wb') as f:
+            w.write(f)
+        os.replace(str(tmp), str(comp_path))
+        return True
+    except Exception:
+        return False
 
 
 def has_text(pdf: Path, sample: int = 6, min_chars: int = 40) -> bool:
@@ -760,6 +817,32 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
     frac = scan / readable
     sig.update(sampled=readable, scan_pages=scan, text_pages=text, scan_frac=round(frac, 3))
     return frac < scan_fraction, sig
+
+
+def _page_render_dpi(page, base_dpi: int, cap: int = MAX_RENDER_DPI) -> int:
+    """Per-page render DPI: use the page's native scan resolution when it EXCEEDS the
+    base (so a high-res scan isn't downsampled), capped to avoid a foldout blow-up; never
+    below base (don't upsample a low-res page and bloat it). Returns base if unknown."""
+    try:
+        native = _largest_image_dpi(page)
+    except Exception:
+        return base_dpi
+    if native > base_dpi:
+        return int(min(round(native), cap))
+    return base_dpi
+
+
+def _render_page_gray(src_p: Path, page_no: int, out_png: Path, dpi: int, timeout: int = 0) -> bool:
+    """Render a single page to a grayscale PNG at `dpi` (used to re-render one high-res
+    bitonal page at its native resolution). Returns True on success."""
+    try:
+        subprocess.run([GS, '-sDEVICE=pnggray', f'-r{dpi}', f'-dFirstPage={page_no}',
+                        f'-dLastPage={page_no}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                        '-sOutputFile=' + str(out_png), win_long(src_p)],
+                       capture_output=True, timeout=timeout or None)
+    except Exception:
+        return False
+    return out_png.exists()
 
 
 def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
@@ -925,9 +1008,9 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
             binarize_png(png, min_size, despeckle, dpi, sauvola_k)
             r = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), png.name], cwd=sub, capture_output=True)
             comp += len(r.stdout)
-        elif pc.type == PT_COLOR_LINE:
-            # colour line art is passed through losslessly -> charge ~its original page size,
-            # so the precheck doesn't over-optimistically expect JBIG2-tiny output.
+        elif pc.type in _PT_PASSTHROUGH:
+            # colour line art / vector page is passed through losslessly -> charge ~its
+            # original page size, so the precheck doesn't expect JBIG2-tiny output.
             clseg = sub / f'cl{p}.pdf'
             _color_line_seg(src_p, p, clseg)
             comp += clseg.stat().st_size if clseg.exists() else 0
@@ -1017,7 +1100,10 @@ def compress_one(src: str, dest: str, dpi: int,
                                  timeout, in_place)
             res['action'] = 'ocr_only'
             return res
-        # 1) render pages to grayscale PNG
+        # 1) render pages to grayscale PNG (batched at the base DPI). High-resolution
+        #    bitonal pages are RE-rendered per page at their native DPI further below, so
+        #    a 300/400-dpi scan is not downsampled to a fixed 200 (a visible quality loss)
+        #    while the common low-res pages don't bloat the file by being upsampled.
         render_src = src_p
         did_repair = False
 
@@ -1047,11 +1133,13 @@ def compress_one(src: str, dest: str, dpi: int,
 
         def _gen_jbig2(name, k):
             """Binarize (adaptive Sauvola + optional despeckle) + generic self-contained
-            JBIG2 for one page → .jb2 name."""
-            binarize_png(work / name, min_size, despeckle, dpi, sauvola_k)
+            JBIG2 for one page → .jb2 name. Uses the page's own DPI (native for high-res
+            pages, base otherwise) so resolution and MediaBox sizing stay correct."""
+            pd = page_dpi.get(k, dpi)
+            binarize_png(work / name, min_size, despeckle, pd, sauvola_k)
             jb = f'g{k:05d}.jb2'
             with open(work / jb, 'wb') as jf:
-                rr = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), name],
+                rr = subprocess.run([JBIG, '-p', '-a', '-D', str(pd), name],
                                     cwd=work, stdout=jf, stderr=subprocess.PIPE, text=True)
             if rr.returncode != 0 or (work / jb).stat().st_size == 0:
                 raise RuntimeError(f'jbig2 page {k} rc={rr.returncode} {rr.stderr[:160]}')
@@ -1077,8 +1165,22 @@ def compress_one(src: str, dest: str, dpi: int,
                                  True, photo_thresh, photo_dpi, page=_page_at(k))
                    for k, n in enumerate(pngs)]
         n_color_line = sum(c.type == PT_COLOR_LINE for c in classes)
-        n_photo = sum(c.type not in _PT_BITONAL and c.type != PT_COLOR_LINE for c in classes)
+        n_vector = sum(c.type == PT_VECTOR for c in classes)
+        n_photo = sum(c.type not in _PT_BITONAL and c.type not in _PT_PASSTHROUGH for c in classes)
         n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
+
+        # NATIVE-DPI: for BITONAL pages whose source scan is higher-res than the base
+        # render, re-render just that page at its native DPI so it isn't downsampled.
+        # Only the (usually few) high-res pages pay the extra render; the rest keep the
+        # fast batched render. Photos downsample on purpose; pass-through pages are copied.
+        page_dpi = {}
+        n_native = 0
+        for k, c in enumerate(classes):
+            if c.type in _PT_BITONAL:
+                pd = _page_render_dpi(_page_at(k), dpi)
+                if pd > dpi and _render_page_gray(render_src, k + 1, work / pngs[k], pd, timeout):
+                    page_dpi[k] = pd
+                    n_native += 1
         seg_pdfs = []
         i = 0
         try:
@@ -1101,8 +1203,9 @@ def compress_one(src: str, dest: str, dpi: int,
                                 'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
                     seg_pdfs.append(seg)
                     i = j
-                elif classes[i].type == PT_COLOR_LINE:
-                    # colour line art -> lossless pass-through of the original page (no binarize)
+                elif classes[i].type in _PT_PASSTHROUGH:
+                    # colour line art / born-digital vector page -> lossless pass-through of
+                    # the original page (no binarize): keeps colour, text, vector and links.
                     seg = work / f's{i:05d}.pdf'
                     _color_line_seg(render_src, i + 1, seg)
                     seg_pdfs.append(seg)
@@ -1137,9 +1240,13 @@ def compress_one(src: str, dest: str, dpi: int,
         if kept_original:
             base = work / 'orig.pdf'
             shutil.copyfile(str(src_p), str(base))
-            n_photo = n_color = n_color_line = 0
+            n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
+            # restore the source's bookmarks onto the rebuilt PDF (1:1 page mapping);
+            # best-effort, never fails the file. ocrmypdf preserves the outline downstream.
+            if _rpages is not None:
+                _clone_outline(_rdr, comp)
 
         # 4) build the per-file note, then OCR (only if no text) + place into dest.
         if kept_original:
@@ -1152,6 +1259,10 @@ def compress_one(src: str, dest: str, dpi: int,
             note = ''
         if n_color_line:
             note += f' [{n_color_line} colour line-art pg (lossless)]'
+        if n_vector:
+            note += f' [{n_vector} vector/born-digital pg (lossless)]'
+        if n_native:
+            note += f' [{n_native} hi-res pg at native dpi]'
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,

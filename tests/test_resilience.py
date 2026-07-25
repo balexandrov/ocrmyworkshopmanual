@@ -120,6 +120,73 @@ def test_colour_survives_compression_round_trip(tmp_path):
     assert U.owm._is_color(a), 'colour was lost in the round trip (page was binarized to b&w)'
 
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_vector_page_passed_through_in_mixed_pdf(tmp_path):
+    """A born-digital VECTOR page (TOC/nav: vector text + colour + links, no full-page
+    raster) inside an otherwise-scanned PDF must be passed through losslessly, not
+    rasterized to b&w. Regression for the mixed-PDF case (the 4Runner owner's manual:
+    page 1 lost its blue links + colour when the whole file was rasterized)."""
+    from pypdf import PdfReader, PdfWriter
+    vec = U.make_born_digital_pdf(tmp_path / 'vec.pdf', npages=1)
+    scans = U.make_scan_pdf(tmp_path / 'scans.pdf', npages=5, dpi=200)
+    wr = PdfWriter(); wr.append(str(vec)); wr.append(str(scans))
+    mixed = tmp_path / 'mixed.pdf'
+    with open(mixed, 'wb') as f:
+        wr.write(f)
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(mixed), str(out), 200, ocr=False)
+    assert res.get('err') is None and res.get('action') == 'compressed', res
+    r = PdfReader(str(out))
+    assert len(r.pages) == 6
+    # page 0 (vector) keeps its vector text and has NO raster image (not rasterized)
+    assert len((r.pages[0].extract_text() or '').strip()) > 50, 'vector page lost its text'
+    res0 = r.pages[0].get('/Resources')
+    xo0 = res0.get_object().get('/XObject') if res0 else None
+    assert not xo0, 'vector page was rasterized (has an image xobject)'
+    # a scan page IS compressed to JBIG2
+    assert b'/JBIG2Decode' in out.read_bytes(), 'scan pages were not JBIG2-compressed'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_hires_scan_rendered_at_native_dpi(tmp_path):
+    """A 300-dpi scan must NOT be downsampled to the fixed 200-dpi render (a visible
+    quality loss). The output image should keep ~native resolution."""
+    from pypdf import PdfReader
+    scans = U.make_scan_pdf(tmp_path / 'hires.pdf', npages=3, dpi=300)
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(scans), str(out), 200, ocr=False)
+    assert res.get('err') is None, res
+    r = PdfReader(str(out))
+    xo = r.pages[0]['/Resources']['/XObject'].get_object()
+    img = next(o.get_object() for o in xo.values() if o.get_object().get('/Subtype') == '/Image')
+    w = int(img['/Width'])
+    assert w >= 2400, f'scan downsampled: width {w}px (expected ~2550 at native 300dpi, not 1700 at 200)'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_bookmarks_preserved_through_compression(tmp_path):
+    """Bookmarks (document outline) must survive the rasterize-and-rebuild, remapped 1:1
+    by page. Rebuilding from scratch used to drop them (the 4Runner lost 23 bookmarks)."""
+    from pypdf import PdfReader, PdfWriter
+    scans = U.make_scan_pdf(tmp_path / 'scans.pdf', npages=4, dpi=200)
+    wr = PdfWriter(clone_from=str(scans))
+    wr.add_outline_item('Chapter 1', 0)
+    wr.add_outline_item('Chapter 2', 2)
+    src = tmp_path / 'bm.pdf'
+    with open(src, 'wb') as f:
+        wr.write(f)
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(src), str(out), 200, ocr=False)
+    assert res.get('err') is None and res.get('action') == 'compressed', res
+
+    def cnt(items):
+        c = 0
+        for it in items:
+            c += cnt(it) if isinstance(it, list) else 1
+        return c
+    assert cnt(PdfReader(str(out)).outline) == 2, 'bookmarks were lost through compression'
+
+
 def test_available_ocr_lang_degrades_to_installed(monkeypatch):
     """A detected/requested language whose pack is NOT installed must degrade to an
     installed one (never fail OCR and drop the whole text layer — the rus-missing bug)."""
