@@ -197,6 +197,50 @@ TESS = shutil.which('tesseract')
 # English too, so pair rus+eng. Scripts without an installed pack fall back to eng.
 _SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng'}
 
+# Minimum Tesseract OSD "Script confidence" to TRUST a page's script vote. OSD is
+# unreliable on sparse text (a wiring-diagram page with few words), where it emits a
+# low-confidence — often wrong — guess (measured: English diagrams mislabelled Cyrillic
+# at conf 0.6-1.3, while genuine dense pages score ~15-20). Votes below this floor are
+# ignored, so a Latin/English doc is no longer mislabelled rus+eng (slow, lower quality)
+# by a couple of noisy sparse pages; a genuinely Russian manual still clears it easily.
+MIN_OSD_SCRIPT_CONF = 3.0
+
+_INSTALLED_LANGS = None
+
+
+def _installed_langs() -> set:
+    """Tesseract language packs actually installed (cached per process). `tesseract
+    --list-langs` also prints script/ combos and a header line — keep only plain packs."""
+    global _INSTALLED_LANGS
+    if _INSTALLED_LANGS is None:
+        langs: set = set()
+        if TESS:
+            try:
+                r = subprocess.run([TESS, '--list-langs'], capture_output=True,
+                                   text=True, timeout=30)
+                for ln in (r.stdout or '').splitlines():
+                    ln = ln.strip()
+                    if ln and 'List of' not in ln and '/' not in ln and '\\' not in ln:
+                        langs.add(ln)
+            except Exception:
+                pass
+        _INSTALLED_LANGS = langs
+    return _INSTALLED_LANGS
+
+
+def _available_ocr_lang(lang: str) -> str:
+    """Filter an OCR language spec (e.g. 'rus+eng') to packs that are actually installed;
+    if none survive, fall back to 'eng' (or any installed pack). So a missing language
+    pack NEVER silently drops the whole OCR text layer — it degrades to what Tesseract
+    can actually run, instead of erroring the file out with no text at all."""
+    inst = _installed_langs()
+    if not inst:
+        return lang                        # couldn't enumerate -> don't second-guess
+    keep = [p for p in lang.split('+') if p in inst]
+    if keep:
+        return '+'.join(keep)
+    return 'eng' if 'eng' in inst else sorted(inst)[0]
+
 
 def set_below_normal_priority():
     """Lower this process (and thus its subprocess children, which inherit it) to
@@ -785,11 +829,13 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
                     conf = float(s.split(':', 1)[1].strip())
                 except ValueError:
                     conf = 0.0
-        if script:
+        # Only trust a CONFIDENT script vote — sparse pages emit low-confidence noise
+        # (often a spurious 'Cyrillic') that otherwise accumulates into a wrong language.
+        if script and conf >= MIN_OSD_SCRIPT_CONF:
             scores[script] = scores.get(script, 0.0) + conf
     if not scores:
-        return 'eng'
-    return _SCRIPT_LANG.get(max(scores, key=scores.get), 'eng')
+        return 'eng'                       # no confident page -> safe default
+    return _available_ocr_lang(_SCRIPT_LANG.get(max(scores, key=scores.get), 'eng'))
 
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
@@ -809,7 +855,10 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         else:
             if language == 'auto':
                 language = _detect_language(base, work, timeout)
-                note += f' (lang:{language})'
+            # filter to installed packs so a missing pack degrades to eng/available
+            # rather than erroring OCR out and leaving the file with no text at all.
+            language = _available_ocr_lang(language)
+            note += f' (lang:{language})'
             ocr_pdf = work / 'ocr.pdf'
             r = subprocess.run(
                 OCRMYPDF + ['--language', language, '--optimize', '0',

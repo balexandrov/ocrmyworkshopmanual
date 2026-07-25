@@ -120,6 +120,37 @@ def test_colour_survives_compression_round_trip(tmp_path):
     assert U.owm._is_color(a), 'colour was lost in the round trip (page was binarized to b&w)'
 
 
+def test_available_ocr_lang_degrades_to_installed(monkeypatch):
+    """A detected/requested language whose pack is NOT installed must degrade to an
+    installed one (never fail OCR and drop the whole text layer — the rus-missing bug)."""
+    monkeypatch.setattr(U.owm, '_INSTALLED_LANGS', {'eng', 'deu', 'rus'})
+    assert U.owm._available_ocr_lang('rus+eng') == 'rus+eng'   # both installed -> unchanged
+    assert U.owm._available_ocr_lang('kor+eng') == 'eng'       # kor absent -> keep eng
+    assert U.owm._available_ocr_lang('ara') == 'eng'           # none installed -> eng fallback
+    assert U.owm._available_ocr_lang('fra+deu') == 'deu'       # keep only the installed pack
+    monkeypatch.setattr(U.owm, '_INSTALLED_LANGS', {'spa', 'ita'})
+    assert U.owm._available_ocr_lang('kor') == 'ita'           # no eng -> first installed (sorted)
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(not U.owm.TESS, reason='Tesseract not found')
+def test_sparse_english_not_mislabelled_cyrillic(tmp_path):
+    """Regression: sparse English pages (wiring diagrams) make Tesseract OSD emit a
+    low-confidence, often spurious 'Cyrillic', which used to yield rus+eng (slow and
+    lower-quality OCR). The per-page confidence floor must keep them 'eng'. Exercised on
+    the real DODGE NEON diagram — the exact page that misdetected as rus+eng."""
+    fx = U.fixture_pdfs('color_line')
+    if not fx:
+        pytest.skip('no color_line fixture')
+    work = U.workdir()
+    try:
+        lang = U.owm._detect_language(fx[0], work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    assert 'rus' not in lang, f'sparse English mislabelled as {lang!r}'
+    assert lang == 'eng', f'expected eng, got {lang!r}'
+
+
 # ── config file / dedup / retry / repair ─────────────────────────────────────
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
