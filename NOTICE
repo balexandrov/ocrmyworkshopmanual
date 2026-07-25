@@ -7,6 +7,8 @@ not linked or redistributed) and bundles one small third-party helper script.
 Bundled in this repository
 --------------------------
 * tools/jbig2topdf.py — from jbig2enc by Adam Langley, Apache License 2.0.
+  Modified: `-s -` reads the page-file list from stdin (to avoid the OS
+  command-line length limit on very long runs).
   Full license text: tools/jbig2enc-LICENSE.txt
   Source: https://github.com/agl/jbig2enc
 

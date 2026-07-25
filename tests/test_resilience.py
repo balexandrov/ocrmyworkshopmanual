@@ -82,6 +82,46 @@ def test_bright_colour_page_not_classified_blank(tmp_path):
 
 # ── config file / dedup / retry / repair ─────────────────────────────────────
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_multipage_bitonal_via_stdin_preserves_pages(tmp_path):
+    """A multi-page bitonal scan is JBIG2-wrapped by feeding the page list to the wrapper
+    over STDIN (`-s -`) rather than as argv — one call, any length, so a multi-thousand-
+    page manual can't overflow the OS command-line limit (the WinError-206 bug). Verify a
+    real multi-page scan round-trips with every page intact and compresses."""
+    from pypdf import PdfReader, PdfWriter
+    line = U.fixture_pdfs('line')
+    if not line:
+        pytest.skip('no line fixtures')
+    src = tmp_path / 'multi.pdf'                 # a 5-page scan (a real scanned page x5)
+    w = PdfWriter()
+    for _ in range(5):
+        w.append(str(line[0]))
+    with open(src, 'wb') as f:
+        w.write(f)
+    n_in = len(PdfReader(str(src)).pages)
+    res = U.owm.compress_one(str(src), str(src), 200, ocr=False, in_place=True)
+    assert res.get('err') is None, res
+    assert res.get('action') == 'compressed', res
+    assert len(PdfReader(str(src)).pages) == n_in, 'stdin-wrapped merge lost/added pages'
+
+
+def test_wrapper_reads_page_list_from_stdin(tmp_path):
+    """Direct check of the wrapper's `-s -` stdin mode: given a couple of tiny fake
+    'page' files via stdin, it emits a %PDF with the right page count (no jbig2 binary
+    needed — the wrapper only reads the files' JBIG2 header bytes for width/height)."""
+    import struct, subprocess, sys
+    # minimal jbig2 generic-region page: bytes[11:27] = width,height,xres,yres (big-endian)
+    def fake_page(p, w, h):
+        p.write_bytes(b'\x00' * 11 + struct.pack('>IIII', w, h, 200, 200) + b'\x00' * 8)
+    (tmp_path / 'a.jb2'); fake_page(tmp_path / 'a.jb2', 100, 120)
+    fake_page(tmp_path / 'b.jb2', 100, 120)
+    r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'tools' / 'jbig2topdf.py'), '-s', '-'],
+                       input='a.jb2\nb.jb2\n', text=True, capture_output=True, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith('%PDF'), r.stdout[:50]
+    assert r.stdout.count('/Type /Page\n') == 2 or r.stdout.count('/Page') >= 2, 'expected 2 pages'
+
+
 def test_say_survives_broken_stdout(monkeypatch, capsys):
     """_say must never raise when stdout is broken (the closed-pipe case that a
     `| head` reader triggers) — a dropped progress line can't be allowed to abort

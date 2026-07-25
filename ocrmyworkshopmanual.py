@@ -876,23 +876,29 @@ def compress_one(src: str, dest: str, dpi: int,
         i = 0
         try:
             while i < len(pngs):
-                seg = work / f's{i:05d}.pdf'
                 if classes[i].type in _PT_BITONAL:
-                    # a run of consecutive bitonal pages -> one multi-page JBIG2 PDF
+                    # a run of consecutive bitonal pages -> one generic multi-page JBIG2.
                     jbs, j = [], i
                     while j < len(pngs) and classes[j].type in _PT_BITONAL:
                         jbs.append(_gen_jbig2(pngs[j], j)); j += 1
+                    # Hand the page list to the wrapper over STDIN (one path per line), not
+                    # as argv — a multi-thousand-page manual would otherwise overflow the OS
+                    # command-line limit (Windows ~32K chars -> WinError 206). One call, any
+                    # length. (`-s -` = standalone mode, read page files from stdin.)
+                    seg = work / f's{i:05d}.pdf'
                     with open(seg, 'wb') as fout:
-                        r = subprocess.run([PY, WRAP, '-s', *jbs], cwd=work, stdout=fout,
-                                           stderr=subprocess.PIPE, text=True)
+                        r = subprocess.run([PY, WRAP, '-s', '-'], input='\n'.join(jbs),
+                                           cwd=work, stdout=fout, stderr=subprocess.PIPE, text=True)
                     if r.returncode != 0 or seg.stat().st_size == 0:
                         return {'src': src_p.name, 'orig': orig, 'new': 0,
                                 'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
+                    seg_pdfs.append(seg)
                     i = j
                 else:  # PHOTO_GRAY / PHOTO_COLOR
+                    seg = work / f's{i:05d}.pdf'
                     photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_descreen)
+                    seg_pdfs.append(seg)
                     i += 1
-                seg_pdfs.append(seg)
         except RuntimeError as ex:
             return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': str(ex)}
 

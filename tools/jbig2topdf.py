@@ -16,6 +16,10 @@
 
 # JBIG2 Encoder
 # https://github.com/agl/jbig2enc
+#
+# MODIFIED for ocrmyworkshopmanual: `-s -` reads the page-file list from stdin
+# (one path per line), so a caller can pass thousands of pages without hitting the
+# OS command-line length limit. (Apache-2.0 change notice.)
 
 import glob
 import struct
@@ -233,11 +237,14 @@ def usage(script, msg):
 Usage:
   {script} [basename] > out.pdf
   {script} -s [page.jb2]... > out.pdf
+  {script} -s -  < pagelist.txt > out.pdf
 
   Read symbol table from `basename.sym` and pages from `basename.[0-9]*`
     if basename not given: symbol table from `symboltable`, pages from `page-*`
 
   -s: standalone mode (no global symbol table)
+  -s -: standalone mode, read the page files from stdin (one path per line) —
+        avoids the OS command-line length limit on very long (multi-thousand-page) runs
 """)
     sys.exit(1)
 
@@ -253,6 +260,10 @@ def parse_args(script: str) -> tuple:
     if "-s" in sys.argv:
         # Standalone mode, no global symbol table
         pages = [arg for arg in sys.argv[1:] if arg != "-s"]
+        if pages == ["-"]:
+            # `-s -`: read the page files from stdin, one path per line. Lets a caller
+            # pass thousands of pages without overflowing the OS command-line limit.
+            pages = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
         return "", pages
     elif len(sys.argv) == 2:
         base_name = sys.argv[1]
