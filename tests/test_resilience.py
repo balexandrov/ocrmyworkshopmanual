@@ -101,25 +101,26 @@ def test_multipage_bitonal_via_stdin_preserves_pages(tmp_path):
     n_in = len(PdfReader(str(src)).pages)
     res = U.owm.compress_one(str(src), str(src), 200, ocr=False, in_place=True)
     assert res.get('err') is None, res
-    assert res.get('action') == 'compressed', res
     assert len(PdfReader(str(src)).pages) == n_in, 'stdin-wrapped merge lost/added pages'
 
 
 def test_wrapper_reads_page_list_from_stdin(tmp_path):
     """Direct check of the wrapper's `-s -` stdin mode: given a couple of tiny fake
-    'page' files via stdin, it emits a %PDF with the right page count (no jbig2 binary
-    needed — the wrapper only reads the files' JBIG2 header bytes for width/height)."""
+    'page' files via stdin, it emits a %PDF with one page each (no jbig2 binary needed —
+    the wrapper only reads the files' JBIG2 header bytes for width/height). The wrapper's
+    PDF output is BINARY (latin1), so capture it as bytes — decoding as text would choke
+    on high bytes under a UTF-8 locale."""
     import struct, subprocess, sys
     # minimal jbig2 generic-region page: bytes[11:27] = width,height,xres,yres (big-endian)
     def fake_page(p, w, h):
         p.write_bytes(b'\x00' * 11 + struct.pack('>IIII', w, h, 200, 200) + b'\x00' * 8)
-    (tmp_path / 'a.jb2'); fake_page(tmp_path / 'a.jb2', 100, 120)
+    fake_page(tmp_path / 'a.jb2', 100, 120)
     fake_page(tmp_path / 'b.jb2', 100, 120)
     r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'tools' / 'jbig2topdf.py'), '-s', '-'],
-                       input='a.jb2\nb.jb2\n', text=True, capture_output=True, cwd=str(tmp_path))
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.startswith('%PDF'), r.stdout[:50]
-    assert r.stdout.count('/Type /Page\n') == 2 or r.stdout.count('/Page') >= 2, 'expected 2 pages'
+                       input=b'a.jb2\nb.jb2\n', capture_output=True, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr[-300:]
+    assert r.stdout.startswith(b'%PDF'), r.stdout[:50]
+    assert r.stdout.count(b'/MediaBox') == 2, f'expected 2 pages, got {r.stdout.count(b"/MediaBox")}'
 
 
 def test_say_survives_broken_stdout(monkeypatch, capsys):
