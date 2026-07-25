@@ -314,6 +314,12 @@ them while a run is still going):
   download shouldn't be silently lost.
 - **`--min-free-gb N`** (default 1.0) — aborts up front if the destination drive is nearly
   full, instead of failing partway through a long run.
+- **Doesn't die on a partial failure** — a worker crashing (OOM, an OS kill, a native
+  segfault → `BrokenProcessPool`) marks the affected files FAILED and lets the run finish
+  with a complete report, instead of aborting everything with a traceback. Console output
+  is crash-safe (a closed stdout pipe won't kill the run), `Ctrl-C` still writes the
+  partial report, and stale render-scratch from earlier killed runs is swept from the temp
+  dir at startup (age-gated, so a concurrent run's active scratch is safe).
 
 ## Config file
 

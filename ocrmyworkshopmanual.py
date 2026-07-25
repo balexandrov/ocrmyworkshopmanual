@@ -204,6 +204,38 @@ def set_below_normal_priority():
         pass
 
 
+def _say(*a, **k):
+    """print() that never aborts a long run if stdout is gone (the reader end of a
+    pipe closed, terminal detached, etc.). A dropped progress line must not kill the
+    batch — the per-file report CSV is the durable record, the console is just a view."""
+    try:
+        print(*a, **k)
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _sweep_stale_scratch(max_age_h: float = 6.0) -> None:
+    """Remove leftover render-scratch dirs (jb_* / jbprev_*) in the system temp dir left
+    behind by a prior run whose worker was OS-KILLED (OOM, BrokenProcessPool, task kill) —
+    a killed process skips its `finally` cleanup, so scratch can pile up to many GB. Only
+    dirs untouched for `max_age_h` hours are removed, so a concurrently-running instance's
+    ACTIVE scratch (files are being written, mtime stays fresh) is never disturbed."""
+    tmp = Path(tempfile.gettempdir())
+    cutoff = time.time() - max_age_h * 3600
+    n = freed = 0
+    for d in list(tmp.glob('jb_*')) + list(tmp.glob('jbprev_*')):
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                freed += sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+        except Exception:
+            pass
+    if n:
+        _say(f'(swept {n} stale scratch dir(s) from earlier interrupted runs, '
+             f'~{freed/1e9:.1f} GB reclaimed)')
+
+
 def _ocrmypdf_ok():
     try:
         return subprocess.run(OCRMYPDF + ['--version'],
@@ -660,8 +692,12 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
     note += warn
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
-    shutil.copyfile(str(final), str(tmp_out))
-    os.replace(str(tmp_out), str(dest_p))
+    try:
+        shutil.copyfile(str(final), str(tmp_out))
+        os.replace(str(tmp_out), str(dest_p))
+    except Exception:
+        tmp_out.unlink(missing_ok=True)   # don't leave a stray .part on a failed swap
+        raise
     return {'src': src_p.name, 'orig': orig, 'new': dest_p.stat().st_size,
             'pages': pages, 'note': note, 'kept': kept, 'err': None}
 
@@ -755,8 +791,12 @@ def compress_one(src: str, dest: str, dpi: int,
             if not in_place:   # in-place: leave the original vector PDF exactly as-is
                 dest_p.parent.mkdir(parents=True, exist_ok=True)
                 tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
-                shutil.copyfile(str(src_p), str(tmp_out))
-                os.replace(str(tmp_out), str(dest_p))
+                try:
+                    shutil.copyfile(str(src_p), str(tmp_out))
+                    os.replace(str(tmp_out), str(dest_p))
+                except Exception:
+                    tmp_out.unlink(missing_ok=True)
+                    raise
             where = 'left untouched' if in_place else 'copied untouched'
             return {'src': src_p.name, 'orig': orig,
                     'new': orig if in_place else dest_p.stat().st_size,
@@ -1471,6 +1511,8 @@ def main():
               'result. Non-PDFs, structure, born-digital & already-optimal files untouched. ***\n')
 
     set_below_normal_priority()
+    if not args.dry_run:
+        _sweep_stale_scratch()   # reclaim scratch orphaned by earlier killed runs
     t0 = time.time()
     done = fail = kept = 0
     tot_orig = tot_new = 0
@@ -1491,84 +1533,112 @@ def main():
         except Exception as ex:
             print(f'(could not open live CSV: {ex})', file=sys.stderr); csv_live = None
 
-    with cf.ProcessPoolExecutor(max_workers=args.workers,
-                                initializer=set_below_normal_priority) as ex:
-        if args.dry_run:
-            futs = {ex.submit(preview_one, s, args.dpi,
-                              not args.no_despeckle, args.min_size, args.ocr_only,
-                              args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                              args.min_savings, args.sauvola_k, args.photo_descreen): (s, d)
-                    for s, d in jobs}
-        else:
-            futs = {ex.submit(compress_one, s, d, args.dpi,
-                              not args.no_despeckle, args.min_size,
-                              not args.no_ocr, args.language,
-                              args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                              args.min_savings, args.ocr_only, args.sauvola_k,
-                              args.photo_descreen,
-                              args.timeout, args.in_place): (s, d)
-                    for s, d in jobs}
-        N = len(jobs)
-        # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
-        dup_check = not args.dry_run
-        seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
-        for i, fut in enumerate(cf.as_completed(futs), 1):
-            s, d = futs[fut]
-            res = fut.result()
-            res['rel'] = os.path.relpath(s, str(rel_base))
-            results.append(res)
-            dmark, live_dup = '', ''
-            if dup_check:
-                try:
-                    res['hash'] = _file_hash(Path(s))
-                except Exception:
-                    res['hash'] = None
-                if res.get('hash'):
-                    if res['hash'] in seen_hash:
-                        live_dup = seen_hash[res['hash']]
-                        res['duplicate_of'] = live_dup
-                        dmark = f'  [dup of {live_dup}]'
-                    else:
-                        seen_hash[res['hash']] = res['rel']
-            elapsed = time.time() - t0
-            eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
-            eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
-            if res['err']:
-                fail += 1
-                print(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{dmark}{eta_str}')
+    N = len(jobs)
+    # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
+    dup_check = not args.dry_run
+    seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
+    interrupted = False
+    try:
+        with cf.ProcessPoolExecutor(max_workers=args.workers,
+                                    initializer=set_below_normal_priority) as ex:
+            if args.dry_run:
+                futs = {ex.submit(preview_one, s, args.dpi,
+                                  not args.no_despeckle, args.min_size, args.ocr_only,
+                                  args.photo_threshold, args.photo_dpi, args.jpeg_quality,
+                                  args.min_savings, args.sauvola_k, args.photo_descreen): (s, d)
+                        for s, d in jobs}
             else:
-                done += 1
-                if res.get('kept'):
-                    kept += 1
-                tot_orig += res['orig']; tot_new += res['new']
-                pct = res['new'] * 100 // res['orig'] if res['orig'] else 0
-                arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
-                print(f'  [{i}/{N}] {res["src"][:60]}  '
-                      f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
-            if csv_live:   # flush a row per file for live progress
-                csv_live.write(_csv_row(_report_row(res)))
-                csv_live.flush()
+                futs = {ex.submit(compress_one, s, d, args.dpi,
+                                  not args.no_despeckle, args.min_size,
+                                  not args.no_ocr, args.language,
+                                  args.photo_threshold, args.photo_dpi, args.jpeg_quality,
+                                  args.min_savings, args.ocr_only, args.sauvola_k,
+                                  args.photo_descreen,
+                                  args.timeout, args.in_place): (s, d)
+                        for s, d in jobs}
+            for i, fut in enumerate(cf.as_completed(futs), 1):
+                s, d = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as ex:
+                    # a worker DIED (BrokenProcessPool from OOM / OS-kill / native
+                    # segfault) or raised — don't let one dead worker abort the whole
+                    # run; mark this file FAILED (original untouched, in-place never
+                    # wrote) and carry on. Every still-pending file will land here too,
+                    # so the run ends with a complete report you can --retry-failed.
+                    try:
+                        orig = Path(s).stat().st_size
+                    except Exception:
+                        orig = 0
+                    res = {'src': Path(s).name, 'orig': orig, 'new': 0,
+                           'err': f'worker died ({type(ex).__name__}): {str(ex)[:140]}'}
+                res['rel'] = os.path.relpath(s, str(rel_base))
+                results.append(res)
+                dmark = ''
+                if dup_check and not res.get('err'):
+                    try:
+                        res['hash'] = _file_hash(Path(s))
+                    except Exception:
+                        res['hash'] = None
+                    if res.get('hash'):
+                        if res['hash'] in seen_hash:
+                            res['duplicate_of'] = seen_hash[res['hash']]
+                            dmark = f'  [dup of {seen_hash[res["hash"]]}]'
+                        else:
+                            seen_hash[res['hash']] = res['rel']
+                elapsed = time.time() - t0
+                eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
+                eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
+                if res['err']:
+                    fail += 1
+                    _say(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{dmark}{eta_str}')
+                else:
+                    done += 1
+                    if res.get('kept'):
+                        kept += 1
+                    tot_orig += res['orig']; tot_new += res['new']
+                    pct = res['new'] * 100 // res['orig'] if res['orig'] else 0
+                    arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
+                    _say(f'  [{i}/{N}] {res["src"][:60]}  '
+                         f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
+                if csv_live:   # flush a row per file so the report survives a hard stop
+                    try:
+                        csv_live.write(_csv_row(_report_row(res))); csv_live.flush()
+                    except Exception:
+                        pass
+    except KeyboardInterrupt:
+        interrupted = True
+        _say('\n*** interrupted (Ctrl-C) — finishing up and writing the report for '
+             'work done so far; in-place files are each intact (original or complete) ***')
+    finally:
+        if csv_live:
+            try:
+                csv_live.close()
+            except Exception:
+                pass
 
-    if csv_live:
-        csv_live.close()
     dup_sets = _flag_duplicates(results) if dup_check else 0
     dt = time.time() - t0
     n_born = sum(1 for r in results if r.get('action') == 'born_digital')
     verb = 'Previewed' if args.dry_run else 'processed'
-    print(f'\nDone in {dt/60:.1f} min. {verb} {done} ({done - kept} '
-          f'{"would compress" if args.dry_run else "compressed"}, '
-          f'{kept} kept-original/OCR-only incl. {n_born} born-digital), failed {fail}')
+    head = 'Interrupted after' if interrupted else 'Done in'
+    _say(f'\n{head} {dt/60:.1f} min. {verb} {done} ({done - kept} '
+         f'{"would compress" if args.dry_run else "compressed"}, '
+         f'{kept} kept-original/OCR-only incl. {n_born} born-digital), failed {fail}')
     if tot_orig:
         word = 'Projected' if args.dry_run else 'Total'
         saved = 'would save' if args.dry_run else 'saved'
-        print(f'{word}: {mb(tot_orig):.0f} MB -> {mb(tot_new):.0f} MB '
-              f'({tot_new*100//tot_orig}% ; {saved} {mb(tot_orig-tot_new):.0f} MB)')
+        _say(f'{word}: {mb(tot_orig):.0f} MB -> {mb(tot_new):.0f} MB '
+             f'({tot_new*100//tot_orig}% ; {saved} {mb(tot_orig-tot_new):.0f} MB)')
+    if fail:
+        _say(f'{fail} file(s) FAILED — see the report .csv (filter the `error` column); '
+             f're-run them with --retry-failed <report>.csv once the cause is cleared.')
     if dup_sets:
         n_dup_files = sum(1 for r in results if r.get('duplicate_of'))
-        print(f'Duplicates: {n_dup_files} file(s) in {dup_sets} set(s) flagged '
-              f'(byte-identical; all still processed — see report)')
-    print('Output: (dry-run — nothing written)' if args.dry_run else
-          ('Output: IN-PLACE (source PDFs overwritten)' if args.in_place else f'Output: {dest_root}'))
+        _say(f'Duplicates: {n_dup_files} file(s) in {dup_sets} set(s) flagged '
+             f'(byte-identical; all still processed — see report)')
+    _say('Output: (dry-run — nothing written)' if args.dry_run else
+         ('Output: IN-PLACE (source PDFs overwritten)' if args.in_place else f'Output: {dest_root}'))
 
     if not args.no_log:
         settings = {
@@ -1590,9 +1660,11 @@ def main():
             log_path = write_run_log(report_log_path, dest_root, src_root, results, settings,
                                      t0, dt, len(pdfs), skipped, args.limit, fail, done, kept,
                                      dry_run=args.dry_run, report_dir=report_dir)
-            print(f'Log: {log_path}  (+ .csv)')
+            _say(f'Log: {log_path}  (+ .csv)')
         except Exception as ex:
-            print(f'(could not write run log: {ex})', file=sys.stderr)
+            _say(f'(could not write run log: {ex})')
+    if interrupted:
+        sys.exit(130)   # conventional exit code for Ctrl-C
 
 
 if __name__ == '__main__':
