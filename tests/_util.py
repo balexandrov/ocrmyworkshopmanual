@@ -32,6 +32,7 @@ TYPE_DIRS = {
     'blank': owm.PT_BLANK,
     'photo_gray': owm.PT_PHOTO_GRAY,
     'photo_color': owm.PT_PHOTO_COLOR,
+    'color_line': owm.PT_COLOR_LINE,
 }
 
 
@@ -115,6 +116,34 @@ def make_color_pdf(path: Path, size=(1000, 1400)) -> Path:
     with open(path, 'wb') as f:
         f.write(img2pdf.convert(str(jpg), dpi=200))
     jpg.unlink(missing_ok=True)
+    return path
+
+
+def make_color_line_pdf(path: Path, size=(1000, 1400)) -> Path:
+    """Make a flat-colour LINE-ART page (mimics a colour wiring diagram): thin RED /
+    GREEN / BLUE 'wires' + black text-like marks on white. Sharp edges, NO continuous
+    tone -> photo_coverage stays ~0 (the bitonal gate), yet ~half the ink is genuine
+    colour. This is exactly the case that must route to PT_COLOR_LINE (lossless pass-
+    through) instead of being binarized to b&w. Saved lossless (PNG -> DeviceRGB)."""
+    import numpy as np
+    import img2pdf
+    from PIL import Image
+    w, h = size
+    a = np.full((h, w, 3), 255, np.uint8)
+    cols = [(220, 20, 20), (20, 150, 20), (30, 30, 220)]
+    y, ci = 60, 0
+    while y < h - 60:
+        a[y:y + 3, 60:w - 60] = cols[ci % 3]          # a coloured horizontal 'wire'
+        for x in range(80, w - 80, 40):               # black text-like dashes beneath it
+            a[y + 12:y + 20, x:x + 24] = (0, 0, 0)
+        y += 48; ci += 1
+    for i, x in enumerate(range(120, w - 120, 160)):  # a few vertical coloured wires
+        a[80:h - 80, x:x + 3] = cols[i % 3]
+    png = path.with_suffix('.png')                     # PNG = lossless, exact colours + sharp
+    Image.fromarray(a).save(png, dpi=(200, 200))
+    with open(path, 'wb') as f:
+        f.write(img2pdf.convert(str(png), dpi=200))
+    png.unlink(missing_ok=True)
     return path
 
 

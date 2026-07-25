@@ -53,6 +53,9 @@ PHOTO_COLOR_COMBOS = [
     dict(quality=q, photo_dpi=pd) for q in (40, 60, 80) for pd in (110, 150)
 ]
 
+# Colour line art: parameterless — the page is passed through LOSSLESSLY (no knobs).
+COLOR_LINE_COMBOS = [dict()]
+
 
 def _bitonal_row(pdf, combo, art_dir):
     """Binarize page 1 with `combo`, JBIG2 it, return metrics + save the PNG."""
@@ -72,6 +75,23 @@ def _bitonal_row(pdf, combo, art_dir):
         shutil.copyfile(png, art_dir / f'{tag}.png')
         return {'combo': tag, 'out_bytes': jb2, 'raw_black_frac': round(raw_black, 4),
                 'ink_kept_frac': round(ink_kept, 4)}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _color_line_row(pdf, art_dir):
+    """Colour line art: build the LOSSLESS pass-through segment and record its size.
+    Parameterless — the original page is copied through, not re-encoded, so there are
+    no knobs to sweep and no 'smaller' guarantee (crisp colour is the point)."""
+    work = U.workdir()
+    try:
+        out_pdf = work / 'seg.pdf'
+        U.owm._color_line_seg(pdf, 1, out_pdf)
+        if not out_pdf.exists() or out_pdf.stat().st_size == 0:
+            return None
+        art_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(out_pdf, art_dir / 'passthrough.pdf')
+        return {'combo': 'lossless_passthrough', 'out_bytes': out_pdf.stat().st_size}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -118,6 +138,9 @@ def run_matrix() -> list[dict]:
             elif page_type == 'photo_gray':
                 combos, runner = PHOTO_GRAY_COMBOS, \
                     lambda c: _photo_row(pdf, page_type, c, art_dir)
+            elif page_type == 'color_line':
+                combos, runner = COLOR_LINE_COMBOS, \
+                    lambda c: _color_line_row(pdf, art_dir)
             else:
                 combos, runner = PHOTO_COLOR_COMBOS, \
                     lambda c: _photo_row(pdf, page_type, c, art_dir)
@@ -178,6 +201,8 @@ def test_default_settings_produce_a_valid_output(page_type, pdf):
             m = _bitonal_row(pdf, dict(sauvola_k=0.30), art_dir)
         elif page_type == 'photo_gray':
             m = _photo_row(pdf, page_type, dict(quality=60, descreen=0.6), art_dir)
+        elif page_type == 'color_line':
+            m = _color_line_row(pdf, art_dir)
         else:
             m = _photo_row(pdf, page_type, dict(quality=60, photo_dpi=150), art_dir)
     finally:

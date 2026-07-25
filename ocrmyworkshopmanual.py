@@ -101,7 +101,15 @@ PT_BLANK = 'blank'              # near-empty  -> folds into the bitonal run (JBI
 PT_LINE = 'line'               # text / line-art (incl. gray-wash/shadow) -> flatten+Sauvola -> JBIG2
 PT_PHOTO_GRAY = 'photo_gray'   # B&W photo / halftone / stipple -> whiten paper + trim edges -> gray JPEG
 PT_PHOTO_COLOR = 'photo_color' # genuine colour (covers, colour diagrams) -> colour JPEG
+PT_COLOR_LINE = 'color_line'   # colour LINE ART (colour wiring diagrams / schematics): low
+                               # continuous-tone coverage but real colour -> lossless source-
+                               # page pass-through (NEVER binarize, so the colour survives)
 _PT_BITONAL = (PT_BLANK, PT_LINE)  # types that share the grouped-JBIG2 path
+
+# DPI for the cheap colour PROBE that rescues colour line art from the bitonal path.
+# Only low enough to let _is_color() see chroma; the page itself is passed through at
+# full resolution (never re-rendered), so this never limits output quality.
+COLOR_PROBE_DPI = 100
 
 # classify_page() result: the page's type, plus a pre-rendered colour PNG for photo
 # pages (so the strategy doesn't re-render), else None.
@@ -188,6 +196,50 @@ TESS = shutil.which('tesseract')
 # Tesseract OSD script name -> ocrmypdf language. Cyrillic docs often carry some
 # English too, so pair rus+eng. Scripts without an installed pack fall back to eng.
 _SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng'}
+
+# Minimum Tesseract OSD "Script confidence" to TRUST a page's script vote. OSD is
+# unreliable on sparse text (a wiring-diagram page with few words), where it emits a
+# low-confidence — often wrong — guess (measured: English diagrams mislabelled Cyrillic
+# at conf 0.6-1.3, while genuine dense pages score ~15-20). Votes below this floor are
+# ignored, so a Latin/English doc is no longer mislabelled rus+eng (slow, lower quality)
+# by a couple of noisy sparse pages; a genuinely Russian manual still clears it easily.
+MIN_OSD_SCRIPT_CONF = 3.0
+
+_INSTALLED_LANGS = None
+
+
+def _installed_langs() -> set:
+    """Tesseract language packs actually installed (cached per process). `tesseract
+    --list-langs` also prints script/ combos and a header line — keep only plain packs."""
+    global _INSTALLED_LANGS
+    if _INSTALLED_LANGS is None:
+        langs: set = set()
+        if TESS:
+            try:
+                r = subprocess.run([TESS, '--list-langs'], capture_output=True,
+                                   text=True, timeout=30)
+                for ln in (r.stdout or '').splitlines():
+                    ln = ln.strip()
+                    if ln and 'List of' not in ln and '/' not in ln and '\\' not in ln:
+                        langs.add(ln)
+            except Exception:
+                pass
+        _INSTALLED_LANGS = langs
+    return _INSTALLED_LANGS
+
+
+def _available_ocr_lang(lang: str) -> str:
+    """Filter an OCR language spec (e.g. 'rus+eng') to packs that are actually installed;
+    if none survive, fall back to 'eng' (or any installed pack). So a missing language
+    pack NEVER silently drops the whole OCR text layer — it degrades to what Tesseract
+    can actually run, instead of erroring the file out with no text at all."""
+    inst = _installed_langs()
+    if not inst:
+        return lang                        # couldn't enumerate -> don't second-guess
+    keep = [p for p in lang.split('+') if p in inst]
+    if keep:
+        return '+'.join(keep)
+    return 'eng' if 'eng' in inst else sorted(inst)[0]
 
 
 def set_below_normal_priority():
@@ -427,13 +479,108 @@ def _is_color(a: np.ndarray) -> bool:
     return float(((mx - mn)[marks] > 45).mean()) > 0.06
 
 
+def _render_color(src_p: Path, page_no: int, out_png: Path, dpi: int) -> bool:
+    """Render one page to a full-colour (png16m / RGB) PNG at `dpi`. True on success."""
+    subprocess.run([GS, '-sDEVICE=png16m', f'-r{dpi}', f'-dFirstPage={page_no}',
+                    f'-dLastPage={page_no}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                    '-sOutputFile=' + str(out_png), win_long(src_p)], capture_output=True)
+    return out_png.exists()
+
+
+_GRAY_CS = {'/DeviceGray', '/CalGray'}  # colour spaces that can NEVER carry colour
+
+
+def _page_color_capable(page) -> bool:
+    """Cheap METADATA pre-filter (no pixels): COULD this page contain colour?
+
+    Walks the page's image XObjects (recursing into Form XObjects) and inspects each
+    image's /ColorSpace. Returns True as soon as ANY image is colour-capable
+    (DeviceRGB/CMYK/Lab, Indexed/Separation/DeviceN, or ICCBased with N>=3), so a big
+    gray scan with a small colour inset still gets probed. 'When unsure, probe': also
+    True on a parse error, when `page` is None, or when no image is found — because a
+    wrong 'gray' verdict silently destroys colour (the exact bug this guards), whereas
+    a wrong 'colour' verdict only costs one cheap probe render. Returns False only when
+    image(s) were found and ALL resolve as confidently gray / 1-bit — the common
+    grayscale scan, which then keeps the fast bitonal path with no colour render."""
+    if page is None:
+        return True
+
+    def cs_is_color(cs) -> bool:
+        try:
+            cs = cs.get_object() if hasattr(cs, 'get_object') else cs
+        except Exception:
+            return True
+        if isinstance(cs, (list, tuple)) and cs:
+            head = str(cs[0])
+            if head == '/ICCBased':
+                try:
+                    return int(cs[1].get_object().get('/N', 3)) >= 3
+                except Exception:
+                    return True
+            if head in ('/Indexed', '/Separation', '/DeviceN'):
+                return True   # palette / separation may carry colour -> let _is_color arbitrate
+            return head not in _GRAY_CS
+        return str(cs) not in _GRAY_CS
+
+    found = [False]
+    color = [False]
+
+    def walk(res, depth=0):
+        if not res or depth > 4:
+            return
+        try:
+            xo = res.get_object().get('/XObject')
+            if not xo:
+                return
+            xo = xo.get_object()
+            for name in xo:
+                obj = xo[name].get_object()
+                sub = obj.get('/Subtype')
+                if sub == '/Image':
+                    found[0] = True
+                    if obj.get('/ImageMask'):
+                        continue          # 1-bit stencil -> not colour
+                    if cs_is_color(obj.get('/ColorSpace')):
+                        color[0] = True
+                elif sub == '/Form':
+                    walk(obj.get('/Resources'), depth + 1)
+        except Exception:
+            color[0] = True               # unsure -> probe
+
+    try:
+        walk(page.get('/Resources'))
+    except Exception:
+        return True
+    return color[0] or not found[0]
+
+
+def _page_has_color(work: Path, src_p: Path, page_no: int, dpi: int) -> bool:
+    """Authoritative COLOUR test for a low-coverage line-art page: render it in colour
+    at a low DPI via Ghostscript and run the cast-robust _is_color() test. We render
+    (not extract via pypdf) deliberately — pypdf silently MIS-decodes Indexed/palette
+    images (drops the lookup table -> a gray-looking fallback -> false 'not colour',
+    which would re-binarize the very colour diagrams this guards); Ghostscript applies
+    the palette/ICC correctly. Gated by the cheap _page_color_capable() pre-filter, so
+    plain DeviceGray scans never reach here."""
+    cpng = work / f'cl{page_no}.png'
+    got = _render_color(src_p, page_no, cpng, min(dpi, COLOR_PROBE_DPI))
+    res = _is_color(np.asarray(Image.open(cpng).convert('RGB')).astype(np.int16)) if got else False
+    cpng.unlink(missing_ok=True)
+    return res
+
+
 def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
                   detect_photos: bool, photo_thresh: float, photo_dpi: int,
-                  blank_ink: float = 0.0008) -> PageClass:
+                  blank_ink: float = 0.0008, page=None) -> PageClass:
     """Route one rendered grayscale page to a PageType. Cheap signals: ink fraction
-    (BLANK), tiled continuous-tone coverage (PHOTO vs LINE), and — for photo pages —
-    a colour render + cast-robust colour test (PHOTO_GRAY vs PHOTO_COLOR). The colour
-    PNG is rendered once here and handed to the strategy via PageClass.color_png.
+    (BLANK), tiled continuous-tone coverage (PHOTO vs LINE), a colour render + cast-
+    robust colour test for photo pages (PHOTO_GRAY vs PHOTO_COLOR), and — critically —
+    a colour probe on LOW-coverage line art so a colour wiring diagram / schematic is
+    routed to PT_COLOR_LINE (lossless pass-through) instead of being binarized to b&w.
+    The photo colour PNG is rendered once and handed to the strategy via color_png.
+
+    `page` is the source PdfReader page (for the cheap colourspace pre-filter); callers
+    that classify many pages should pass it (one reader) — else it is loaded on demand.
 
     A page is only BLANK when it has neither ink NOR continuous-tone coverage: bright
     colour pages (an orange/pastel cover) convert to a grayscale luminance that is all
@@ -441,20 +588,31 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
     the coverage guard keeps them on the photo/colour path."""
     g = np.asarray(Image.open(png).convert('L'))
     cov = photo_coverage(png, dpi) if detect_photos else 0.0
+
+    # continuous-tone page: render colour once, decide gray vs colour
+    if detect_photos and cov > photo_thresh:
+        d = photo_dpi or dpi
+        cpng = work / f'color{page_no}.png'
+        if _render_color(src_p, page_no, cpng, d):
+            a = np.asarray(Image.open(cpng).convert('RGB')).astype(np.int16)
+            return PageClass(PT_PHOTO_COLOR if _is_color(a) else PT_PHOTO_GRAY, cpng)
+        # colour render failed -> fall through to the bitonal decision below
+
+    # LOW-coverage LINE ART: rescue genuine COLOUR (colour wiring diagrams / schematics)
+    # before it is binarized. The metadata pre-filter skips the probe for plain
+    # grayscale scans (the common case), so this adds no render there.
+    if detect_photos:
+        if page is None:
+            try:
+                page = PdfReader(str(src_p)).pages[page_no - 1]
+            except Exception:
+                page = None
+        if _page_color_capable(page) and _page_has_color(work, src_p, page_no, dpi):
+            return PageClass(PT_COLOR_LINE, None)
+
     if float((g < 100).mean()) < blank_ink and cov <= photo_thresh:
         return PageClass(PT_BLANK, None)
-    if not detect_photos or cov <= photo_thresh:
-        return PageClass(PT_LINE, None)
-    # continuous-tone page: render colour once, decide gray vs colour
-    d = photo_dpi or dpi
-    cpng = work / f'color{page_no}.png'
-    subprocess.run([GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={page_no}', f'-dLastPage={page_no}',
-                    '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(cpng), win_long(src_p)],
-                   capture_output=True)
-    if not cpng.exists():
-        return PageClass(PT_LINE, None)  # colour render failed -> treat as line
-    a = np.asarray(Image.open(cpng).convert('RGB')).astype(np.int16)
-    return PageClass(PT_PHOTO_COLOR if _is_color(a) else PT_PHOTO_GRAY, cpng)
+    return PageClass(PT_LINE, None)
 
 
 def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
@@ -476,6 +634,33 @@ def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
     pc.color_png.unlink(missing_ok=True)
     with open(out_pdf, 'wb') as f:
         f.write(img2pdf.convert(str(jpg)))
+
+
+def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
+    """Strategy for PT_COLOR_LINE: copy the ORIGINAL page through LOSSLESSLY (no
+    re-encode) so a colour wiring diagram keeps its exact colours and crisp lines at a
+    tiny size — the whole point of not binarizing it. Falls back to a re-rendered,
+    palette-quantized PNG only if the lossless page copy fails (near-never)."""
+    try:
+        r = PdfReader(str(src_pdf))
+        w = PdfWriter()
+        w.add_page(r.pages[page_no - 1])
+        with open(out_pdf, 'wb') as f:
+            w.write(f)
+        if out_pdf.stat().st_size > 0:
+            return
+    except Exception:
+        pass
+    # fallback: re-render colour, quantize to a small lossless indexed PNG, wrap to PDF
+    tmp = out_pdf.with_name(out_pdf.stem + '_clr.png')
+    if _render_color(src_pdf, page_no, tmp, 200):
+        try:
+            Image.open(tmp).convert('RGB').quantize(colors=64).save(tmp, 'PNG', dpi=(200, 200))
+        except Exception:
+            pass
+        with open(out_pdf, 'wb') as f:
+            f.write(img2pdf.convert(str(tmp), dpi=200))
+    tmp.unlink(missing_ok=True)
 
 
 def has_text(pdf: Path, sample: int = 6, min_chars: int = 40) -> bool:
@@ -644,11 +829,13 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
                     conf = float(s.split(':', 1)[1].strip())
                 except ValueError:
                     conf = 0.0
-        if script:
+        # Only trust a CONFIDENT script vote — sparse pages emit low-confidence noise
+        # (often a spurious 'Cyrillic') that otherwise accumulates into a wrong language.
+        if script and conf >= MIN_OSD_SCRIPT_CONF:
             scores[script] = scores.get(script, 0.0) + conf
     if not scores:
-        return 'eng'
-    return _SCRIPT_LANG.get(max(scores, key=scores.get), 'eng')
+        return 'eng'                       # no confident page -> safe default
+    return _available_ocr_lang(_SCRIPT_LANG.get(max(scores, key=scores.get), 'eng'))
 
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
@@ -668,7 +855,10 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         else:
             if language == 'auto':
                 language = _detect_language(base, work, timeout)
-                note += f' (lang:{language})'
+            # filter to installed packs so a missing pack degrades to eng/available
+            # rather than erroring OCR out and leaving the file with no text at all.
+            language = _available_ocr_lang(language)
+            note += f' (lang:{language})'
             ocr_pdf = work / 'ocr.pdf'
             r = subprocess.run(
                 OCRMYPDF + ['--language', language, '--optimize', '0',
@@ -735,9 +925,14 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
             binarize_png(png, min_size, despeckle, dpi, sauvola_k)
             r = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), png.name], cwd=sub, capture_output=True)
             comp += len(r.stdout)
+        elif pc.type == PT_COLOR_LINE:
+            # colour line art is passed through losslessly -> charge ~its original page size,
+            # so the precheck doesn't over-optimistically expect JBIG2-tiny output.
+            clseg = sub / f'cl{p}.pdf'
+            _color_line_seg(src_p, p, clseg)
+            comp += clseg.stat().st_size if clseg.exists() else 0
         else:
             d = photo_dpi or dpi
-            jpg = sub / f'j{p}.jpg'
             photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_descreen)
             # photo_seg_pdf writes photo{p}.jpg then a tiny PDF wrapper; size ~ the JPEG
             comp += (sub / f'photo{p}.jpg').stat().st_size
@@ -867,10 +1062,22 @@ def compress_one(src: str, dest: str, dpi: int,
         # generic JBIG2 PDF (self-contained, so it renders in Chrome/Edge); PHOTO_*
         # pages each become one JPEG PDF.
         d = photo_dpi or dpi
+        try:
+            _rdr = PdfReader(str(render_src))   # kept alive for page.images extraction
+            _rpages = _rdr.pages
+        except Exception:
+            _rpages = None
+
+        def _page_at(k):
+            try:
+                return _rpages[k] if _rpages is not None else None
+            except Exception:
+                return None
         classes = [classify_page(work / n, k + 1, render_src, work, dpi,
-                                 True, photo_thresh, photo_dpi)
+                                 True, photo_thresh, photo_dpi, page=_page_at(k))
                    for k, n in enumerate(pngs)]
-        n_photo = sum(c.type not in _PT_BITONAL for c in classes)
+        n_color_line = sum(c.type == PT_COLOR_LINE for c in classes)
+        n_photo = sum(c.type not in _PT_BITONAL and c.type != PT_COLOR_LINE for c in classes)
         n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
         seg_pdfs = []
         i = 0
@@ -894,6 +1101,12 @@ def compress_one(src: str, dest: str, dpi: int,
                                 'err': f'wrap failed rc={r.returncode} {r.stderr[:200]}'}
                     seg_pdfs.append(seg)
                     i = j
+                elif classes[i].type == PT_COLOR_LINE:
+                    # colour line art -> lossless pass-through of the original page (no binarize)
+                    seg = work / f's{i:05d}.pdf'
+                    _color_line_seg(render_src, i + 1, seg)
+                    seg_pdfs.append(seg)
+                    i += 1
                 else:  # PHOTO_GRAY / PHOTO_COLOR
                     seg = work / f's{i:05d}.pdf'
                     photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_descreen)
@@ -924,7 +1137,7 @@ def compress_one(src: str, dest: str, dpi: int,
         if kept_original:
             base = work / 'orig.pdf'
             shutil.copyfile(str(src_p), str(base))
-            n_photo = n_color = 0
+            n_photo = n_color = n_color_line = 0
         else:
             base = comp
 
@@ -937,6 +1150,8 @@ def compress_one(src: str, dest: str, dpi: int,
             note = f' [{n_photo} photo pg: {", ".join(bits)}]'
         else:
             note = ''
+        if n_color_line:
+            note += f' [{n_color_line} colour line-art pg (lossless)]'
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
