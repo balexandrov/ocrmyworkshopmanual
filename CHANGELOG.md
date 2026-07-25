@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Very-high-page-count PDFs (multi-thousand-page manuals) failed with a Windows
+  `WinError 206` ("filename or extension too long"): the JBIG2 wrapper was
+  called with one command-line argument per page, overflowing the OS
+  command-line length limit (~32K chars). Root fix (not a chunk/cap workaround):
+  the wrapper now reads its page list from **stdin** (`jbig2topdf.py -s -`, one
+  path per line) and the tool feeds it that way — a single call of any length,
+  so the limit is eliminated as a failure mode. Verified end-to-end on a real
+  3,573-page manual that previously failed outright.
+
 ### Changed
 
 - Hardened the batch run against partial-failure modes found in the field:
