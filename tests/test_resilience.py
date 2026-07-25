@@ -80,6 +80,46 @@ def test_bright_colour_page_not_classified_blank(tmp_path):
     assert t == U.owm.PT_PHOTO_COLOR, f'expected photo_color, got {t}: {sig}'
 
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_colour_line_art_routes_to_color_line(tmp_path):
+    """Regression: a flat-COLOUR line-art page (colour wiring diagram — coloured wires +
+    black text, continuous-tone coverage ~0) must route to PT_COLOR_LINE, NOT the
+    bitonal path. The colour test used to be gated behind photo-coverage, so low-
+    coverage colour line art fell through to PT_LINE and was binarized to b&w,
+    destroying the wire colours (the real DODGE NEON diagram this reproduces)."""
+    pdf = U.make_color_line_pdf(tmp_path / 'wires.pdf')
+    work = U.workdir()
+    try:
+        t, sig = U.classify(pdf, 1, 200, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    assert t == U.owm.PT_COLOR_LINE, f'colour line art misrouted to {t!r}: {sig}'
+    assert t not in U.owm._PT_BITONAL, 'colour line art must never take the bitonal path'
+    assert sig['photo_cov'] <= 0.02, f'should be the LOW-coverage path, cov={sig["photo_cov"]}'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_colour_survives_compression_round_trip(tmp_path):
+    """End-to-end: compressing a colour line-art page keeps its colour (lossless source-
+    page pass-through), where the old bitonal path flattened it to 1-bit b&w."""
+    import subprocess
+
+    import numpy as np
+    from PIL import Image
+    pdf = U.make_color_line_pdf(tmp_path / 'wires.pdf')
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(pdf), str(out), 200, ocr=False)
+    assert res.get('err') is None, res
+    assert out.exists(), 'no output produced'
+    assert len(PdfReader(str(out)).pages) == 1
+    cp = tmp_path / 'c.png'
+    subprocess.run([U.owm.GS, '-sDEVICE=png16m', '-r150', '-dFirstPage=1', '-dLastPage=1',
+                    '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(cp),
+                    U.owm.win_long(out)], capture_output=True)
+    a = np.asarray(Image.open(cp).convert('RGB')).astype(np.int16)
+    assert U.owm._is_color(a), 'colour was lost in the round trip (page was binarized to b&w)'
+
+
 # ── config file / dedup / retry / repair ─────────────────────────────────────
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))

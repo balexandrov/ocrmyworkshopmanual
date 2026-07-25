@@ -306,5 +306,19 @@
     "classifier_said": "photo_color",
     "verified": true,
     "note": "BRIGHT ORANGE cover, no dark pixels: grayscale luminance all >=100 so ink_frac=0. REGRESSION: was mis-classified BLANK (dark-pixel-only test) and destroyed as bitonal until the blank test also required low photo-coverage. cov~0.71. Human-verified. lcw 60-series."
+  },
+  {
+    "file": "color_line/11042_NEON_DODGE NEON  1 WIRE ALERT SHEL_p0001.pdf",
+    "type": "color_line",
+    "source": "M:\\Auto\\Backup\\Auto\\--General--\\Autoelectric schemas\\Alarm cables\\DOWNLOADS\\11042_NEON_DODGE NEON  1 WIRE ALERT SHELBY UNITS.pdf",
+    "source_page": 1,
+    "signals": {
+      "ink_frac": 0.089487,
+      "photo_cov": 0.0,
+      "type": "color_line"
+    },
+    "classifier_said": "color_line",
+    "verified": true,
+    "note": "the12volt DODGE NEON alarm wiring diagram: flat-colour LINE ART (colour-coded wires + black text on white, photo_cov~0). Pre-fix it was binarized to b&w, destroying the wire colours; now routed to PT_COLOR_LINE (lossless pass-through). 23.8% of non-white marks are genuinely coloured. Human-verified."
   }
 ]
