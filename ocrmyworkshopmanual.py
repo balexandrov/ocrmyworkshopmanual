@@ -486,7 +486,18 @@ def _is_color(a: np.ndarray) -> bool:
     marks = mn < 200
     if int(marks.sum()) < 50:
         return False
-    return float(((mx - mn)[marks] > 45).mean()) > 0.06
+    chroma = (mx - mn)[marks]
+    # (a) A SMALL amount of strongly saturated ink still means "colour-coded": a wiring
+    # diagram that is mostly a black text table but has a few vivid red/blue/yellow wires
+    # carries its meaning in those wires. Judging by SHARE of ink alone missed exactly
+    # that case (a real Chrysler diagram: 5.5% coloured -> binarized, colour destroyed).
+    # Measured separation is wide: non-colour scans reach 0.0019 / 66 px of chroma>60,
+    # while every genuinely colour page starts at 0.053 / 2875 px.
+    strong = chroma > 60
+    if int(strong.sum()) >= 500 and float(strong.mean()) > 0.01:
+        return True
+    # (b) broadly colourful page (pastel/faded colour spread over much of the ink)
+    return float((chroma > 45).mean()) > 0.06
 
 
 def _render_color(src_p: Path, page_no: int, out_png: Path, dpi: int) -> bool:
