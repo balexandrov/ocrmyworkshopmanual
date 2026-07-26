@@ -593,6 +593,53 @@ def test_gs_repair_recovers_truncated(tmp_path):
         shutil.rmtree(work, ignore_errors=True)
 
 
+CORRUPT_FIXTURE = U.FIXTURES_DIR / 'corrupt' / 'nissan_rogue_2009_FSU_corrupt.pdf'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_real_corrupt_pdf_is_recovered_whole(tmp_path):
+    """A REAL corrupt manual (Nissan Rogue FSM, corrupt at source: garbage bytes inside
+    the content streams, page tree intact). Ghostscript renders 0 pages and its pdfwrite
+    repair salvages only 1 of 21 — which used to be shipped as a 1-page file. It must now
+    be recovered WHOLE: every page, with its links and bookmarks."""
+    from pypdf import PdfReader
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(CORRUPT_FIXTURE), str(out), 200, ocr=False)
+    assert res.get('err') is None, res
+    assert 'repaired' in (res.get('note') or ''), f'repair should be reported: {res}'
+    r = PdfReader(str(out))
+    assert len(r.pages) == 21, f'page loss: {len(r.pages)}/21'
+    links = 0
+    for p in r.pages:
+        a = p.get('/Annots')
+        if a:
+            links += sum(1 for x in a.get_object()
+                         if x.get_object().get('/Subtype') == '/Link')
+
+    def cnt(items):
+        n = 0
+        for it in items:
+            n += cnt(it) if isinstance(it, list) else 1
+        return n
+    assert links > 100, f'links lost: {links}'
+    assert cnt(r.outline) > 50, 'bookmarks lost'
+    assert out.stat().st_size < CORRUPT_FIXTURE.stat().st_size, 'should also compress'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_corrupt_pdf_not_byte_copied_on_the_ocr_only_path(tmp_path):
+    """The OCR-only path copies the source through byte-for-byte, which faithfully
+    reproduced a CORRUPT file (the copy rendered 0 pages). It must repair instead."""
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(CORRUPT_FIXTURE), str(out), 200, ocr=False, ocr_only=True)
+    assert res.get('err') is None, res
+    assert out.exists()
+    assert out.read_bytes() != CORRUPT_FIXTURE.read_bytes(), 'shipped the corrupt bytes'
+    assert U.owm._renders_ok(out), 'output still does not render'
+
+
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_repair_prefers_the_engine_that_keeps_every_page(tmp_path):
     """Repair must not accept a PARTIAL salvage. Ghostscript's pdfwrite recovered only
