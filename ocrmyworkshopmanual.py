@@ -967,6 +967,20 @@ def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0
     return None
 
 
+def _renders_ok(pdf: Path, timeout: int = 0) -> bool:
+    """Can this PDF actually be rendered? Cheap one-page Ghostscript probe. Used on the
+    paths that copy the source through byte-for-byte, so a corrupt file is caught and
+    repaired instead of being faithfully reproduced as an unreadable copy."""
+    out = pdf.parent / f'_probe_{pdf.stem}.png'
+    try:
+        ok = _render_page_gray(pdf, 1, out, 36, timeout) and out.stat().st_size > 0
+    except Exception:
+        ok = False
+    finally:
+        out.unlink(missing_ok=True)
+    return ok
+
+
 def _qpdf_repair(src_p: Path, work: Path, timeout: int = 0):
     """Rewrite a damaged PDF through qpdf (via pikepdf), which reconstructs broken
     xref/trailer structure while keeping every page it can parse."""
@@ -1246,8 +1260,20 @@ def compress_one(src: str, dest: str, dpi: int,
             # No (worthwhile) compression: keep the original images, just add the OCR layer.
             base = work / 'orig.pdf'
             shutil.copyfile(str(src_p), str(base))
+            # ...but never pass a BROKEN file straight through: this path copies bytes, so
+            # a corrupt PDF would be reproduced corrupt (it renders nothing). If it cannot
+            # render, repair it first — the repaired copy is what gets OCR'd and placed.
+            if not _renders_ok(base, timeout):
+                fixed = _repair_pdf(base, work, src_pages, timeout)
+                if fixed and _renders_ok(fixed, timeout):
+                    base = fixed
+                    note0 += ' (repaired malformed PDF)'
+                else:
+                    return {'src': src_p.name, 'orig': orig, 'new': 0,
+                            'err': 'unreadable PDF: renders no pages and repair failed '
+                                   '— original kept'}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                                 len(PdfReader(str(base)).pages), True, note0,
+                                 src_pages or len(PdfReader(str(base)).pages), True, note0,
                                  timeout, in_place)
             res['action'] = 'ocr_only'
             return res
@@ -1409,8 +1435,10 @@ def compress_one(src: str, dest: str, dpi: int,
         grafted = _graft_into_source(render_src, comp)
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
+            # Keep the ORIGINAL images — but if the source was malformed, keep the
+            # REPAIRED copy instead of copying the broken bytes back out.
             base = work / 'orig.pdf'
-            shutil.copyfile(str(src_p), str(base))
+            shutil.copyfile(str(render_src if did_repair else src_p), str(base))
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp

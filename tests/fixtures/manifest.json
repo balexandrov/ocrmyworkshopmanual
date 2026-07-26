@@ -334,5 +334,15 @@
     "classifier_said": "color_line",
     "verified": true,
     "note": "the12volt CHRYSLER disarm diagram: mostly a BLACK text table with a few vivid red/blue/yellow wires + green fuse \u2014 only 5.5% of ink is coloured, so the old share-of-ink colour test (>6% at chroma>45) MISSED it and binarized it, destroying the wire colours. Caught now by the strongly-saturated-ink rule (chroma>60). Human-verified."
+  },
+  {
+    "file": "corrupt/nissan_rogue_2009_FSU_corrupt.pdf",
+    "type": "corrupt",
+    "source": "https://jdmfsm.info/Auto/Japan/Nissan/S35%20Rogue/2009/FSU.pdf",
+    "source_page": 0,
+    "signals": {},
+    "classifier_said": "n/a",
+    "verified": true,
+    "note": "Nissan Rogue 2009 FSM, Front Suspension section \u2014 CORRUPT AT SOURCE (the local copy is byte-identical to the website's, and the freshly downloaded copy is equally broken): garbage bytes inside the content streams, page tree intact. Ghostscript renders 0 pages and its pdfwrite repair salvages only 1 of 21; qpdf recovers all 21. Guards the repair path: qpdf-first, and no partial salvage."
   }
 ]
