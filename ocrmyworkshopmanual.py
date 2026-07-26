@@ -70,6 +70,7 @@ import concurrent.futures as cf
 import csv
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -618,7 +619,14 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
     # text, colour and hyperlinks survive (rasterizing to b&w destroys all three).
     if page is not None:
         try:
+            # no full-page raster -> a born-digital page
             if _largest_image_dpi(page) < VECTOR_DPI_FLOOR:
+                return PageClass(PT_VECTOR, None)
+            # OR: real VISIBLE text drawn over a background scan. Rasterising would
+            # destroy publisher text that OCR cannot faithfully reproduce, so this page
+            # is passed through too. An invisible (mode 3) OCR layer does NOT count —
+            # that we can and do regenerate.
+            if _visible_text_chars(page):
                 return PageClass(PT_VECTOR, None)
         except Exception:
             pass
@@ -694,6 +702,116 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
     tmp.unlink(missing_ok=True)
 
 
+def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
+                timeout: int = 0) -> tuple:
+    """Run OCR on the SOURCE at full resolution and return (ocr'd_pdf, language, note).
+
+    OCR must read the ORIGINAL, never our own output: every compression we apply is
+    lossy, so OCR'ing the result reads a degraded image. Measured on a real Russian
+    manual — OCR of the source at 400 dpi made ~1 word error per 70, while OCR of the
+    shipped 150-dpi page made ~5, because the detail was already thrown away (and
+    re-rendering the downsampled page at higher dpi cannot bring it back).
+
+    ocrmypdf writes its text layer as a self-contained Form XObject, which the graft
+    then carries onto the compressed pages — so image compression and text quality are
+    fully decoupled. Mode matters: --redo-ocr upgrades a stale OCR layer, but on a
+    VECTOR page it stacks OCR text on top of real text (measured: 1467 -> 2937 chars),
+    so it is only used when the file has no vector pages."""
+    if language == 'auto':
+        language = _detect_language(src_p, work, timeout)
+    language = _available_ocr_lang(language)
+    # --skip-text skips any page carrying ANY text, so a page with a bare page number
+    # (measured: 20 chars on a Lexus manual) would never be OCR'd and the manual would
+    # ship unsearchable. --redo-ocr instead strips such remnants and OCRs properly. It is
+    # unsafe only where REAL vector text exists, since there it stacks OCR on top of it.
+    mode = '--skip-text' if has_vector else '--redo-ocr'
+    out = work / 'src_ocr.pdf'
+    r, tries = _run_retry(lambda: subprocess.run(
+        OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
+                    mode, '--quiet', '--jobs', '1', str(src_p), str(out)],
+        capture_output=True, text=True))
+    note = f' (lang:{language}'
+    note += ', re-ocr' if mode == '--redo-ocr' else ''
+    note += f', retried x{tries - 1}' if tries > 1 else ''
+    note += ')'
+    if r is not None and r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+        return out, language, note
+    return None, language, ' (OCR FAILED)'
+
+
+_TEXT_SHOW = re.compile(rb"(?<![A-Za-z0-9])(Tj|TJ|'|\")(?![A-Za-z0-9])")
+_TR_MODE = re.compile(rb"(?<![\d.])(\d)\s+Tr(?![A-Za-z0-9])")
+
+
+def _visible_text_chars(page, min_chars: int = 100) -> int:
+    """Characters of REAL (visible) text on the page — 0 if its only text is an
+    invisible OCR layer.
+
+    This is the line between text we may destroy and text we may not. An OCR layer is
+    drawn in text-render mode 3 (invisible): rasterising the page loses nothing we
+    cannot regenerate by OCR'ing it again. Text drawn visibly is publisher content —
+    real vector type over a background scan — and rasterising it destroys the original
+    permanently (measured on a Toyota RAV4 manual: 731 chars of visible 6.5-15pt text
+    on pages that also carry a full-page image, so the DPI test alone called them scans).
+    Pages below `min_chars` are ignored so a bare page number does not veto compression."""
+    try:
+        data = page.get_contents().get_data()
+    except Exception:
+        return 0
+    if not data:
+        return 0
+    modes = [(m.start(), int(m.group(1))) for m in _TR_MODE.finditer(data)]
+    visible = False
+    for show in _TEXT_SHOW.finditer(data):
+        mode = 0                              # PDF default render mode is 0 = fill
+        for pos, md in modes:
+            if pos < show.start():
+                mode = md
+            else:
+                break
+        if mode != 3:
+            visible = True
+            break
+    if not visible:
+        return 0
+    try:
+        n = len((page.extract_text() or '').strip())
+    except Exception:
+        return 0
+    return n if n >= min_chars else 0
+
+
+def _has_vector_pages(pdf: Path, sample: int = 8) -> bool:
+    """Does this PDF contain born-digital/vector pages (no full-page raster)? Metadata
+    only, no rendering. Used to pick a safe OCR mode: real vector text must never be
+    re-OCR'd on top of."""
+    try:
+        r = PdfReader(str(pdf))
+        n = len(r.pages)
+        if n == 0:
+            return False
+        k = min(sample, n)
+        idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
+        for i in idxs:
+            try:
+                if _largest_image_dpi(r.pages[i]) < VECTOR_DPI_FLOOR:
+                    return True
+            except Exception:
+                return True                    # unsure -> take the safe mode
+    except Exception:
+        return True
+    return False
+
+
+def _page_ocr_xobjects(page):
+    """The /OCR-* Form XObjects ocrmypdf put on a page (its invisible text layer)."""
+    try:
+        xo = page.obj.get('/Resources', {}).get('/XObject', {})
+        return {str(n): xo[n] for n in xo.keys() if str(n).startswith('/OCR')}
+    except Exception:
+        return {}
+
+
 def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
     """Put the COMPRESSED page content back into the ORIGINAL document, instead of
     shipping a freshly-built PDF that carries only pages.
@@ -720,9 +838,24 @@ def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
             if len(s.pages) != len(c.pages) or not len(s.pages):
                 return False
             for sp, cp in zip(s.pages, c.pages):
+                # Keep the source page's OCR text layer (a self-contained Form XObject)
+                # before its content is replaced: the text was read from the ORIGINAL at
+                # full resolution and must survive onto the compressed page, so image
+                # compression never degrades searchability.
+                ocr_xo = _page_ocr_xobjects(sp)
                 fp = s.copy_foreign(cp.obj)      # bring the compressed page across
                 sp.Contents = fp.Contents
                 sp.Resources = fp.Resources
+                if ocr_xo:
+                    res = sp.obj.get('/Resources')
+                    if '/XObject' not in res:
+                        res['/XObject'] = pikepdf.Dictionary()
+                    draw = []
+                    for name, xobj in ocr_xo.items():
+                        res['/XObject'][name] = xobj
+                        draw.append(f'q {name} Do Q'.encode())
+                    body = bytes(sp.obj.Contents.read_bytes()) + b'\n' + b'\n'.join(draw) + b'\n'
+                    sp.Contents = s.make_stream(body)
                 for k in ('/MediaBox', '/Rotate'):
                     if k in fp.keys():
                         sp[k] = fp[k]
@@ -1272,7 +1405,19 @@ def compress_one(src: str, dest: str, dpi: int,
                     return {'src': src_p.name, 'orig': orig, 'new': 0,
                             'err': 'unreadable PDF: renders no pages and repair failed '
                                    '— original kept'}
-            res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
+            # Same OCR rules as the compress path (one implementation): only OCR when the
+            # file lacks a real text layer, and pick the mode by whether vector pages are
+            # present — otherwise a page holding just a page number is skipped entirely
+            # and the manual ships unsearchable.
+            if ocr and not has_text(base):
+                ocr_src, language, onote = _ocr_source(
+                    base, work, language, has_vector=_has_vector_pages(base), timeout=timeout)
+                note0 += onote
+                if ocr_src:
+                    base = ocr_src
+            elif ocr:
+                note0 += ' (had text, OCR skipped)'
+            res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                                  src_pages or len(PdfReader(str(base)).pages), True, note0,
                                  timeout, in_place)
             res['action'] = 'ocr_only'
@@ -1428,17 +1573,27 @@ def compress_one(src: str, dest: str, dpi: int,
         #      re-render didn't help (already-efficient photo/colour scans), keeping it
         #      would only grow the file and risk generational quality loss -> instead
         #      keep the ORIGINAL and just add the OCR layer to it (images untouched).
+        # OCR THE SOURCE, not our own output: every compression here is lossy, so OCR'ing
+        # the compressed page reads a degraded image (measured: ~5x the word errors). The
+        # text layer is produced from the original at full resolution and then carried
+        # onto the compressed pages by the graft, decoupling text quality from image size.
+        ocr_note = ''
+        ocr_src = None
+        if ocr:
+            ocr_src, language, ocr_note = _ocr_source(
+                render_src, work, language, has_vector=bool(n_vector), timeout=timeout)
+
         # Put the compressed pages back INTO the original document, so links, bookmarks,
-        # named destinations and metadata are inherited rather than rebuilt (and lost).
-        # Done BEFORE the size decision so min-savings judges the artefact we will ship.
-        # Falls back silently to the plain rebuild.
-        grafted = _graft_into_source(render_src, comp)
+        # named destinations, metadata AND the source-quality OCR layer are inherited
+        # rather than rebuilt (and lost). Done BEFORE the size decision so min-savings
+        # judges the artefact we will ship. Falls back silently to the plain rebuild.
+        grafted = _graft_into_source(ocr_src or render_src, comp)
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
-            # Keep the ORIGINAL images — but if the source was malformed, keep the
-            # REPAIRED copy instead of copying the broken bytes back out.
+            # Keep the ORIGINAL images — already OCR'd above, so ship that; if the source
+            # was malformed keep the REPAIRED copy, never the broken bytes.
             base = work / 'orig.pdf'
-            shutil.copyfile(str(render_src if did_repair else src_p), str(base))
+            shutil.copyfile(str(ocr_src or (render_src if did_repair else src_p)), str(base))
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
@@ -1464,7 +1619,10 @@ def compress_one(src: str, dest: str, dpi: int,
             note += f' (render retried x{n_retry[0]})'
         if did_repair:
             note += ' (repaired malformed PDF)'
-        res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
+        note += ocr_note
+        # OCR already ran on the source above and its layer was grafted on, so the place
+        # step must NOT re-run it against our compressed images.
+        res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                              src_pages or len(pngs), kept_original, note, timeout, in_place)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
