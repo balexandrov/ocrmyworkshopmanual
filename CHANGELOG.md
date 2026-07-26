@@ -5,6 +5,30 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (OCR now reads the source, not our output)
+
+- **OCR runs on the ORIGINAL at full resolution, before compression.** Every
+  compression here is lossy, so OCR'ing the compressed result reads a degraded
+  image: measured on a real page, OCR of the source made ~1 word error per 70
+  where OCR of the shipped 150-dpi page made ~5, and re-rendering that page at
+  higher dpi cannot recover the discarded detail. ocrmypdf writes its text layer
+  as a self-contained Form XObject, which is grafted onto the compressed pages —
+  so text quality is fully decoupled from image size.
+- **Scan pages are OCR'd in their own document.** ocrmypdf's mode is per file but
+  the requirement is per page: one vector page in a mixed manual forced
+  `--skip-text`, which then skipped every scan page carrying a hidden text layer
+  and shipped 37 characters where the source had 31,693. Scan pages are now
+  separated, force-OCR'd (the only mode that reliably writes a harvestable text
+  layer), and mapped back; vector pages keep the real text they already carry.
+- **Pages with real text drawn ON TOP of a scan are never rasterized** — that is
+  publisher content OCR cannot faithfully reproduce. Draw order decides it: text
+  painted *before* a full-page image is hidden underneath and is treated as a
+  regenerable layer (verified — such a page renders pixel-identically to its
+  background image alone), so those files still compress.
+- A missing language pack, a page holding only a page number (which `--skip-text`
+  skipped entirely, shipping an English manual unsearchable), and OSD script
+  misdetection are all handled; validated across English and Russian manuals.
+
 ### Fixed (data integrity — found by auditing a 64-file sample against its originals)
 
 - **Silent page loss.** The output was verified against the RENDERED page count — the
