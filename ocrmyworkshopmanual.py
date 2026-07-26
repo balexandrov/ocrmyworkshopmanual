@@ -722,38 +722,59 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
     tmp.unlink(missing_ok=True)
 
 
-def _ocr_scan_pages(src_p: Path, work: Path, language: str, vector_pages: set,
-                    timeout: int = 0) -> tuple:
-    """OCR only the SCAN pages of the source, and return (ocr_pdf, {src_page -> ocr_page},
-    language, note).
+def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
+                    skip_pages: set, quality: int = 90) -> tuple:
+    """Wrap OUR OWN page renders into a text-free PDF for OCR, returning (pdf, mapping).
 
-    ocrmypdf's mode is per FILE but the requirement is per PAGE: --force-ocr is the only
-    mode that reliably writes the text into a harvestable /OCR-* XObject, yet it would
-    flatten genuine vector pages. Choosing one mode for the whole file breaks either way
-    — measured on a 12-page RAV4 extract holding a single vector page, --skip-text left
-    every scan page unOCR'd and the output shipped 37 characters instead of 31,693.
-    So the scan pages are pulled into their own document, force-OCR'd there, and mapped
-    back; vector pages keep the real text they already carry."""
-    keep = [i for i in range(_page_count(src_p)) if i not in vector_pages]
-    if not keep:
-        return None, {}, language, ''
-    sub = src_p
-    mapping = {i: i for i in keep}
-    if vector_pages:
-        sub = work / 'scan_pages.pdf'
+    OCR must read the source pixels, never our lossy output — but it does NOT have to
+    read the source FILE. Handing ocrmypdf the original forced --force-ocr, because any
+    text already on a page makes --skip-text skip it (a bare page number left a 311-page
+    manual unsearchable) and --redo-ocr leave an empty text layer behind. --force-ocr then
+    rasterised every page a second time, at full resolution, on top of the render we had
+    already done — measured as a 2.6x slowdown over the whole run.
+
+    These renders carry NO text by construction, so plain --skip-text OCRs every page,
+    and the expensive second rasterisation disappears. Must be called BEFORE the bitonal
+    pages are binarised in place — OCR wants the grayscale, not the 1-bit version.
+    Vector pages are excluded: they keep the real text they already carry."""
+    pages, mapping = [], {}
+    for k, name in enumerate(pngs):
+        if k in skip_pages:
+            continue
+        src = work / name
+        if not src.exists():
+            continue
+        d = page_dpi.get(k, base_dpi)
+        jpg = work / f'ocrin_{k:05d}.jpg'
         try:
-            r = PdfReader(str(src_p))
-            w = PdfWriter()
-            for n, i in enumerate(keep):
-                w.add_page(r.pages[i])
-                mapping[i] = n
-            with open(sub, 'wb') as f:
-                w.write(f)
+            Image.open(src).convert('L').save(jpg, 'JPEG', quality=quality, dpi=(d, d))
+            one = work / f'ocrin_{k:05d}.pdf'
+            with open(one, 'wb') as f:
+                f.write(img2pdf.convert(str(jpg), dpi=d))
+            mapping[k] = len(pages)
+            pages.append(one)
         except Exception:
-            return None, {}, language, ' (OCR FAILED)'
-    ocr_pdf, language, note = _ocr_source(sub, work, language, has_vector=False,
-                                          timeout=timeout)
-    return ocr_pdf, mapping, language, note
+            continue
+        finally:
+            jpg.unlink(missing_ok=True)
+    if not pages:
+        return None, {}
+    out = work / 'ocr_input.pdf'
+    try:
+        if len(pages) == 1:
+            os.replace(str(pages[0]), str(out))
+        else:
+            w = PdfWriter()
+            for pg in pages:
+                w.append(str(pg))
+            with open(out, 'wb') as f:
+                w.write(f)
+    except Exception:
+        return None, {}
+    finally:
+        for pg in pages:
+            pg.unlink(missing_ok=True)
+    return out, mapping
 
 
 def _page_count(p: Path) -> int:
@@ -1401,7 +1422,7 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
                    timeout: int = 0, in_place: bool = False, colour_pages=None,
-                   already_ocred: bool = False) -> dict:
+                   already_ocred: bool = False, was_repaired: bool = False) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
     0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
@@ -1442,7 +1463,10 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
     # already carry a fresh text layer even though this function did not add one. Without
     # it that layer was silently thrown away and the file shipped unsearchable (measured:
     # 13 of 64 files in a sample run OCR'd and then left untouched).
-    if in_place and kept and not ocr_added and not already_ocred:
+    # `was_repaired` likewise: a corrupt source that we could repair must be WRITTEN even
+    # when compression was not worthwhile — leaving the broken original in place discards
+    # a readable version of a file that currently opens nowhere.
+    if in_place and kept and not ocr_added and not already_ocred and not was_repaired:
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
                 'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
     # SELF-AUDIT the result against the source BEFORE anything is overwritten. Damage and
@@ -1721,6 +1745,14 @@ def compress_one(src: str, dest: str, dpi: int,
                 if pd > dpi and _render_page_gray(render_src, k + 1, work / pngs[k], pd, timeout):
                     page_dpi[k] = pd
                     n_native += 1
+        # Build the OCR input from the renders NOW: the bitonal pages are binarised in
+        # place below, and OCR wants the grayscale version, not the 1-bit one.
+        ocr_input = None
+        ocr_map = None
+        if ocr:
+            vec_pages = {k for k, c in enumerate(classes) if c.type == PT_VECTOR}
+            ocr_input, ocr_map = _ocr_render_pdf(work, pngs, page_dpi, dpi, vec_pages)
+
         seg_pdfs = []
         i = 0
         try:
@@ -1782,11 +1814,12 @@ def compress_one(src: str, dest: str, dpi: int,
         # onto the compressed pages by the graft, decoupling text quality from image size.
         ocr_note = ''
         ocr_src = None
-        ocr_map = None
-        if ocr:
-            vec_pages = {k for k, c in enumerate(classes) if c.type == PT_VECTOR}
-            ocr_src, ocr_map, language, ocr_note = _ocr_scan_pages(
-                render_src, work, language, vec_pages, timeout=timeout)
+        if ocr and ocr_input is not None:
+            # --skip-text is correct here precisely because the input is our render, which
+            # carries no text: every page gets OCR'd, and ocrmypdf has nothing to
+            # rasterise a second time.
+            ocr_src, language, ocr_note = _ocr_source(
+                ocr_input, work, language, has_vector=True, timeout=timeout)
 
         # Put the compressed pages back INTO the original document, so links, bookmarks,
         # named destinations, metadata AND the source-quality OCR layer are inherited
@@ -1843,7 +1876,8 @@ def compress_one(src: str, dest: str, dpi: int,
         res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                              src_pages or len(pngs), kept_original, note, timeout, in_place,
                              colour_pages=None if kept_original else colour_pages,
-                             already_ocred=(kept_ocred if kept_original else True))
+                             already_ocred=(kept_ocred if kept_original else True),
+                             was_repaired=did_repair)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:
