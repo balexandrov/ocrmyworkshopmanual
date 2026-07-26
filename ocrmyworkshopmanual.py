@@ -1373,7 +1373,8 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
-                   timeout: int = 0, in_place: bool = False, colour_pages=None) -> dict:
+                   timeout: int = 0, in_place: bool = False, colour_pages=None,
+                   already_ocred: bool = False) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
     0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
@@ -1408,8 +1409,12 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                     note += f' (OCR retried x{tries - 1})'
             else:
                 note += ' (OCR FAILED)'
-    # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched
-    if in_place and kept and not ocr_added:
+    # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched.
+    # `already_ocred` matters: OCR now runs on the SOURCE before this point, so `base` can
+    # already carry a fresh text layer even though this function did not add one. Without
+    # it that layer was silently thrown away and the file shipped unsearchable (measured:
+    # 13 of 64 files in a sample run OCR'd and then left untouched).
+    if in_place and kept and not ocr_added and not already_ocred:
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
                 'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
     # SELF-AUDIT the result against the source BEFORE anything is overwritten. Damage and
@@ -1564,6 +1569,7 @@ def compress_one(src: str, dest: str, dpi: int,
             # ...but never pass a BROKEN file straight through: this path copies bytes, so
             # a corrupt PDF would be reproduced corrupt (it renders nothing). If it cannot
             # render, repair it first — the repaired copy is what gets OCR'd and placed.
+            did_ocr = False
             if not _renders_ok(base, timeout):
                 fixed = _repair_pdf(base, work, src_pages, timeout)
                 if fixed and _renders_ok(fixed, timeout):
@@ -1582,12 +1588,12 @@ def compress_one(src: str, dest: str, dpi: int,
                     base, work, language, has_vector=_has_vector_pages(base), timeout=timeout)
                 note0 += onote
                 if ocr_src:
-                    base = ocr_src
+                    base, did_ocr = ocr_src, True
             elif ocr:
                 note0 += ' (had text, OCR skipped)'
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                                  src_pages or len(PdfReader(str(base)).pages), True, note0,
-                                 timeout, in_place)
+                                 timeout, in_place, already_ocred=did_ocr)
             res['action'] = 'ocr_only'
             return res
         # 1) render pages to grayscale PNG (batched at the base DPI). High-resolution
@@ -1758,6 +1764,7 @@ def compress_one(src: str, dest: str, dpi: int,
         # rather than rebuilt (and lost). Done BEFORE the size decision so min-savings
         # judges the artefact we will ship. Falls back silently to the plain rebuild.
         grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map)
+        kept_ocred = False
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
             # Keep the ORIGINAL images. If the source was malformed keep the REPAIRED
@@ -1772,7 +1779,7 @@ def compress_one(src: str, dest: str, dpi: int,
                 o2, _l, n2 = _ocr_source(base, work, language, has_vector=True,
                                          timeout=timeout)
                 if o2:
-                    base, ocr_note = o2, n2
+                    base, ocr_note, kept_ocred = o2, n2, True
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
@@ -1805,7 +1812,8 @@ def compress_one(src: str, dest: str, dpi: int,
                         if c.type in (PT_COLOR_LINE, PT_PHOTO_COLOR)}
         res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                              src_pages or len(pngs), kept_original, note, timeout, in_place,
-                             colour_pages=None if kept_original else colour_pages)
+                             colour_pages=None if kept_original else colour_pages,
+                             already_ocred=(kept_ocred if kept_original else True))
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:

@@ -699,3 +699,19 @@ def test_self_audit_catches_lost_text_layer(tmp_path):
     textless = U.make_scan_pdf(tmp_path / 'textless.pdf', npages=3, dpi=150)
     fatal, _ = U.owm._audit_output(textless, 3, src_p=ocred, colour_pages=set())
     assert fatal and 'text' in fatal.lower(), fatal
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
+def test_in_place_keeps_the_ocr_layer_when_not_compressing(tmp_path):
+    """Regression: OCR runs on the SOURCE before the place step, so the place step is
+    told not to OCR again. The in-place 'nothing changed, leave it alone' shortcut then
+    judged the file unchanged and threw the fresh text layer away — 13 of 64 files in a
+    sample run were OCR'd and shipped unsearchable."""
+    from pypdf import PdfReader
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=2, dpi=200)
+    res = U.owm.compress_one(str(src), str(src), 200, ocr=True, language='eng',
+                             in_place=True, ocr_only=True)
+    assert res.get('err') is None, res
+    chars = len((PdfReader(str(src)).pages[0].extract_text() or '').strip())
+    assert chars > 100, f'in-place OCR layer was discarded ({chars} chars)'
