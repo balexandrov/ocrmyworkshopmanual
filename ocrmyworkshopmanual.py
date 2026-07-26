@@ -941,6 +941,45 @@ def _run_retry(fn, attempts: int = 3, backoff: float = 2.0):
     return last, attempts
 
 
+def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0):
+    """Try to repair a malformed/corrupt PDF. qpdf FIRST, Ghostscript second.
+
+    They fail differently and qpdf is far better at this: on a real corrupt manual
+    (garbage bytes inside the content streams, page tree intact) Ghostscript's pdfwrite
+    salvaged 1 of 21 pages while qpdf recovered all 21 perfectly. Preferring GS therefore
+    turned a fully recoverable file into a lost one. A repair that returns FEWER pages
+    than the source is rejected outright — a truncated 'repair' is worse than none.
+    Returns the repaired Path, else None."""
+    for name, fn in (('qpdf', _qpdf_repair), ('gs', _gs_repair)):
+        try:
+            out = fn(src_p, work, timeout)
+        except Exception:
+            out = None
+        if not out or not out.exists() or out.stat().st_size == 0:
+            continue
+        if expect_pages:
+            try:
+                if len(PdfReader(str(out)).pages) < expect_pages:
+                    continue                     # partial salvage -> keep looking
+            except Exception:
+                continue
+        return out
+    return None
+
+
+def _qpdf_repair(src_p: Path, work: Path, timeout: int = 0):
+    """Rewrite a damaged PDF through qpdf (via pikepdf), which reconstructs broken
+    xref/trailer structure while keeping every page it can parse."""
+    out = work / 'repaired_qpdf.pdf'
+    try:
+        import pikepdf
+        with pikepdf.open(str(src_p)) as p:
+            p.save(str(out))
+    except Exception:
+        return None
+    return out if out.exists() and out.stat().st_size > 0 else None
+
+
 def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
     """Try to repair a malformed/corrupt PDF by rewriting it through Ghostscript's
     pdfwrite device (which tolerates and reconstructs a lot of broken structure).
@@ -1236,7 +1275,7 @@ def compress_one(src: str, dest: str, dpi: int,
         pngs = sorted(p.name for p in work.glob('p*.png'))
         if r.returncode != 0 or not pngs:
             # malformed PDF? try a Ghostscript pdfwrite rewrite, then render the repaired copy
-            fixed = _gs_repair(src_p, work, timeout)
+            fixed = _repair_pdf(src_p, work, src_pages, timeout)
             if fixed:
                 render_src, did_repair = fixed, True
                 for old in work.glob('p*.png'):

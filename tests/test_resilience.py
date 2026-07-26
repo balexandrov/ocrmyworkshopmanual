@@ -591,3 +591,22 @@ def test_gs_repair_recovers_truncated(tmp_path):
         assert len(PdfReader(str(fixed)).pages) >= 1, 'repaired PDF should open with pages'
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_repair_prefers_the_engine_that_keeps_every_page(tmp_path):
+    """Repair must not accept a PARTIAL salvage. Ghostscript's pdfwrite recovered only
+    1 of 21 pages from a real corrupt manual while qpdf recovered all 21, so a repair
+    returning fewer pages than the source is rejected and the next engine is tried."""
+    src = U.make_scan_pdf(tmp_path / 'multi.pdf', npages=4, dpi=150)
+    broken = tmp_path / 'broken.pdf'
+    broken.write_bytes(src.read_bytes()[:-900])       # damage the trailer/xref
+    work = U.workdir()
+    try:
+        fixed = U.owm._repair_pdf(broken, work, expect_pages=4)
+        assert fixed is not None, 'a recoverable PDF should be repaired'
+        assert len(PdfReader(str(fixed)).pages) >= 4, 'repair must keep every page'
+        # a repair that cannot reach the expected page count is refused outright
+        assert U.owm._repair_pdf(broken, work, expect_pages=999) is None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
