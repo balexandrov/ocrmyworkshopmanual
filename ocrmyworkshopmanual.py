@@ -720,12 +720,31 @@ def _clone_outline(src_reader, comp_path: Path) -> bool:
         return False
 
 
-def has_text(pdf: Path, sample: int = 6, min_chars: int = 40) -> bool:
-    """True if the PDF already has a real text layer (sampled first pages)."""
+def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
+             covered: float = 0.8) -> bool:
+    """True if the PDF ALREADY has a text layer on (essentially) every page, i.e. OCR
+    would add nothing. Judged PER PAGE over pages sampled across the WHOLE file.
+
+    Deliberately not a total-chars-over-the-first-few-pages test: on a MIXED manual
+    (a vector TOC/nav page plus scanned content) one text-rich page would blow past a
+    global threshold and suppress OCR for every scanned page, leaving the actual content
+    unsearchable. Requiring most pages to carry text means a partly-scanned file still
+    goes to ocrmypdf, whose --skip-text adds a layer only to the pages missing one."""
     try:
         r = PdfReader(str(pdf))
-        n = min(sample, len(r.pages))
-        return sum(len((r.pages[i].extract_text() or '').strip()) for i in range(n)) >= min_chars
+        n = len(r.pages)
+        if n == 0:
+            return False
+        k = min(sample, n)
+        idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
+        with_text = 0
+        for i in idxs:
+            try:
+                if len((r.pages[i].extract_text() or '').strip()) >= min_chars:
+                    with_text += 1
+            except Exception:
+                pass
+        return with_text >= covered * len(idxs)
     except Exception:
         return False
 
