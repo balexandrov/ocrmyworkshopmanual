@@ -45,6 +45,17 @@ def tools_missing() -> str | None:
     return None
 
 
+def ocr_missing() -> str | None:
+    """Return a message if the OCR toolchain is unavailable, else None. Kept separate
+    from tools_missing() so tests that actually RUN OCR skip cleanly on a machine
+    without Tesseract, instead of failing as if the code were broken."""
+    if not owm.TESS:
+        return 'Tesseract not found (owm.TESS is None)'
+    if not owm.OCRMYPDF:
+        return 'ocrmypdf not found'
+    return None
+
+
 def render_gray(pdf: Path, page_no: int, dpi: int, out_png: Path) -> bool:
     """Render one page of `pdf` to a grayscale PNG via the same Ghostscript call
     the pipeline uses. Returns True on success."""
