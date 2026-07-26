@@ -52,17 +52,74 @@ def test_preview_one_scanned_projects_smaller(tmp_path):
     assert res['new'] <= res['orig']
 
 
+def test_stall_watchdog_spares_slow_but_working_process(tmp_path):
+    """A SLOW but progressing process must NOT be killed. A flat wall-clock budget kills
+    healthy work purely for being big (a 6,855-page manual was failed at 2h while OCR'ing
+    correctly); progress-based detection is size-independent."""
+    import subprocess
+    prog = tmp_path / 'out.txt'
+    code = (f"import time\nf=open(r'{prog}','w')\n"
+            "for i in range(6):\n    f.write('x'*500); f.flush(); time.sleep(0.5)\nf.close()\n")
+    r = U.owm._run_stalled([sys.executable, '-c', code],
+                           lambda: prog.stat().st_size if prog.exists() else 0,
+                           2, poll=0.25)                 # 3s of work, 2s stall limit
+    assert r.returncode == 0, 'a slow-but-progressing process was killed'
+
+
+def test_stall_watchdog_kills_hung_process(tmp_path):
+    """A process making NO progress is killed once the stall window passes."""
+    import subprocess
+    never = tmp_path / 'never.txt'
+    with pytest.raises(subprocess.TimeoutExpired):
+        U.owm._run_stalled([sys.executable, '-c', 'import time; time.sleep(30)'],
+                           lambda: never.stat().st_size if never.exists() else 0,
+                           2, poll=0.25)
+
+
+def test_retry_recovers_crash_but_never_retries_a_stall():
+    """Transient crashes (non-zero rc) are retried; a stall is not — a hung or genuinely
+    slow step behaves the same way next time, so retrying only burns the time again."""
+    import subprocess
+    calls = [0]
+
+    def flaky():
+        calls[0] += 1
+        return subprocess.run([sys.executable, '-c',
+                               f'import sys; sys.exit(0 if {calls[0]} >= 3 else 1)'])
+    r, tries = U.owm._run_retry(flaky, attempts=3, backoff=0.05)
+    assert r.returncode == 0 and tries == 3
+
+    stalls = [0]
+
+    def stalling():
+        stalls[0] += 1
+        raise subprocess.TimeoutExpired('cmd', 1)
+    with pytest.raises(subprocess.TimeoutExpired):
+        U.owm._run_retry(stalling, attempts=3, backoff=0.05)
+    assert stalls[0] == 1, 'a stall must never be retried'
+
+
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
-def test_timeout_fails_gracefully(tmp_path):
-    """A tiny timeout must abort the render as a clean FAILED result (no hang, no
-    crash, no output file), so one pathological file never stalls a big batch."""
+def test_stalled_file_fails_gracefully(tmp_path):
+    """A step that makes no progress within the stall window aborts as a clean FAILED
+    result (no hang, no crash, no output file), so one pathological file never wedges a
+    big batch. Simulated by making the progress probe report no progress at all."""
+    import subprocess
     pdfs = U.fixture_pdfs('photo_gray') or U.fixture_pdfs('line')
     if not pdfs:
         pytest.skip('no fixtures')
-    dest = tmp_path / 'out' / 'x.pdf'
-    res = U.owm.compress_one(str(pdfs[0]), str(dest), 200, ocr=False, timeout=0.001)
-    assert res.get('err') and 'timed out' in res['err'], res
-    assert not dest.exists(), 'a timed-out file must not leave a dest output'
+    real = U.owm._run_stalled
+
+    def frozen(cmd, progress, stall, **kw):              # simulate a hung external tool
+        raise subprocess.TimeoutExpired(cmd, stall)
+    U.owm._run_stalled = frozen
+    try:
+        dest = tmp_path / 'out' / 'x.pdf'
+        res = U.owm.compress_one(str(pdfs[0]), str(dest), 200, ocr=False, timeout=1)
+    finally:
+        U.owm._run_stalled = real
+    assert res.get('err') and 'stalled' in res['err'], res
+    assert not dest.exists(), 'a stalled file must not leave a dest output'
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))

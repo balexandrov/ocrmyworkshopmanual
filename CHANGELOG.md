@@ -5,6 +5,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`--timeout` is now a STALL timeout, not a time budget** (default 7200 → 600).
+  A flat wall-clock limit cannot tell "slow" from "stuck", so it killed healthy
+  work purely for being big — a 6,855-page manual was marked FAILED at 2h while
+  it was OCR'ing correctly. The value now means *max seconds a step may make no
+  progress*: the page-render is killed only if no new page appears, the PDF
+  repair only if the output stops growing. A slow-but-working file is never
+  killed for its size, however long it takes; detection is size-independent.
+  OCR (ocrmypdf) has no timeout at all — measured, it emits no usable progress
+  signal (silent for ~90% of a run), so any bound there would only punish big
+  files. Transient external-tool **crashes are retried** (3 attempts, backoff)
+  and reported; a **stall is never retried**, since a hung or genuinely slow
+  step behaves the same way next time and retrying just burns the time again.
+
 ### Fixed
 
 - **Colour loss on colour line-art** (colour wiring diagrams / schematics). The
