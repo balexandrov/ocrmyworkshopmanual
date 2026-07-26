@@ -702,6 +702,47 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
     tmp.unlink(missing_ok=True)
 
 
+def _ocr_scan_pages(src_p: Path, work: Path, language: str, vector_pages: set,
+                    timeout: int = 0) -> tuple:
+    """OCR only the SCAN pages of the source, and return (ocr_pdf, {src_page -> ocr_page},
+    language, note).
+
+    ocrmypdf's mode is per FILE but the requirement is per PAGE: --force-ocr is the only
+    mode that reliably writes the text into a harvestable /OCR-* XObject, yet it would
+    flatten genuine vector pages. Choosing one mode for the whole file breaks either way
+    — measured on a 12-page RAV4 extract holding a single vector page, --skip-text left
+    every scan page unOCR'd and the output shipped 37 characters instead of 31,693.
+    So the scan pages are pulled into their own document, force-OCR'd there, and mapped
+    back; vector pages keep the real text they already carry."""
+    keep = [i for i in range(_page_count(src_p)) if i not in vector_pages]
+    if not keep:
+        return None, {}, language, ''
+    sub = src_p
+    mapping = {i: i for i in keep}
+    if vector_pages:
+        sub = work / 'scan_pages.pdf'
+        try:
+            r = PdfReader(str(src_p))
+            w = PdfWriter()
+            for n, i in enumerate(keep):
+                w.add_page(r.pages[i])
+                mapping[i] = n
+            with open(sub, 'wb') as f:
+                w.write(f)
+        except Exception:
+            return None, {}, language, ' (OCR FAILED)'
+    ocr_pdf, language, note = _ocr_source(sub, work, language, has_vector=False,
+                                          timeout=timeout)
+    return ocr_pdf, mapping, language, note
+
+
+def _page_count(p: Path) -> int:
+    try:
+        return len(PdfReader(str(p)).pages)
+    except Exception:
+        return 0
+
+
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                 timeout: int = 0) -> tuple:
     """Run OCR on the SOURCE at full resolution and return (ocr'd_pdf, language, note).
@@ -835,7 +876,8 @@ def _page_ocr_xobjects(page):
         return {}
 
 
-def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
+def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
+                       ocr_map: dict = None) -> bool:
     """Put the COMPRESSED page content back into the ORIGINAL document, instead of
     shipping a freshly-built PDF that carries only pages.
 
@@ -857,15 +899,23 @@ def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
         return False
     tmp = comp_path.with_name(comp_path.stem + '_graft.pdf')
     try:
+        ctx = pikepdf.open(str(ocr_pdf)) if ocr_pdf else None
         with pikepdf.open(str(src_pdf)) as s, pikepdf.open(str(comp_path)) as c:
             if len(s.pages) != len(c.pages) or not len(s.pages):
                 return False
-            for sp, cp in zip(s.pages, c.pages):
-                # Keep the source page's OCR text layer (a self-contained Form XObject)
-                # before its content is replaced: the text was read from the ORIGINAL at
-                # full resolution and must survive onto the compressed page, so image
-                # compression never degrades searchability.
-                ocr_xo = _page_ocr_xobjects(sp)
+            for idx, (sp, cp) in enumerate(zip(s.pages, c.pages)):
+                # Keep this page's OCR text layer (a self-contained Form XObject) before
+                # its content is replaced: the text was read from the ORIGINAL at full
+                # resolution and must survive onto the compressed page, so image
+                # compression never degrades searchability. When the text was produced in
+                # a separate scan-pages-only document, take it from the mapped page there.
+                if ctx is not None and ocr_map is not None:
+                    j = ocr_map.get(idx)
+                    ocr_xo = ({k: s.copy_foreign(v)
+                               for k, v in _page_ocr_xobjects(ctx.pages[j]).items()}
+                              if j is not None and j < len(ctx.pages) else {})
+                else:
+                    ocr_xo = _page_ocr_xobjects(sp)
                 fp = s.copy_foreign(cp.obj)      # bring the compressed page across
                 sp.Contents = fp.Contents
                 sp.Resources = fp.Resources
@@ -882,6 +932,8 @@ def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
                 for k in ('/MediaBox', '/Rotate'):
                     if k in fp.keys():
                         sp[k] = fp[k]
+            if ctx is not None:
+                ctx.close()
             s.remove_unreferenced_resources()
             s.save(str(tmp), recompress_flate=True,
                    object_stream_mode=pikepdf.ObjectStreamMode.generate)
@@ -1602,21 +1654,32 @@ def compress_one(src: str, dest: str, dpi: int,
         # onto the compressed pages by the graft, decoupling text quality from image size.
         ocr_note = ''
         ocr_src = None
+        ocr_map = None
         if ocr:
-            ocr_src, language, ocr_note = _ocr_source(
-                render_src, work, language, has_vector=bool(n_vector), timeout=timeout)
+            vec_pages = {k for k, c in enumerate(classes) if c.type == PT_VECTOR}
+            ocr_src, ocr_map, language, ocr_note = _ocr_scan_pages(
+                render_src, work, language, vec_pages, timeout=timeout)
 
         # Put the compressed pages back INTO the original document, so links, bookmarks,
         # named destinations, metadata AND the source-quality OCR layer are inherited
         # rather than rebuilt (and lost). Done BEFORE the size decision so min-savings
         # judges the artefact we will ship. Falls back silently to the plain rebuild.
-        grafted = _graft_into_source(ocr_src or render_src, comp)
+        grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map)
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
-            # Keep the ORIGINAL images — already OCR'd above, so ship that; if the source
-            # was malformed keep the REPAIRED copy, never the broken bytes.
+            # Keep the ORIGINAL images. If the source was malformed keep the REPAIRED
+            # copy, never the broken bytes. (The OCR'd copy is not reused here: it holds
+            # only the scan pages when the file also has vector pages.)
             base = work / 'orig.pdf'
-            shutil.copyfile(str(ocr_src or (render_src if did_repair else src_p)), str(base))
+            shutil.copyfile(str(render_src if did_repair else src_p), str(base))
+            # We ship the ORIGINAL images here, so the OCR'd copy made above is unusable
+            # (--force-ocr rasterises). Add a text layer image-preservingly instead, and
+            # only when the file has none of its own.
+            if ocr and not has_text(base):
+                o2, _l, n2 = _ocr_source(base, work, language, has_vector=True,
+                                         timeout=timeout)
+                if o2:
+                    base, ocr_note = o2, n2
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
