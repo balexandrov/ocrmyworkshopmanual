@@ -206,7 +206,11 @@ TESS = shutil.which('tesseract')
 
 # Tesseract OSD script name -> ocrmypdf language. Cyrillic docs often carry some
 # English too, so pair rus+eng. Scripts without an installed pack fall back to eng.
-_SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng'}
+_SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng',
+                # OSD can tell these apart from Latin, and the packs exist — OCR'ing a
+                # Japanese manual as English yields garbage, not merely worse text.
+                'Japanese': 'jpn+eng', 'Han': 'jpn+eng', 'HanS': 'jpn+eng',
+                'HanT': 'jpn+eng', 'Katakana': 'jpn+eng', 'Hiragana': 'jpn+eng'}
 
 # Minimum Tesseract OSD "Script confidence" to TRUST a page's script vote. OSD is
 # unreliable on sparse text (a wiring-diagram page with few words), where it emits a
@@ -217,6 +221,12 @@ _SCRIPT_LANG = {'Cyrillic': 'rus+eng', 'Latin': 'eng'}
 MIN_OSD_SCRIPT_CONF = 3.0
 
 _INSTALLED_LANGS = None
+
+# Threads to give ocrmypdf. The batch parallelises across FILES, so 1 is right when the
+# pool is saturated — but when there are fewer files in flight than cores (a short run,
+# a --from-list of one manual, or the tail of a batch) that leaves the machine idle:
+# measured on an 8-page file, ocrmypdf took 17.3s at --jobs 1 and 7.3s at --jobs 4.
+OCR_JOBS = 1
 
 
 def _installed_langs() -> set:
@@ -251,6 +261,16 @@ def _available_ocr_lang(lang: str) -> str:
     if keep:
         return '+'.join(keep)
     return 'eng' if 'eng' in inst else sorted(inst)[0]
+
+
+def _init_worker(ocr_jobs: int = 1):
+    """Worker start-up: run below normal priority and tell ocrmypdf how many threads it
+    may use in THIS process. The pool parallelises across files, so the budget is the
+    machine's cores divided among the workers — that keeps a short run (fewer files than
+    cores) from leaving most of the CPU idle."""
+    global OCR_JOBS
+    OCR_JOBS = max(1, int(ocr_jobs))
+    set_below_normal_priority()
 
 
 def set_below_normal_priority():
@@ -744,7 +764,7 @@ def _page_count(p: Path) -> int:
 
 
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
-                timeout: int = 0) -> tuple:
+                timeout: int = 0, preserve_images: bool = False) -> tuple:
     """Run OCR on the SOURCE at full resolution and return (ocr'd_pdf, language, note).
 
     OCR must read the ORIGINAL, never our own output: every compression we apply is
@@ -768,14 +788,21 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     #               XObject, so nothing survives the graft (measured on a RAV4 manual:
     #               731 chars inline, 0 in the XObject -> 0 chars in the output).
     #  --force-ocr  always writes a real layer into the XObject (806 chars on that page).
-    # force-ocr also rasterises images, which is irrelevant here because every image is
-    # replaced by our compressed one — but it WOULD flatten genuine vector pages, so it
-    # is used only when the file has none.
-    mode = '--skip-text' if has_vector else '--force-ocr'
+    # force-ocr RASTERISES every page. That is free when we are about to replace all the
+    # images anyway (the compress path), but ruinous when the ORIGINAL images are what we
+    # ship: it re-encoded a 41 MB Lexus manual into 616 MB, and blew small colour diagrams
+    # up 4-9x. So callers that keep the source images pass preserve_images=True and get
+    # --redo-ocr, which refreshes the text layer without touching the images.
+    if has_vector:
+        mode = '--skip-text'                  # never re-OCR on top of real vector text
+    elif preserve_images:
+        mode = '--redo-ocr'                   # images are the output — must not rasterise
+    else:
+        mode = '--force-ocr'                  # images will be replaced by compressed ones
     out = work / 'src_ocr.pdf'
     r, tries = _run_retry(lambda: subprocess.run(
         OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
-                    mode, '--quiet', '--jobs', '1', str(src_p), str(out)],
+                    mode, '--quiet', '--jobs', str(OCR_JOBS), str(src_p), str(out)],
         capture_output=True, text=True))
     note = f' (lang:{language}'
     note += ', re-ocr' if mode == '--redo-ocr' else ''
@@ -1400,7 +1427,8 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             # OCR'ing correctly. A crash is retried; slowness is simply waited out.
             r, tries = _run_retry(lambda: subprocess.run(
                 OCRMYPDF + ['--language', language, '--optimize', '0',
-                            '--output-type', 'pdf', '--skip-text', '--quiet', '--jobs', '1',
+                            '--output-type', 'pdf', '--skip-text', '--quiet',
+                            '--jobs', str(OCR_JOBS),
                             str(base), str(ocr_pdf)], capture_output=True, text=True))
             if r is not None and r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
                 final = ocr_pdf
@@ -1585,7 +1613,8 @@ def compress_one(src: str, dest: str, dpi: int,
             # and the manual ships unsearchable.
             if ocr and not has_text(base):
                 ocr_src, language, onote = _ocr_source(
-                    base, work, language, has_vector=_has_vector_pages(base), timeout=timeout)
+                    base, work, language, has_vector=_has_vector_pages(base),
+                    timeout=timeout, preserve_images=True)
                 note0 += onote
                 if ocr_src:
                     base, did_ocr = ocr_src, True
@@ -1776,8 +1805,9 @@ def compress_one(src: str, dest: str, dpi: int,
             # (--force-ocr rasterises). Add a text layer image-preservingly instead, and
             # only when the file has none of its own.
             if ocr and not has_text(base):
-                o2, _l, n2 = _ocr_source(base, work, language, has_vector=True,
-                                         timeout=timeout)
+                o2, _l, n2 = _ocr_source(base, work, language,
+                                         has_vector=_has_vector_pages(base),
+                                         timeout=timeout, preserve_images=True)
                 if o2:
                     base, ocr_note, kept_ocred = o2, n2, True
             n_photo = n_color = n_color_line = n_vector = n_native = 0
@@ -2419,8 +2449,12 @@ def main():
     seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
     interrupted = False
     try:
+        # Give each worker a share of the cores for OCR: with fewer files than workers the
+        # pool cannot use them, so hand the slack to ocrmypdf instead of idling.
+        _ocr_jobs = max(1, _default_workers() // max(1, min(args.workers, N)))
         with cf.ProcessPoolExecutor(max_workers=args.workers,
-                                    initializer=set_below_normal_priority) as ex:
+                                    initializer=_init_worker,
+                                    initargs=(_ocr_jobs,)) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size, args.ocr_only,
