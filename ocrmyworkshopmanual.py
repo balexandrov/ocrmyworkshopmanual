@@ -720,11 +720,17 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     if language == 'auto':
         language = _detect_language(src_p, work, timeout)
     language = _available_ocr_lang(language)
-    # --skip-text skips any page carrying ANY text, so a page with a bare page number
-    # (measured: 20 chars on a Lexus manual) would never be OCR'd and the manual would
-    # ship unsearchable. --redo-ocr instead strips such remnants and OCRs properly. It is
-    # unsafe only where REAL vector text exists, since there it stacks OCR on top of it.
-    mode = '--skip-text' if has_vector else '--redo-ocr'
+    # Mode matters, and the harvestable place for the text is the /OCR-* Form XObject:
+    #  --skip-text  skips any page carrying ANY text, so a page holding just a page number
+    #               (measured: 20 chars, a Lexus manual) ships unsearchable.
+    #  --redo-ocr   leaves a publisher's hidden inline text in place and adds an EMPTY OCR
+    #               XObject, so nothing survives the graft (measured on a RAV4 manual:
+    #               731 chars inline, 0 in the XObject -> 0 chars in the output).
+    #  --force-ocr  always writes a real layer into the XObject (806 chars on that page).
+    # force-ocr also rasterises images, which is irrelevant here because every image is
+    # replaced by our compressed one — but it WOULD flatten genuine vector pages, so it
+    # is used only when the file has none.
+    mode = '--skip-text' if has_vector else '--force-ocr'
     out = work / 'src_ocr.pdf'
     r, tries = _run_retry(lambda: subprocess.run(
         OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
@@ -760,16 +766,33 @@ def _visible_text_chars(page, min_chars: int = 100) -> int:
         return 0
     if not data:
         return 0
+    # Text painted BEFORE a full-page image is hidden underneath it — a searchable layer,
+    # not something the reader sees. Verified on a Toyota RAV4 page: all 44 text ops
+    # precede the image draw, and the rendered page is pixel-identical to the background
+    # image alone. Judging by render mode alone wrongly called that "real text" and
+    # blocked compression of a 258 MB manual.
+    last_img = -1
+    try:
+        xo = page['/Resources']['/XObject'].get_object()
+        names = {str(n) for n, o in xo.items()
+                 if o.get_object().get('/Subtype') == '/Image'}
+        for m in re.finditer(rb'(/[A-Za-z0-9_.\-]+)\s+Do\b', data):
+            if m.group(1).decode('latin1', 'replace') in names:
+                last_img = max(last_img, m.start())
+    except Exception:
+        last_img = -1
     modes = [(m.start(), int(m.group(1))) for m in _TR_MODE.finditer(data)]
     visible = False
     for show in _TEXT_SHOW.finditer(data):
+        if show.start() < last_img:
+            continue                          # covered by the scan painted over it
         mode = 0                              # PDF default render mode is 0 = fill
         for pos, md in modes:
             if pos < show.start():
                 mode = md
             else:
                 break
-        if mode != 3:
+        if mode != 3:                         # mode 3 = invisible OCR layer
             visible = True
             break
     if not visible:
