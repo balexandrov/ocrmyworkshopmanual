@@ -5,6 +5,36 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (data integrity — found by auditing a 64-file sample against its originals)
+
+- **Silent page loss.** The output was verified against the RENDERED page count — the
+  same number that had already lost the pages — so a corrupt 21-page manual whose
+  repair salvaged 1 page passed the check and was shipped as a 1-page file. The source
+  page count is now captured up front and everything is checked against it; a render or
+  repair that loses pages fails the file and keeps the original.
+- **Links, bookmarks and named destinations were dropped.** Rebuilding a PDF from
+  rendered pages ships pages and nothing else: measured, a 36-page manual kept 5 of 249
+  links, and a file lost all 248 bookmarks (their destinations point at other documents,
+  so they resolve to no page number). The compressed pages are now grafted back INTO the
+  original document (pikepdf/qpdf) — each page's content and resources are swapped and
+  everything else is inherited, with the orphaned images dropped on write. Falls back to
+  the plain rebuild, which the report then flags.
+- **Corrupt PDFs are repaired properly.** Repair preferred Ghostscript, which salvaged
+  1 of 21 pages from a real corrupt-at-source manual that qpdf recovers whole. Repair now
+  tries qpdf first and REJECTS any repair that returns fewer pages than the source.
+- **A corrupt PDF is no longer copied through untouched.** The paths that pass the source
+  through byte-for-byte (`--ocr-only`, keep-original) faithfully reproduced broken files
+  — the copy rendered nothing. They now probe whether the source renders, repair it if
+  not, and fail rather than emit a copy that opens nowhere. Repairs are reported in the
+  per-file note, never silent.
+
+### Added
+
+- `verify_run.py` — audit a run against the originals: point it at a folder with
+  `before/` and `after/` copies and it compares every pair on page count, colour, links,
+  bookmarks and searchable text, flagging anything that lost something. Compression is
+  only trustworthy if you can show what survived.
+
 ### Changed
 
 - **`--timeout` is now a STALL timeout, not a time budget** (default 7200 → 600).
