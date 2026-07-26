@@ -187,6 +187,31 @@ def test_bookmarks_preserved_through_compression(tmp_path):
     assert cnt(PdfReader(str(out)).outline) == 2, 'bookmarks were lost through compression'
 
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_mixed_pdf_scan_pages_still_get_ocr(tmp_path):
+    """Regression: has_text() summed characters over the first few pages, so ONE
+    text-rich vector TOC page made a mixed manual look 'already has text' and OCR was
+    skipped for every SCANNED page — leaving the actual content unsearchable. It is now
+    judged per page across the whole file, so the scan pages get their text layer."""
+    from pypdf import PdfReader, PdfWriter
+    vec = U.make_born_digital_pdf(tmp_path / 'vec.pdf', npages=1)
+    scans = U.make_scan_pdf(tmp_path / 'sc.pdf', npages=4, dpi=200)
+    wr = PdfWriter(); wr.append(str(vec)); wr.append(str(scans))
+    mixed = tmp_path / 'mixed.pdf'
+    with open(mixed, 'wb') as f:
+        wr.write(f)
+    assert U.owm.has_text(mixed) is False, 'mixed file wrongly reported as fully texted'
+    assert U.owm.has_text(vec) is True, 'an all-vector file should still skip OCR'
+    assert U.owm.has_text(scans) is False, 'a pure scan has no text'
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(mixed), str(out), 200, ocr=True, language='eng')
+    assert res.get('err') is None, res
+    r = PdfReader(str(out))
+    for pi in range(1, len(r.pages)):          # every SCAN page must now carry OCR text
+        assert len((r.pages[pi].extract_text() or '').strip()) > 100, (
+            f'scan page {pi} got no OCR text layer')
+
+
 def test_available_ocr_lang_degrades_to_installed(monkeypatch):
     """A detected/requested language whose pack is NOT installed must degrade to an
     installed one (never fail OCR and drop the whole text layer — the rus-missing bug)."""
