@@ -659,3 +659,43 @@ def test_repair_prefers_the_engine_that_keeps_every_page(tmp_path):
         assert U.owm._repair_pdf(broken, work, expect_pages=999) is None
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_self_audit_refuses_to_ship_a_degraded_file(tmp_path):
+    """The tool must audit its OWN output against the source before overwriting anything.
+    Damage and success look identical on file size — losing a page, a colour or the text
+    layer all make the file smaller — so the check compares content, and a failure keeps
+    the original instead of shipping it."""
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=4, dpi=200)
+    good = tmp_path / 'good.pdf'
+    res = U.owm.compress_one(str(src), str(good), 200, ocr=False)
+    assert res.get('err') is None, res
+
+    # page loss is fatal
+    fatal, _ = U.owm._audit_output(good, 99, src_p=src)
+    assert fatal and 'pages' in fatal
+
+    # an unopenable output is fatal
+    junk = tmp_path / 'junk.pdf'
+    junk.write_bytes(b'not a pdf')
+    fatal, _ = U.owm._audit_output(junk, 4, src_p=src)
+    assert fatal and 'open' in fatal
+
+    # a healthy result passes
+    fatal, _ = U.owm._audit_output(good, 4, src_p=src, colour_pages=set())
+    assert fatal is None, fatal
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
+def test_self_audit_catches_lost_text_layer(tmp_path):
+    """Losing the searchable text is invisible to every size metric — it must be caught
+    by word recall against the source, not by character count (a re-OCR differs)."""
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=3, dpi=200)
+    ocred = tmp_path / 'ocred.pdf'
+    res = U.owm.compress_one(str(src), str(ocred), 200, ocr=True, language='eng')
+    assert res.get('err') is None, res
+    textless = U.make_scan_pdf(tmp_path / 'textless.pdf', npages=3, dpi=150)
+    fatal, _ = U.owm._audit_output(textless, 3, src_p=ocred, colour_pages=set())
+    assert fatal and 'text' in fatal.lower(), fatal

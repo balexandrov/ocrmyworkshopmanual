@@ -76,7 +76,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 
 import img2pdf
@@ -1219,18 +1219,109 @@ def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
     return out if (r.returncode == 0 and out.exists() and out.stat().st_size > 0) else None
 
 
-def _verify_output(dest_p: Path, expect_pages) -> str:
-    """Cheap trust check on a written output: it must open as a PDF and (when we know
-    the expected page count) have that many pages. Returns '' if OK, else a warning
-    string to append to the note — so a silently-corrupt result in a big batch is
-    visible in the log rather than shipped unnoticed."""
+def _words(t: str) -> list:
+    return re.findall(r'[^\W\d_]{3,}', (t or '').lower())
+
+
+def _sampled_text(pdf: Path, idxs) -> str:
     try:
-        got = len(PdfReader(str(dest_p)).pages)
+        r = PdfReader(str(pdf))
+        return '\n'.join((r.pages[i].extract_text() or '') for i in idxs
+                         if 0 <= i < len(r.pages))
+    except Exception:
+        return ''
+
+
+def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
+                  colour_pages=None, sample: int = 6) -> tuple:
+    """Self-check the result against the SOURCE before anything is overwritten.
+    Returns (fatal, warn): `fatal` means do not ship this file — keep the original.
+
+    A compression run cannot be trusted on the size it reports: losing a page, a colour,
+    a link or the text layer all make the file SMALLER, so damage and success look
+    identical on the only number most runs print. Everything here is therefore compared
+    against the source, and the checks are structural (no re-rendering), so they stay
+    affordable on a 100k-file archive:
+
+      * opens, and has exactly the source's page count       -> fatal
+      * a page classified as COLOUR is not 1-bit in the output -> fatal (the failure that
+        silently destroyed colour wiring diagrams archive-wide)
+      * searchable text survives, by WORD RECALL on sampled pages, not character count
+        (a legitimate re-OCR differs in character count)      -> fatal below 50%
+      * link annotations and bookmarks are not fewer          -> warning
+    """
+    try:
+        r = PdfReader(str(out_p))
+        got = len(r.pages)
     except Exception as ex:
-        return f' (WARN: output failed to open: {ex})'
+        return f'output failed to open: {ex}', ''
     if expect_pages and got != expect_pages:
-        return f' (WARN: output has {got} pages, expected {expect_pages})'
-    return ''
+        return f'output has {got} pages, expected {expect_pages}', ''
+
+    warn = []
+    # colour pages must not have been binarised
+    for i in sorted(colour_pages or ())[:sample]:
+        try:
+            xo = r.pages[i]['/Resources']['/XObject'].get_object()
+            for _n, o in xo.items():
+                oo = o.get_object()
+                if oo.get('/Subtype') == '/Image' and int(oo.get('/BitsPerComponent', 8)) == 1:
+                    return f'colour page {i + 1} was binarised to 1-bit', ''
+        except Exception:
+            pass
+    if src_p is None or not src_p.exists():
+        return None, ''
+    # text must survive
+    idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
+    wb = Counter(_words(_sampled_text(src_p, idxs)))
+    if sum(wb.values()) >= 50:
+        wa = Counter(_words(_sampled_text(out_p, idxs)))
+        recall = sum(min(n, wa[w]) for w, n in wb.items()) / sum(wb.values())
+        if recall < 0.5:
+            return f'searchable text lost (word recall {recall:.2f})', ''
+        if recall < 0.8:
+            warn.append(f'text recall {recall:.2f}')
+    # structure should not shrink
+    try:
+        s = PdfReader(str(src_p))
+
+        def links(rd):
+            n = 0
+            for pg in rd.pages:
+                a = pg.get('/Annots')
+                if a:
+                    try:
+                        n += sum(1 for x in a.get_object()
+                                 if x.get_object().get('/Subtype') == '/Link')
+                    except Exception:
+                        pass
+            return n
+
+        def bms(rd):
+            def c(items):
+                k = 0
+                for it in items:
+                    k += c(it) if isinstance(it, list) else 1
+                return k
+            try:
+                return c(rd.outline)
+            except Exception:
+                return 0
+        lb, la = links(s), links(r)
+        bb, ba = bms(s), bms(r)
+        if la < lb:
+            warn.append(f'links {lb}->{la}')
+        if ba < bb:
+            warn.append(f'bookmarks {bb}->{ba}')
+    except Exception:
+        pass
+    return None, (' (WARN: ' + ', '.join(warn) + ')' if warn else '')
+
+
+def _verify_output(dest_p: Path, expect_pages) -> str:
+    """Backwards-compatible thin wrapper: page-count/openability warning only."""
+    fatal, warn = _audit_output(dest_p, expect_pages)
+    return f' (WARN: {fatal})' if fatal else warn
 
 
 def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
@@ -1282,7 +1373,7 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
 
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
-                   timeout: int = 0, in_place: bool = False) -> dict:
+                   timeout: int = 0, in_place: bool = False, colour_pages=None) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
     0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
@@ -1321,11 +1412,13 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
     if in_place and kept and not ocr_added:
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
                 'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
-    # verify the output BEFORE overwriting anything
-    warn = _verify_output(final, pages)
-    if warn and in_place:   # never overwrite the original with a bad file
+    # SELF-AUDIT the result against the source BEFORE anything is overwritten. Damage and
+    # success look identical on file size, so this compares content: page count, colour
+    # pages not binarised, searchable text surviving, links/bookmarks not shrinking.
+    fatal, warn = _audit_output(final, pages, src_p=src_p, colour_pages=colour_pages)
+    if fatal:               # never ship a degraded file — keep the original, report why
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
-                'note': note, 'kept': True, 'err': 'output failed verify, original kept' + warn}
+                'note': note, 'kept': True, 'err': f'self-check failed: {fatal} — original kept'}
     note += warn
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
@@ -1708,8 +1801,11 @@ def compress_one(src: str, dest: str, dpi: int,
         note += ocr_note
         # OCR already ran on the source above and its layer was grafted on, so the place
         # step must NOT re-run it against our compressed images.
+        colour_pages = {k for k, c in enumerate(classes)
+                        if c.type in (PT_COLOR_LINE, PT_PHOTO_COLOR)}
         res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
-                             src_pages or len(pngs), kept_original, note, timeout, in_place)
+                             src_pages or len(pngs), kept_original, note, timeout, in_place,
+                             colour_pages=None if kept_original else colour_pages)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:
