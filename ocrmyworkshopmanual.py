@@ -694,40 +694,50 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
     tmp.unlink(missing_ok=True)
 
 
-def _clone_outline(src_reader, comp_path: Path) -> bool:
-    """Best-effort: copy the source PDF's bookmarks (document outline) onto the rebuilt
-    PDF, remapped 1:1 by page index (page count and order are preserved). Rasterise-and-
-    rebuild otherwise drops bookmarks. Never raises — bookmarks are a nice-to-have, not
-    worth failing a whole file over. Returns True if an outline was written."""
+def _graft_into_source(src_pdf: Path, comp_path: Path) -> bool:
+    """Put the COMPRESSED page content back into the ORIGINAL document, instead of
+    shipping a freshly-built PDF that carries only pages.
+
+    Rebuilding a PDF from rendered pages silently drops everything that is not page
+    content: link annotations (internal, URI and cross-file /GoToR), bookmarks, named
+    destinations, and document metadata. Re-attaching each of those one at a time is a
+    losing game — measured on one 36-page manual, the rebuild kept 5 of 249 links, and a
+    Lexus file lost all 248 bookmarks because their destinations point at other files and
+    so resolve to no page number.
+
+    So: open the source, swap each page's /Contents and /Resources for the compressed
+    ones, and save. Everything else is inherited by construction. qpdf drops the now
+    unreferenced original images on write (object streams), so the size stays close to
+    the rebuilt file. Requires an exact page-count match; returns False (leaving
+    comp_path untouched) on any problem, so the caller just ships the rebuild."""
     try:
-        outline = src_reader.outline
-        if not outline:
-            return False
-        w = PdfWriter(clone_from=str(comp_path))
-        npages = len(w.pages)
-
-        def walk(items, parent=None):
-            prev = None
-            for it in items:
-                if isinstance(it, list):
-                    walk(it, prev)
-                    continue
-                try:
-                    pnum = src_reader.get_destination_page_number(it)
-                except Exception:
-                    pnum = None
-                if pnum is None or pnum < 0 or pnum >= npages:
-                    continue
-                title = getattr(it, 'title', None) or (it.get('/Title') if hasattr(it, 'get') else None)
-                prev = w.add_outline_item(str(title or 'untitled'), pnum, parent=parent)
-
-        walk(outline)
-        tmp = comp_path.with_name(comp_path.stem + '_ol.pdf')
-        with open(tmp, 'wb') as f:
-            w.write(f)
+        import pikepdf
+    except Exception:
+        return False
+    tmp = comp_path.with_name(comp_path.stem + '_graft.pdf')
+    try:
+        with pikepdf.open(str(src_pdf)) as s, pikepdf.open(str(comp_path)) as c:
+            if len(s.pages) != len(c.pages) or not len(s.pages):
+                return False
+            for sp, cp in zip(s.pages, c.pages):
+                fp = s.copy_foreign(cp.obj)      # bring the compressed page across
+                sp.Contents = fp.Contents
+                sp.Resources = fp.Resources
+                for k in ('/MediaBox', '/Rotate'):
+                    if k in fp.keys():
+                        sp[k] = fp[k]
+            s.remove_unreferenced_resources()
+            s.save(str(tmp), recompress_flate=True,
+                   object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        if tmp.stat().st_size == 0:
+            raise RuntimeError('empty graft')
         os.replace(str(tmp), str(comp_path))
         return True
     except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
         return False
 
 
@@ -1151,6 +1161,15 @@ def compress_one(src: str, dest: str, dpi: int,
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jb_'))
     try:
+        # How many pages the SOURCE has. Everything downstream is verified against this,
+        # never against the rendered count: on a corrupt PDF, rendering (or the repair
+        # fallback) can silently yield fewer pages, and verifying the output against that
+        # same reduced count happily passes — which is how a 21-page manual was replaced
+        # by a 1-page file. 0 = unknown (unreadable source); then we can't cross-check.
+        try:
+            src_pages = len(PdfReader(str(src_p)).pages)
+        except Exception:
+            src_pages = 0
         # SAFETY: never rasterise a born-digital (vector/text) PDF. If the file does
         # not look like a scan, copy it through to dest byte-for-byte, untouched
         # (no render, no binarize, no OCR) — this tool is for scanned/image PDFs only.
@@ -1227,6 +1246,14 @@ def compress_one(src: str, dest: str, dpi: int,
         if r.returncode != 0 or not pngs:
             return {'src': src_p.name, 'orig': orig, 'new': 0,
                     'err': f'render failed rc={r.returncode} {r.stderr[:200]}'}
+        # A render that produced FEWER pages than the source is page loss, not success —
+        # typically a corrupt PDF whose repair salvaged only part of it. Fail the file and
+        # keep the original rather than silently shipping a truncated manual.
+        if src_pages and len(pngs) != src_pages:
+            return {'src': src_p.name, 'orig': orig, 'new': 0,
+                    'err': f'page loss: source has {src_pages} page(s) but only '
+                           f'{len(pngs)} rendered' + (' (after repair)' if did_repair else '')
+                           + ' — original kept'}
         comp = work / 'compressed.pdf'
         n_photo = 0
         n_color = 0
@@ -1336,6 +1363,11 @@ def compress_one(src: str, dest: str, dpi: int,
         #      re-render didn't help (already-efficient photo/colour scans), keeping it
         #      would only grow the file and risk generational quality loss -> instead
         #      keep the ORIGINAL and just add the OCR layer to it (images untouched).
+        # Put the compressed pages back INTO the original document, so links, bookmarks,
+        # named destinations and metadata are inherited rather than rebuilt (and lost).
+        # Done BEFORE the size decision so min-savings judges the artefact we will ship.
+        # Falls back silently to the plain rebuild.
+        grafted = _graft_into_source(render_src, comp)
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
             base = work / 'orig.pdf'
@@ -1343,10 +1375,6 @@ def compress_one(src: str, dest: str, dpi: int,
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
-            # restore the source's bookmarks onto the rebuilt PDF (1:1 page mapping);
-            # best-effort, never fails the file. ocrmypdf preserves the outline downstream.
-            if _rpages is not None:
-                _clone_outline(_rdr, comp)
 
         # 4) build the per-file note, then OCR (only if no text) + place into dest.
         if kept_original:
@@ -1363,12 +1391,14 @@ def compress_one(src: str, dest: str, dpi: int,
             note += f' [{n_vector} vector/born-digital pg (lossless)]'
         if n_native:
             note += f' [{n_native} hi-res pg at native dpi]'
+        if not kept_original and not grafted:
+            note += ' (rebuilt — links/bookmarks not carried over)'
         if n_retry[0]:
             note += f' (render retried x{n_retry[0]})'
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
-                             len(pngs), kept_original, note, timeout, in_place)
+                             src_pages or len(pngs), kept_original, note, timeout, in_place)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         return res
     except subprocess.TimeoutExpired as ex:

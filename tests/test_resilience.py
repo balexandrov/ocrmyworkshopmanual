@@ -291,6 +291,83 @@ def test_mixed_pdf_scan_pages_still_get_ocr(tmp_path):
             f'scan page {pi} got no OCR text layer')
 
 
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_page_loss_fails_instead_of_shipping_a_truncated_file(tmp_path):
+    """Regression (silent data loss): the output used to be verified against the RENDERED
+    page count, so when a corrupt PDF rendered (or repaired) to fewer pages the check
+    passed and a 21-page manual was replaced by a 1-page file. Verification is now
+    against the SOURCE page count, so page loss fails the file and keeps the original.
+    Simulated by dropping a rendered page, exactly as a partial render would."""
+    src = U.make_scan_pdf(tmp_path / 'many.pdf', npages=5, dpi=150)
+    real = U.owm._run_stalled
+
+    def lose_a_page(cmd, progress, stall, **kw):
+        r = real(cmd, progress, stall, **kw)
+        out = next((a for a in cmd if str(a).startswith('-sOutputFile=')), '')
+        work = Path(out.split('=', 1)[1]).parent if out else None
+        if work:
+            pngs = sorted(work.glob('p*.png'))
+            if len(pngs) > 1:
+                pngs[-1].unlink(missing_ok=True)     # a page vanishes from the render
+        return r
+    U.owm._run_stalled = lose_a_page
+    try:
+        dest = tmp_path / 'out.pdf'
+        res = U.owm.compress_one(str(src), str(dest), 150, ocr=False)
+    finally:
+        U.owm._run_stalled = real
+    assert res.get('err') and 'page loss' in res['err'], res
+    assert not dest.exists(), 'a page-losing run must not write an output'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_links_and_bookmarks_survive_compression(tmp_path):
+    """Rebuilding a PDF from rendered pages drops link annotations, bookmarks and named
+    destinations (measured: 5 of 249 links kept, 248 bookmarks lost). The compressed
+    pages are now grafted back into the ORIGINAL document, so all of it is inherited."""
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject, TextStringObject
+    src0 = U.make_scan_pdf(tmp_path / 'src.pdf', npages=4, dpi=200)
+    wr = PdfWriter(clone_from=str(src0))
+    for i, pg in enumerate(wr.pages):            # a URI link on every page
+        ann = DictionaryObject({
+            NameObject('/Type'): NameObject('/Annot'),
+            NameObject('/Subtype'): NameObject('/Link'),
+            NameObject('/Rect'): ArrayObject([NumberObject(x) for x in (10, 10, 100, 30)]),
+            NameObject('/Border'): ArrayObject([NumberObject(0)] * 3),
+            NameObject('/A'): DictionaryObject({
+                NameObject('/S'): NameObject('/URI'),
+                NameObject('/URI'): TextStringObject(f'https://example.invalid/{i}')}),
+        })
+        pg[NameObject('/Annots')] = ArrayObject([wr._add_object(ann)])
+    wr.add_outline_item('Chapter 1', 0)
+    wr.add_outline_item('Chapter 2', 2)
+    src = tmp_path / 'withmeta.pdf'
+    with open(src, 'wb') as f:
+        wr.write(f)
+
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(src), str(out), 200, ocr=False)
+    assert res.get('err') is None and res.get('action') == 'compressed', res
+    r = PdfReader(str(out))
+    links = 0
+    for p in r.pages:
+        a = p.get('/Annots')
+        if a:
+            links += sum(1 for x in a.get_object()
+                         if x.get_object().get('/Subtype') == '/Link')
+
+    def cnt(items):
+        n = 0
+        for it in items:
+            n += cnt(it) if isinstance(it, list) else 1
+        return n
+    assert len(r.pages) == 4
+    assert links == 4, f'link annotations lost: {links}/4'
+    assert cnt(r.outline) == 2, 'bookmarks lost'
+    assert out.stat().st_size < src.stat().st_size, 'should still compress'
+
+
 def test_available_ocr_lang_degrades_to_installed(monkeypatch):
     """A detected/requested language whose pack is NOT installed must degrade to an
     installed one (never fail OCR and drop the whole text layer — the rus-missing bug)."""
