@@ -864,6 +864,62 @@ def _render_page_gray(src_p: Path, page_no: int, out_png: Path, dpi: int, timeou
     return out_png.exists()
 
 
+def _run_stalled(cmd, progress, stall: int, poll: float = 2.0, **kw):
+    """Run `cmd`, killing it ONLY if it stops making progress — never merely for taking
+    a long time. `progress()` returns a number that grows as work is done (pages
+    rendered, output bytes written); if it hasn't grown for `stall` seconds the process
+    is considered hung and killed (raising subprocess.TimeoutExpired).
+
+    A plain wall-clock budget cannot tell 'slow' from 'stuck': it kills healthy work on
+    big files purely for being big (a 6,855-page manual was failed at 2h while working
+    correctly). Progress-based detection is size-independent — a 3-page and a 7,000-page
+    file are judged identically. stall<=0 disables the watchdog entirely."""
+    if stall <= 0:
+        return subprocess.run(cmd, **kw)
+    kw.pop('timeout', None)
+    p = subprocess.Popen(cmd, stdout=kw.pop('stdout', subprocess.PIPE),
+                         stderr=kw.pop('stderr', subprocess.PIPE), **kw)
+    last, last_t = progress(), time.time()
+    while True:
+        try:
+            out, err = p.communicate(timeout=poll)
+            return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            pass
+        now = progress()
+        if now > last:
+            last, last_t = now, time.time()
+        elif time.time() - last_t >= stall:
+            p.kill()
+            try:
+                p.communicate(timeout=30)
+            except Exception:
+                pass
+            raise subprocess.TimeoutExpired(cmd, stall)
+
+
+def _run_retry(fn, attempts: int = 3, backoff: float = 2.0):
+    """Call fn() and retry a CRASH (an exception or a non-zero return code) a few times —
+    transient native-library crashes and file locks usually succeed on a retry. A STALL
+    (TimeoutExpired) is never retried: a hung or genuinely slow step behaves the same way
+    the second time, so retrying only burns the time again. Returns (result, tries)."""
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            r = fn()
+            if getattr(r, 'returncode', 0) == 0:
+                return r, i
+            last = r
+        except subprocess.TimeoutExpired:
+            raise                          # stalled: retrying would just stall again
+        except Exception:
+            if i == attempts:
+                raise
+        if i < attempts:
+            time.sleep(backoff * i)
+    return last, attempts
+
+
 def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
     """Try to repair a malformed/corrupt PDF by rewriting it through Ghostscript's
     pdfwrite device (which tolerates and reconstructs a lot of broken structure).
@@ -871,9 +927,11 @@ def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
     file is given up on — one bad download shouldn't just be lost in a big batch."""
     out = work / 'repaired.pdf'
     try:
-        r = subprocess.run(
+        # progress = the rewritten PDF growing; killed only if it stalls, not if it's slow
+        r = _run_stalled(
             [GS, '-o', str(out), '-sDEVICE=pdfwrite', '-dQUIET', '-dNOPAUSE', '-dBATCH',
-             win_long(src_p)], capture_output=True, text=True, timeout=timeout or None)
+             win_long(src_p)],
+            lambda: out.stat().st_size if out.exists() else 0, timeout, text=True)
     except Exception:
         return None
     return out if (r.returncode == 0 and out.exists() and out.stat().st_size > 0) else None
@@ -962,14 +1020,19 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             language = _available_ocr_lang(language)
             note += f' (lang:{language})'
             ocr_pdf = work / 'ocr.pdf'
-            r = subprocess.run(
+            # NO timeout on OCR: ocrmypdf emits no usable progress signal (measured: it is
+            # silent for ~90% of a run), so any wall-clock bound would just kill healthy
+            # work on big files — which is exactly how a 6,855-page manual "failed" while
+            # OCR'ing correctly. A crash is retried; slowness is simply waited out.
+            r, tries = _run_retry(lambda: subprocess.run(
                 OCRMYPDF + ['--language', language, '--optimize', '0',
-                 '--output-type', 'pdf', '--skip-text', '--quiet', '--jobs', '1',
-                 str(base), str(ocr_pdf)], capture_output=True, text=True,
-                timeout=timeout or None)
-            if r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
+                            '--output-type', 'pdf', '--skip-text', '--quiet', '--jobs', '1',
+                            str(base), str(ocr_pdf)], capture_output=True, text=True))
+            if r is not None and r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
                 final = ocr_pdf
                 ocr_added = True
+                if tries > 1:
+                    note += f' (OCR retried x{tries - 1})'
             else:
                 note += ' (OCR FAILED)'
     # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched
@@ -1125,12 +1188,19 @@ def compress_one(src: str, dest: str, dpi: int,
         #    while the common low-res pages don't bloat the file by being upsampled.
         render_src = src_p
         did_repair = False
+        n_retry = [0]          # transient external-tool crashes that a retry recovered
 
         def _render():
-            return subprocess.run(
-                [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-                 '-sOutputFile=' + str(work / 'p%04d.png'), win_long(render_src)],
-                capture_output=True, text=True, timeout=timeout or None)
+            # Ghostscript writes p0001.png, p0002.png ... as it goes, so the page count is
+            # a true progress signal: the run is killed only if it STALLS (no new page for
+            # `timeout` secs), never for merely taking long on a big file.
+            cmd = [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                   '-sOutputFile=' + str(work / 'p%04d.png'), win_long(render_src)]
+            rr, tries = _run_retry(lambda: _run_stalled(
+                cmd, lambda: len(list(work.glob('p*.png'))), timeout, text=True))
+            if tries > 1:
+                n_retry[0] += tries - 1
+            return rr
 
         r = _render()
         pngs = sorted(p.name for p in work.glob('p*.png'))
@@ -1282,6 +1352,8 @@ def compress_one(src: str, dest: str, dpi: int,
             note += f' [{n_vector} vector/born-digital pg (lossless)]'
         if n_native:
             note += f' [{n_native} hi-res pg at native dpi]'
+        if n_retry[0]:
+            note += f' (render retried x{n_retry[0]})'
         if did_repair:
             note += ' (repaired malformed PDF)'
         res = _ocr_and_place(base, dest_p, src_p, orig, work, ocr, language,
@@ -1290,7 +1362,7 @@ def compress_one(src: str, dest: str, dpi: int,
         return res
     except subprocess.TimeoutExpired as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0,
-                'err': f'timed out after {timeout}s ({getattr(ex, "cmd", ["?"])[0]})'}
+                'err': f'stalled: no progress for {timeout}s ({getattr(ex, "cmd", ["?"])[0]})'}
     except Exception as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': repr(ex)}
     finally:
@@ -1704,11 +1776,12 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='preview only: classify each pdf (born-digital? scanned?) and project its '
                          'compressed size, report what WOULD happen + projected savings, write NOTHING')
-    ap.add_argument('--timeout', type=int, default=7200,
-                    help='max seconds for the page-render step and for the OCR step per file; a file '
-                         'that exceeds it is marked FAILED and the batch continues (0 = no timeout; '
-                         'default 7200 = 2h, generous enough for the largest manuals while still '
-                         'rescuing a genuinely hung/corrupt pdf)')
+    ap.add_argument('--timeout', type=int, default=600,
+                    help='STALL timeout: max seconds a step may make NO progress (no new page '
+                         'rendered, no bytes written) before it is treated as hung, killed, and the '
+                         'file marked FAILED. This is not a time budget — a slow-but-working file is '
+                         'never killed for being big, however long it takes (default 600 = 10 min of '
+                         'no progress; 0 disables). Transient crashes are retried automatically.')
     ap.add_argument('--min-free-gb', type=float, default=1.0,
                     help='abort before starting if the destination drive has less than this many GB '
                          'free (default 1.0; 0 disables the check)')
