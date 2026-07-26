@@ -177,6 +177,28 @@ def test_colour_survives_compression_round_trip(tmp_path):
     assert U.owm._is_color(a), 'colour was lost in the round trip (page was binarized to b&w)'
 
 
+def test_is_color_detects_small_amount_of_saturated_ink():
+    """Regression: colour judged by SHARE of ink alone missed a diagram that is mostly a
+    black text table with a few vivid wires (a real Chrysler diagram: 5.5% coloured ink
+    vs a 6% bar -> binarized, wire colours destroyed). A small but strongly saturated
+    amount of ink now counts as colour, while neutral/sepia ink still does not."""
+    import numpy as np
+    h = w = 400
+    a = np.full((h, w, 3), 255, np.int16)
+    a[:, :, :][20:380, 20:380] = 255
+    a[100:300, 100:300] = 40                       # a big black block (dominant ink)
+    assert U.owm._is_color(a) is False, 'plain black-on-white must not be colour'
+    a2 = a.copy()
+    a2[150:155, 100:300] = (220, 20, 20)           # a few vivid red "wires" (small share)
+    a2[170:174, 100:300] = (20, 40, 220)           # blue
+    frac = (9 * 200) / float((a2.min(2) < 200).sum())
+    assert frac < 0.06, f'test setup: coloured share {frac:.3f} must be under the old bar'
+    assert U.owm._is_color(a2) is True, 'small amount of saturated colour must count'
+    a3 = a.copy()                                  # sepia/yellowed cast must stay non-colour
+    a3 = (a3 * np.array([1.0, 0.94, 0.82])).astype(np.int16)
+    assert U.owm._is_color(a3) is False, 'a uniform sepia cast must not read as colour'
+
+
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_vector_page_passed_through_in_mixed_pdf(tmp_path):
     """A born-digital VECTOR page (TOC/nav: vector text + colour + links, no full-page
