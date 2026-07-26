@@ -33,6 +33,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ghostscript
 
+      # Tesseract is what ocrmypdf shells out to. Without it every OCR test skips (or,
+      # worse, fails) and the whole searchable-text half of the pipeline goes untested —
+      # which is how several real OCR bugs reached the archive. osd = script detection
+      # used by --language auto.
+      - name: Install Tesseract
+        run: |
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd
+          tesseract --version
+
       # No Debian/Ubuntu apt package ships the jbig2 CLI binary (only the
       # libjbig2enc-dev/libjbig2enc0t64 library packages exist) -- build it
       # from source, following upstream's own tested recipe.

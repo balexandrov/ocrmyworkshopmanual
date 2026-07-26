@@ -15,6 +15,7 @@ from pypdf import PdfReader
 import _util as U
 
 _missing = U.tools_missing()
+_ocr_missing = U.ocr_missing()
 
 
 def test_verify_output_matches_and_mismatches(tmp_path):
@@ -267,6 +268,7 @@ def test_bookmarks_preserved_through_compression(tmp_path):
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
 def test_mixed_pdf_scan_pages_still_get_ocr(tmp_path):
     """Regression: has_text() summed characters over the first few pages, so ONE
     text-rich vector TOC page made a mixed manual look 'already has text' and OCR was
@@ -381,7 +383,7 @@ def test_available_ocr_lang_degrades_to_installed(monkeypatch):
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
-@pytest.mark.skipif(not U.owm.TESS, reason='Tesseract not found')
+@pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
 def test_sparse_english_not_mislabelled_cyrillic(tmp_path):
     """Regression: sparse English pages (wiring diagrams) make Tesseract OSD emit a
     low-confidence, often spurious 'Cyrillic', which used to yield rus+eng (slow and
