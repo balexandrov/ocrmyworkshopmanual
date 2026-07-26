@@ -31,7 +31,6 @@ Usage:
   python ocrmyworkshopmanual.py SRC --dest OUT --workers 10
   python ocrmyworkshopmanual.py SRC --limit 3                    # test first N files
   python ocrmyworkshopmanual.py SRC --no-ocr                     # compress only
-  python ocrmyworkshopmanual.py SRC --ocr-only                   # add text layer only, no compression
   python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu   # multilingual OCR
 
 Page-type router: classify_page() sorts each page into a PageType (PT_LINE/PT_BLANK
@@ -1424,7 +1423,7 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    timeout: int = 0, in_place: bool = False, colour_pages=None,
                    already_ocred: bool = False, was_repaired: bool = False) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
-    it at dest. Shared by the compress path and the --ocr-only path. `timeout` (secs,
+    it at dest. Shared by the compress path and the keep-original path. `timeout` (secs,
     0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
     checked BEFORE placing it. With `in_place` (dest_p == src_p): if the result is
     identical to the source (kept original + no OCR added) the file is left untouched;
@@ -1543,13 +1542,58 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
 # full compression is skipped and the original is kept (just OCR'd) — not worth the work.
 PRECHECK_SKIP_RATIO = 0.75
 
+# The pre-check only pays off on BIG files, where sampling ~10 pages can save compressing
+# hundreds. Below this page count it is a net loss: the sample covers much of the document,
+# so when the file does compress the work is simply done twice (measured: 2.1x on a 4-page
+# scan, 2.2x on 8 pages, 2.0x on a single line-art page, for byte-identical output). Small
+# files are compressed directly and judged on the REAL result by the min-savings guard,
+# which is more accurate than an extrapolation anyway.
+PRECHECK_MIN_PAGES = 100
+
+
+def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
+                   src_pages: int, timeout: int = 0) -> tuple:
+    """Prepare the ORIGINAL images for shipping: repair if unreadable, add a text layer if
+    the file has none. Returns (base, language, note, did_ocr, err).
+
+    Two situations end here and they must behave identically — a big file the pre-check
+    predicted would not compress, and any file whose compressed result failed the
+    min-savings bar. They used to be written out twice, and every bug in this area had to
+    be fixed twice: the discarded OCR layer, --force-ocr rasterising the very images we
+    were preserving, and the repaired copy being thrown away. One implementation now.
+
+    OCR here must PRESERVE the images (--redo-ocr / --skip-text, never --force-ocr):
+    unlike the compress path, these images are the output."""
+    base = work / 'orig.pdf'
+    shutil.copyfile(str(images_from), str(base))
+    note, did_ocr = '', False
+    # never pass a BROKEN file through: this path copies bytes, so a corrupt PDF would be
+    # faithfully reproduced as a file that opens nowhere.
+    if not _renders_ok(base, timeout):
+        fixed = _repair_pdf(base, work, src_pages, timeout)
+        if fixed and _renders_ok(fixed, timeout):
+            base, note = fixed, note + ' (repaired malformed PDF)'
+        else:
+            return None, language, note, False, ('unreadable PDF: renders no pages and '
+                                                 'repair failed — original kept')
+    if ocr and not has_text(base):
+        ocred, language, onote = _ocr_source(base, work, language,
+                                             has_vector=_has_vector_pages(base),
+                                             timeout=timeout, preserve_images=True)
+        note += onote
+        if ocred:
+            base, did_ocr = ocred, True
+    elif ocr:
+        note += ' (had text, OCR skipped)'
+    return base, language, note, did_ocr, None
+
 
 def compress_one(src: str, dest: str, dpi: int,
                  despeckle: bool = True, min_size: int = 10,
                  ocr: bool = True, language: str = 'eng',
                  photo_thresh: float = 0.02,
                  photo_dpi: int = 150, jpeg_quality: int = 60,
-                 min_savings: float = 0.25, ocr_only: bool = False,
+                 min_savings: float = 0.25,
                  sauvola_k: float = 0.30, photo_descreen: float = 0.6,
                  timeout: int = 0, in_place: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
@@ -1604,50 +1648,28 @@ def compress_one(src: str, dest: str, dpi: int,
                     'pages': bsig.get('sampled'), 'kept': True, 'err': None,
                     'action': 'born_digital', 'signals': bsig,
                     'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'}
-        note0 = ' (OCR-only, not compressed)' if ocr_only else ''
-        # cheap pre-check: sample-compress a few pages; if it won't beat the original,
+        note0 = ''
+        skip_compression = False
+        # Cheap pre-check: sample-compress a few pages; if it won't beat the original,
         # skip full compression and just OCR the original (avoids wasted work + growth).
-        if not ocr_only:
+        # Only for big files (see PRECHECK_MIN_PAGES): on a small one it just compresses
+        # the document twice.
+        if src_pages >= PRECHECK_MIN_PAGES:
             proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                      photo_thresh, photo_dpi, jpeg_quality,
                                      sauvola_k, photo_descreen)
             if proj >= PRECHECK_SKIP_RATIO:
-                ocr_only = True
+                skip_compression = True
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
-        if ocr_only:
-            # No (worthwhile) compression: keep the original images, just add the OCR layer.
-            base = work / 'orig.pdf'
-            shutil.copyfile(str(src_p), str(base))
-            # ...but never pass a BROKEN file straight through: this path copies bytes, so
-            # a corrupt PDF would be reproduced corrupt (it renders nothing). If it cannot
-            # render, repair it first — the repaired copy is what gets OCR'd and placed.
-            did_ocr = False
-            if not _renders_ok(base, timeout):
-                fixed = _repair_pdf(base, work, src_pages, timeout)
-                if fixed and _renders_ok(fixed, timeout):
-                    base = fixed
-                    note0 += ' (repaired malformed PDF)'
-                else:
-                    return {'src': src_p.name, 'orig': orig, 'new': 0,
-                            'err': 'unreadable PDF: renders no pages and repair failed '
-                                   '— original kept'}
-            # Same OCR rules as the compress path (one implementation): only OCR when the
-            # file lacks a real text layer, and pick the mode by whether vector pages are
-            # present — otherwise a page holding just a page number is skipped entirely
-            # and the manual ships unsearchable.
-            if ocr and not has_text(base):
-                ocr_src, language, onote = _ocr_source(
-                    base, work, language, has_vector=_has_vector_pages(base),
-                    timeout=timeout, preserve_images=True)
-                note0 += onote
-                if ocr_src:
-                    base, did_ocr = ocr_src, True
-            elif ocr:
-                note0 += ' (had text, OCR skipped)'
+        if skip_compression:
+            base, language, snote, did_ocr, err = _ship_original(
+                src_p, work, ocr, language, src_pages, timeout)
+            if err:
+                return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
-                                 src_pages or len(PdfReader(str(base)).pages), True, note0,
-                                 timeout, in_place, already_ocred=did_ocr)
-            res['action'] = 'ocr_only'
+                                 src_pages or len(PdfReader(str(base)).pages), True,
+                                 note0 + snote, timeout, in_place, already_ocred=did_ocr)
+            res['action'] = 'kept_original'
             return res
         # 1) render pages to grayscale PNG (batched at the base DPI). High-resolution
         #    bitonal pages are RE-rendered per page at their native DPI further below, so
@@ -1832,17 +1854,14 @@ def compress_one(src: str, dest: str, dpi: int,
             # Keep the ORIGINAL images. If the source was malformed keep the REPAIRED
             # copy, never the broken bytes. (The OCR'd copy is not reused here: it holds
             # only the scan pages when the file also has vector pages.)
-            base = work / 'orig.pdf'
-            shutil.copyfile(str(render_src if did_repair else src_p), str(base))
-            # We ship the ORIGINAL images here, so the OCR'd copy made above is unusable
-            # (--force-ocr rasterises). Add a text layer image-preservingly instead, and
-            # only when the file has none of its own.
-            if ocr and not has_text(base):
-                o2, _l, n2 = _ocr_source(base, work, language,
-                                         has_vector=_has_vector_pages(base),
-                                         timeout=timeout, preserve_images=True)
-                if o2:
-                    base, ocr_note, kept_ocred = o2, n2, True
+            # Same situation as a pre-check skip: we ship the ORIGINAL images, so the
+            # OCR'd copy made for the graft is unusable here (it was force-OCR'd, which
+            # rasterises). One shared implementation handles repair + image-preserving OCR.
+            base, language, snote, kept_ocred, err = _ship_original(
+                render_src if did_repair else src_p, work, ocr, language, src_pages, timeout)
+            if err:
+                return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
+            ocr_note = snote
             n_photo = n_color = n_color_line = n_vector = n_native = 0
         else:
             base = comp
@@ -1941,7 +1960,7 @@ def _default_workers() -> int:
 # ── Dry-run preview (runs in a worker process) ────────────────────────────────
 
 def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
-                ocr_only: bool, photo_thresh: float, photo_dpi: int,
+                photo_thresh: float, photo_dpi: int,
                 jpeg_quality: int, min_savings: float,
                 sauvola_k: float, photo_descreen: float) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
@@ -1957,15 +1976,12 @@ def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
             return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
                     'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
                     'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
-        if ocr_only:
-            return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': None, 'kept': True,
-                    'err': None, 'action': 'ocr_only', 'note': ' (OCR-only mode; not compressed)'}
         proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
                                  sauvola_k, photo_descreen)
         est_new = int(proj * orig)
         if proj >= PRECHECK_SKIP_RATIO:
-            action, note = 'ocr_only', f' (would skip compression: projected {proj*100:.0f}% of original)'
+            action, note = 'kept_original', f' (would skip compression: projected {proj*100:.0f}% of original)'
             est_new = orig
         elif proj >= (1 - min_savings):
             action, note = 'kept_original', f' (projected {proj*100:.0f}% — likely keep original)'
@@ -1990,7 +2006,6 @@ def _action_label(res: dict) -> str:
         return 'FAILED'
     return {
         'born_digital': 'born-digital (copied untouched)',
-        'ocr_only': 'OCR-only (not compressed)',
         'kept_original': 'kept original',
         'compressed': 'compressed',
     }.get(res.get('action'), 'processed')
@@ -2287,9 +2302,6 @@ def main():
     ap.add_argument('--min-savings', type=float, default=0.25,
                     help='keep the compressed file only if it is at least this fraction smaller than '
                          'the original; else keep the original and OCR only (default 0.25)')
-    ap.add_argument('--ocr-only', action='store_true',
-                    help='do not compress at all: copy each original and just add the OCR text layer '
-                         '(skips files that already have text)')
     ap.add_argument('--log', type=Path, default=None,
                     help='path for the run report log (default: a timestamped file in the dest root)')
     ap.add_argument('--no-log', action='store_true', help='do not write a run report log')
@@ -2332,9 +2344,6 @@ def main():
 
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
-    if args.no_ocr and args.ocr_only:
-        print('ERROR: --no-ocr and --ocr-only cannot be combined (one skips OCR entirely, '
-              'the other skips compression to ONLY add OCR)', file=sys.stderr); sys.exit(1)
     if args.from_list and args.src:
         print('ERROR: pass EITHER a src OR --from-list, not both', file=sys.stderr); sys.exit(1)
     if not args.from_list and not args.src:
@@ -2436,16 +2445,12 @@ def main():
     print(f'Dest        : {"IN-PLACE (overwrites source PDFs)" if args.in_place else dest_root}')
     ocr_desc = f'OCR({args.language})' if not args.no_ocr else 'no OCR'
     bd_desc = 'born-digital-safe'
-    if args.ocr_only:
-        print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
-              f'@ {args.workers} workers, OCR-ONLY (no compression), {ocr_desc}, {bd_desc}\n')
-    else:
-        photo_desc = f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
-        bin_desc = f'adaptive(sauvola k={args.sauvola_k:g})'
-        print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
-              f'@ {args.dpi} dpi, {args.workers} workers, generic mode, {bin_desc}, '
-              f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
-              f'{photo_desc}, {ocr_desc}, {bd_desc}\n')
+    photo_desc = f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
+    bin_desc = f'adaptive(sauvola k={args.sauvola_k:g})'
+    print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
+          f'@ {args.dpi} dpi, {args.workers} workers, generic mode, {bin_desc}, '
+          f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
+          f'{photo_desc}, {ocr_desc}, {bd_desc}\n')
     if not jobs:
         print('Nothing to do.'); return
     if args.dry_run:
@@ -2491,7 +2496,7 @@ def main():
                                     initargs=(_ocr_jobs,)) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
-                                  not args.no_despeckle, args.min_size, args.ocr_only,
+                                  not args.no_despeckle, args.min_size,
                                   args.photo_threshold, args.photo_dpi, args.jpeg_quality,
                                   args.min_savings, args.sauvola_k, args.photo_descreen): (s, d)
                         for s, d in jobs}
@@ -2500,7 +2505,7 @@ def main():
                                   not args.no_despeckle, args.min_size,
                                   not args.no_ocr, args.language,
                                   args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                                  args.min_savings, args.ocr_only, args.sauvola_k,
+                                  args.min_savings, args.sauvola_k,
                                   args.photo_descreen,
                                   args.timeout, args.in_place): (s, d)
                         for s, d in jobs}
@@ -2596,7 +2601,7 @@ def main():
             'despeckle': not args.no_despeckle, 'min_size': args.min_size,
             'photo_threshold': args.photo_threshold, 'photo_dpi': args.photo_dpi,
             'jpeg_quality': args.jpeg_quality,
-            'photo_descreen': args.photo_descreen, 'ocr': ocr_desc, 'ocr_only': args.ocr_only,
+            'photo_descreen': args.photo_descreen, 'ocr': ocr_desc,
             'min_savings': args.min_savings,
             'timeout': args.timeout,
             'retry_failed': str(args.retry_failed) if args.retry_failed else False,

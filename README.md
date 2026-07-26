@@ -113,9 +113,8 @@ python ocrmyworkshopmanual.py SRC --limit 3
 # Custom output, more workers
 python ocrmyworkshopmanual.py SRC --dest OUT --workers 10
 
-# Compress only (no text layer) / just add OCR, no compression
+# Compress only, no searchable text layer
 python ocrmyworkshopmanual.py SRC --no-ocr
-python ocrmyworkshopmanual.py SRC --ocr-only
 
 # Multilingual OCR
 python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
@@ -138,7 +137,6 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4) |
 | `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu`. Use `auto` to detect each file's script from the image (Tesseract OSD) and pick the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng` |
 | `--no-ocr` | off | Skip the searchable text layer |
-| `--ocr-only` | off | Don't compress — copy originals and only add OCR (skips files that already have text) |
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px |
 | `--no-despeckle` | off | Skip speckle removal |

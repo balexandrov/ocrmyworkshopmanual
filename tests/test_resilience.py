@@ -34,7 +34,7 @@ def test_verify_output_unopenable(tmp_path):
 def test_preview_one_born_digital_writes_nothing(tmp_path):
     src = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=3)
     before = set(tmp_path.iterdir())
-    res = U.owm.preview_one(str(src), 200, True, 10, False, 0.02, 150, 60,
+    res = U.owm.preview_one(str(src), 200, True, 10, 0.02, 150, 60,
                             0.25, 0.30, 0.6)
     assert res['action'] == 'born_digital' and res['err'] is None
     assert res['new'] == res['orig']                      # predicts no size change
@@ -46,10 +46,10 @@ def test_preview_one_scanned_projects_smaller(tmp_path):
     pdfs = U.fixture_pdfs('line')
     if not pdfs:
         pytest.skip('no line fixtures')
-    res = U.owm.preview_one(str(pdfs[0]), 200, True, 10, False, 0.02, 150, 60,
+    res = U.owm.preview_one(str(pdfs[0]), 200, True, 10, 0.02, 150, 60,
                             0.25, 0.30, 0.6)
     assert res['err'] is None
-    assert res['action'] in ('compressed', 'kept_original', 'ocr_only')
+    assert res['action'] in ('compressed', 'kept_original')
     assert res['new'] <= res['orig']
 
 
@@ -631,11 +631,14 @@ def test_real_corrupt_pdf_is_recovered_whole(tmp_path):
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 @pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
-def test_corrupt_pdf_not_byte_copied_on_the_ocr_only_path(tmp_path):
-    """The OCR-only path copies the source through byte-for-byte, which faithfully
-    reproduced a CORRUPT file (the copy rendered 0 pages). It must repair instead."""
+def test_corrupt_pdf_not_byte_copied_when_keeping_the_original(tmp_path, monkeypatch):
+    """The keep-original path passes the source through byte-for-byte, which faithfully
+    reproduced a CORRUPT file (the copy rendered 0 pages). It must repair instead.
+    Forced here by making the pre-check declare the file not worth compressing."""
+    monkeypatch.setattr(U.owm, 'PRECHECK_MIN_PAGES', 1)
+    monkeypatch.setattr(U.owm, 'sample_projection', lambda *a, **k: 1.0)
     out = tmp_path / 'out.pdf'
-    res = U.owm.compress_one(str(CORRUPT_FIXTURE), str(out), 200, ocr=False, ocr_only=True)
+    res = U.owm.compress_one(str(CORRUPT_FIXTURE), str(out), 200, ocr=False)
     assert res.get('err') is None, res
     assert out.exists()
     assert out.read_bytes() != CORRUPT_FIXTURE.read_bytes(), 'shipped the corrupt bytes'
@@ -703,15 +706,17 @@ def test_self_audit_catches_lost_text_layer(tmp_path):
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 @pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
-def test_in_place_keeps_the_ocr_layer_when_not_compressing(tmp_path):
+def test_in_place_keeps_the_ocr_layer_when_not_compressing(tmp_path, monkeypatch):
     """Regression: OCR runs on the SOURCE before the place step, so the place step is
     told not to OCR again. The in-place 'nothing changed, leave it alone' shortcut then
     judged the file unchanged and threw the fresh text layer away — 13 of 64 files in a
     sample run were OCR'd and shipped unsearchable."""
     from pypdf import PdfReader
     src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=2, dpi=200)
+    monkeypatch.setattr(U.owm, 'PRECHECK_MIN_PAGES', 1)
+    monkeypatch.setattr(U.owm, 'sample_projection', lambda *a, **k: 1.0)
     res = U.owm.compress_one(str(src), str(src), 200, ocr=True, language='eng',
-                             in_place=True, ocr_only=True)
+                             in_place=True)
     assert res.get('err') is None, res
     chars = len((PdfReader(str(src)).pages[0].extract_text() or '').strip())
     assert chars > 100, f'in-place OCR layer was discarded ({chars} chars)'
