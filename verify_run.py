@@ -111,12 +111,20 @@ def words(text: str) -> list:
 
 
 def text_of(pdf: Path, limit: int = 8) -> str:
+    """Text from the first pages, extracted PER PAGE. One page that raises must not zero
+    the whole file: a corrupt XObject on a single page made a perfectly good 21-page
+    output look as if it had no text at all, and the audit reported it as a loss."""
     try:
         r = PdfReader(str(pdf))
-        return '\n'.join((r.pages[i].extract_text() or '')
-                         for i in range(min(limit, len(r.pages))))
     except Exception:
         return ''
+    out = []
+    for i in range(min(limit, len(r.pages))):
+        try:
+            out.append(r.pages[i].extract_text() or '')
+        except Exception:
+            continue
+    return '\n'.join(out)
 
 
 def word_recall(before: str, after: str) -> float | None:
@@ -198,7 +206,10 @@ def main() -> None:
             flags.append('UNREADABLE OUTPUT')
         if recall is not None and recall < 0.6:
             flags.append(f'TEXT LOST (word recall {recall:.2f})')
-        if not words(tb) and not words(ta) and sa_st['pages']:
+        # Judge "unsearchable" on CHARACTERS, not words: some PDFs extract as spaced-out
+        # single characters (no 3+ letter runs), which is odd but perfectly searchable —
+        # a 220-page Porsche manual with 50,439 characters was wrongly flagged as empty.
+        if len(tb.strip()) < 20 and len(ta.strip()) < 20 and sa_st['pages']:
             flags.append('NO TEXT LAYER (not searchable)')
         if size_a > size_b * 1.05 and size_a - size_b > 200_000:
             flags.append(f'GREW {100 * size_a / size_b:.0f}%')
