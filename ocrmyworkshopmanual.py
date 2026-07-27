@@ -477,12 +477,15 @@ def _clean_paper(g: np.ndarray, dpi: int, descreen: float = 0.6) -> np.ndarray:
     return out
 
 
-def photo_coverage(png: Path, dpi: int) -> float:
+def photo_coverage(gray, dpi: int) -> float:
     """Fraction of the page covered by dense continuous-tone TILES. A whole-page
     average misses a photo that only fills part of an otherwise-blank page, so we
     tile (~0.85 inch) and count tiles that are mostly mid-tone. High on any page
-    containing a photo (even partial); ~0 on pure line-art/text."""
-    a = np.asarray(Image.open(png).convert('L'))
+    containing a photo (even partial); ~0 on pure line-art/text.
+
+    Takes the grayscale ARRAY, not a path: the page is rendered once, at source
+    resolution and in colour, and every check reads that one render."""
+    a = gray if isinstance(gray, np.ndarray) else np.asarray(Image.open(gray).convert('L'))
     mid = ((a >= 40) & (a <= 215)).astype(np.float32)
     tile = max(32, round(0.85 * dpi))
     H, W = mid.shape
@@ -650,23 +653,18 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
         except Exception:
             pass
 
-    g = np.asarray(Image.open(png).convert('L'))
-    cov = photo_coverage(png, dpi) if detect_photos else 0.0
+    # ONE render feeds every check: it is at the source's own resolution and in colour,
+    # so nothing here is judged on a degraded image and nothing needs re-rendering.
+    rgb = np.asarray(Image.open(png).convert('RGB'))
+    g = np.asarray(Image.fromarray(rgb).convert('L'))
+    cov = photo_coverage(g, dpi) if detect_photos else 0.0
 
-    # continuous-tone page: render colour once, decide gray vs colour
-    if detect_photos and cov > photo_thresh:
-        d = photo_dpi or dpi
-        cpng = work / f'color{page_no}.png'
-        if _render_color(src_p, page_no, cpng, d):
-            a = np.asarray(Image.open(cpng).convert('RGB')).astype(np.int16)
-            return PageClass(PT_PHOTO_COLOR if _is_color(a) else PT_PHOTO_GRAY, cpng)
-        # colour render failed -> fall through to the bitonal decision below
-
-    # LOW-coverage LINE ART: rescue genuine COLOUR (colour wiring diagrams / schematics)
-    # before it is binarized. The metadata pre-filter skips the probe for plain
-    # grayscale scans (the common case), so this adds no render there.
-    if detect_photos and _page_color_capable(page) and _page_has_color(work, src_p, page_no, dpi):
-        return PageClass(PT_COLOR_LINE, None)
+    if detect_photos:
+        colour = _is_color(rgb.astype(np.int16))
+        if cov > photo_thresh:                    # continuous tone -> photo page
+            return PageClass(PT_PHOTO_COLOR if colour else PT_PHOTO_GRAY, Path(png))
+        if colour:                                # colour LINE ART (wiring diagrams)
+            return PageClass(PT_COLOR_LINE, None)
 
     if float((g < 100).mean()) < blank_ink and cov <= photo_thresh:
         return PageClass(PT_BLANK, None)
@@ -674,12 +672,22 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
 
 
 def photo_seg_pdf(pc: PageClass, out_pdf: Path, work: Path, page_no: int,
-                  d: int, quality: int, descreen: float = 0.6):
-    """Strategy for PHOTO_GRAY / PHOTO_COLOR: JPEG the pre-rendered colour page and wrap
-    it to a 1-page PDF sized (via embedded dpi) to match the bitonal pages. Colour pages
-    are kept as-is; grayscale (B&W photo/mixed/stipple) pages get descreen + paper-whitening
-    + dark scan-edge cleanup (skipped on a full-bleed photo with little paper) via _clean_paper."""
+                  d: int, quality: int, descreen: float = 0.6, src_dpi: int = 0):
+    """Strategy for PHOTO_GRAY / PHOTO_COLOR: JPEG the page render and wrap it to a
+    1-page PDF sized (via embedded dpi) to match the bitonal pages. Colour pages are kept
+    as-is; grayscale (B&W photo/mixed/stipple) pages get descreen + paper-whitening +
+    dark scan-edge cleanup (skipped on a full-bleed photo with little paper).
+
+    THIS is where downsampling happens — the page was rendered at its source resolution
+    so every check saw it undegraded, and only now, producing the output, is it reduced
+    to `d` dpi. Never upsampled: a page whose source is already below `d` is left alone."""
     im = Image.open(pc.color_png).convert('RGB')
+    if src_dpi and d and src_dpi > d:                 # final-encode downsample
+        w2 = max(1, round(im.width * d / src_dpi))
+        h2 = max(1, round(im.height * d / src_dpi))
+        im = im.resize((w2, h2), Image.LANCZOS)
+    elif src_dpi and d and src_dpi < d:
+        d = src_dpi                                   # don't invent pixels
     if pc.type == PT_PHOTO_COLOR:
         out_im = im
     else:
@@ -721,8 +729,70 @@ def _color_line_seg(src_pdf: Path, page_no: int, out_pdf: Path) -> None:
     tmp.unlink(missing_ok=True)
 
 
+def _page_render_dpis(src_p: Path, base_dpi: int, cap: int = MAX_RENDER_DPI) -> list:
+    """Per-page render resolution, read from METADATA only (no pixels touched).
+
+    Each page is rendered at its OWN source resolution so no check ever sees a degraded
+    image and nothing has to be rendered twice. Floored at `base_dpi` because OCR needs
+    the pixels — a 73 dpi scan OCR'd at 73 dpi yielded 11,728 characters against 16,319
+    at a sane resolution, and upsampling loses nothing. Capped so a 600 dpi foldout
+    cannot produce a multi-gigabyte render."""
+    try:
+        r = PdfReader(str(src_p))
+        out = []
+        for pg in r.pages:
+            try:
+                d = _largest_image_dpi(pg)
+            except Exception:
+                d = 0.0
+            out.append(int(max(base_dpi, min(round(d) or base_dpi, cap))))
+        return out
+    except Exception:
+        return []
+
+
+def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int,
+                on_retry=None) -> bool:
+    """Render every page ONCE, in COLOUR, at its own resolution. Consecutive pages that
+    share a resolution go in one Ghostscript call, so a uniformly-scanned manual still
+    costs a single pass; only genuinely mixed documents need a few. Ghostscript writes
+    pages as it goes, so page count is a live progress signal for the stall watchdog.
+
+    Each run renders into its own directory because Ghostscript restarts its %d counter
+    at 1 for every invocation — writing straight into `work` would make run 2 overwrite
+    run 1's pages."""
+    if not dpis:
+        dpis = [base_dpi]
+    runs, start = [], 0
+    for i in range(1, len(dpis) + 1):
+        if i == len(dpis) or dpis[i] != dpis[start]:
+            runs.append((start + 1, i, dpis[start]))     # 1-based, inclusive
+            start = i
+    for n, (first, last, d) in enumerate(runs):
+        sub = work / f'r{n:03d}'
+        sub.mkdir(exist_ok=True)
+        cmd = [GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={first}', f'-dLastPage={last}',
+               '-dNOPAUSE', '-dBATCH', '-dQUIET',
+               '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src_p)]
+        try:
+            rr, tries = _run_retry(lambda: _run_stalled(
+                cmd, lambda: len(list(sub.glob('p*.png'))), timeout, text=True))
+        except subprocess.TimeoutExpired:
+            raise            # a STALL must surface as such, not as a generic failure
+        except Exception:
+            return False
+        if tries > 1 and on_retry:
+            on_retry(tries - 1)
+        if rr is None or rr.returncode != 0:
+            return False
+        for k, f in enumerate(sorted(sub.glob('p*.png'))):   # renumber to global index
+            f.replace(work / f'p{first + k:04d}.png')
+        shutil.rmtree(sub, ignore_errors=True)
+    return True
+
+
 def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
-                    skip_pages: set, quality: int = 90) -> tuple:
+                    skip_pages: set) -> tuple:
     """Wrap OUR OWN page renders into a text-free PDF for OCR, returning (pdf, mapping).
 
     OCR must read the source pixels, never our lossy output — but it does NOT have to
@@ -744,18 +814,14 @@ def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
         if not src.exists():
             continue
         d = page_dpi.get(k, base_dpi)
-        jpg = work / f'ocrin_{k:05d}.jpg'
         try:
-            Image.open(src).convert('L').save(jpg, 'JPEG', quality=quality, dpi=(d, d))
             one = work / f'ocrin_{k:05d}.pdf'
             with open(one, 'wb') as f:
-                f.write(img2pdf.convert(str(jpg), dpi=d))
+                f.write(img2pdf.convert(str(src), dpi=d))   # lossless: no re-encode
             mapping[k] = len(pages)
             pages.append(one)
         except Exception:
             continue
-        finally:
-            jpg.unlink(missing_ok=True)
     if not pages:
         return None, {}
     out = work / 'ocr_input.pdf'
@@ -1488,6 +1554,14 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             'pages': pages, 'note': note, 'kept': kept, 'err': None}
 
 
+def _reader_page(pdf: Path, page_no: int):
+    """One page object (1-based), or None — for metadata-only checks."""
+    try:
+        return PdfReader(str(pdf)).pages[page_no - 1]
+    except Exception:
+        return None
+
+
 def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
                       min_size: int, photo_thresh: float, photo_dpi: int, jpeg_quality: int,
                       sauvola_k: float = 0.30,
@@ -1510,7 +1584,10 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
     comp = got = 0
     for p in idxs:
         png = sub / f'p{p}.png'
-        subprocess.run([GS, '-sDEVICE=pnggray', f'-r{dpi}', f'-dFirstPage={p}', f'-dLastPage={p}',
+        # colour, at the page's own resolution — the same render the real run uses, so the
+        # projection is measured on the same input and cannot disagree about colour
+        pd = _page_render_dpi(_reader_page(src_p, p), dpi)
+        subprocess.run([GS, '-sDEVICE=png16m', f'-r{pd}', f'-dFirstPage={p}', f'-dLastPage={p}',
                         '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(png), win_long(src_p)],
                        capture_output=True)
         if not png.exists():
@@ -1518,8 +1595,8 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
         got += 1
         pc = classify_page(png, p, src_p, sub, dpi, True, photo_thresh, photo_dpi)
         if pc.type in _PT_BITONAL:
-            binarize_png(png, min_size, despeckle, dpi, sauvola_k)
-            r = subprocess.run([JBIG, '-p', '-a', '-D', str(dpi), png.name], cwd=sub, capture_output=True)
+            binarize_png(png, min_size, despeckle, pd, sauvola_k)
+            r = subprocess.run([JBIG, '-p', '-a', '-D', str(pd), png.name], cwd=sub, capture_output=True)
             comp += len(r.stdout)
         elif pc.type in _PT_PASSTHROUGH:
             # colour line art / vector page is passed through losslessly -> charge ~its
@@ -1529,7 +1606,8 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
             comp += clseg.stat().st_size if clseg.exists() else 0
         else:
             d = photo_dpi or dpi
-            photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_descreen)
+            photo_seg_pdf(pc, sub / f'seg{p}.pdf', sub, p, d, jpeg_quality, photo_descreen,
+                          src_dpi=pd)
             # photo_seg_pdf writes photo{p}.jpg then a tiny PDF wrapper; size ~ the JPEG
             comp += (sub / f'photo{p}.jpg').stat().st_size
     shutil.rmtree(sub, ignore_errors=True)
@@ -1671,40 +1749,32 @@ def compress_one(src: str, dest: str, dpi: int,
                                  note0 + snote, timeout, in_place, already_ocred=did_ocr)
             res['action'] = 'kept_original'
             return res
-        # 1) render pages to grayscale PNG (batched at the base DPI). High-resolution
-        #    bitonal pages are RE-rendered per page at their native DPI further below, so
-        #    a 300/400-dpi scan is not downsampled to a fixed 200 (a visible quality loss)
-        #    while the common low-res pages don't bloat the file by being upsampled.
+        # 1) RENDER ONCE — in colour, at each page's own source resolution. Every check
+        #    below reads this one render, so nothing is judged on a degraded image and no
+        #    page is ever rendered twice. Downsampling, binarising and colour reduction
+        #    happen only in the final encode, where they are the point.
         render_src = src_p
         did_repair = False
         n_retry = [0]          # transient external-tool crashes that a retry recovered
 
         def _render():
-            # Ghostscript writes p0001.png, p0002.png ... as it goes, so the page count is
-            # a true progress signal: the run is killed only if it STALLS (no new page for
-            # `timeout` secs), never for merely taking long on a big file.
-            cmd = [GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-                   '-sOutputFile=' + str(work / 'p%04d.png'), win_long(render_src)]
-            rr, tries = _run_retry(lambda: _run_stalled(
-                cmd, lambda: len(list(work.glob('p*.png'))), timeout, text=True))
-            if tries > 1:
-                n_retry[0] += tries - 1
-            return rr
+            dpis = _page_render_dpis(render_src, dpi)
+            return _render_all(render_src, work, dpis, dpi, timeout,
+                               on_retry=lambda n: n_retry.__setitem__(0, n_retry[0] + n))
 
-        r = _render()
+        ok = _render()
         pngs = sorted(p.name for p in work.glob('p*.png'))
-        if r.returncode != 0 or not pngs:
-            # malformed PDF? try a Ghostscript pdfwrite rewrite, then render the repaired copy
+        if not ok or not pngs:
+            # malformed PDF? repair (qpdf first, then Ghostscript) and render the copy
             fixed = _repair_pdf(src_p, work, src_pages, timeout)
             if fixed:
                 render_src, did_repair = fixed, True
                 for old in work.glob('p*.png'):
                     old.unlink(missing_ok=True)
-                r = _render()
+                ok = _render()
                 pngs = sorted(p.name for p in work.glob('p*.png'))
-        if r.returncode != 0 or not pngs:
-            return {'src': src_p.name, 'orig': orig, 'new': 0,
-                    'err': f'render failed rc={r.returncode} {r.stderr[:200]}'}
+        if not ok or not pngs:
+            return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': 'render failed'}
         # A render that produced FEWER pages than the source is page loss, not success —
         # typically a corrupt PDF whose repair salvaged only part of it. Fail the file and
         # keep the original rather than silently shipping a truncated manual.
@@ -1713,6 +1783,7 @@ def compress_one(src: str, dest: str, dpi: int,
                     'err': f'page loss: source has {src_pages} page(s) but only '
                            f'{len(pngs)} rendered' + (' (after repair)' if did_repair else '')
                            + ' — original kept'}
+        page_dpi = {k: d for k, d in enumerate(_page_render_dpis(render_src, dpi))}
         comp = work / 'compressed.pdf'
         n_photo = 0
         n_color = 0
@@ -1755,18 +1826,8 @@ def compress_one(src: str, dest: str, dpi: int,
         n_photo = sum(c.type not in _PT_BITONAL and c.type not in _PT_PASSTHROUGH for c in classes)
         n_color = sum(c.type == PT_PHOTO_COLOR for c in classes)
 
-        # NATIVE-DPI: for BITONAL pages whose source scan is higher-res than the base
-        # render, re-render just that page at its native DPI so it isn't downsampled.
-        # Only the (usually few) high-res pages pay the extra render; the rest keep the
-        # fast batched render. Photos downsample on purpose; pass-through pages are copied.
-        page_dpi = {}
-        n_native = 0
-        for k, c in enumerate(classes):
-            if c.type in _PT_BITONAL:
-                pd = _page_render_dpi(_page_at(k), dpi)
-                if pd > dpi and _render_page_gray(render_src, k + 1, work / pngs[k], pd, timeout):
-                    page_dpi[k] = pd
-                    n_native += 1
+        # Pages already rendered at their own resolution by the single pass above.
+        n_native = sum(1 for k in range(len(pngs)) if page_dpi.get(k, dpi) > dpi)
         # Build the OCR input from the renders NOW: the bitonal pages are binarised in
         # place below, and OCR wants the grayscale version, not the 1-bit one.
         ocr_input = None
@@ -1806,7 +1867,8 @@ def compress_one(src: str, dest: str, dpi: int,
                     i += 1
                 else:  # PHOTO_GRAY / PHOTO_COLOR
                     seg = work / f's{i:05d}.pdf'
-                    photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality, photo_descreen)
+                    photo_seg_pdf(classes[i], seg, work, i + 1, d, jpeg_quality,
+                                  photo_descreen, src_dpi=page_dpi.get(i, dpi))
                     seg_pdfs.append(seg)
                     i += 1
         except RuntimeError as ex:

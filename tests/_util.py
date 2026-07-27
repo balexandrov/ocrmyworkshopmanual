@@ -56,9 +56,20 @@ def ocr_missing() -> str | None:
     return None
 
 
+def render_page(pdf: Path, page_no: int, dpi: int, out_png: Path) -> bool:
+    """Render one page in COLOUR at `dpi`, exactly as the pipeline does: one render at
+    source resolution feeds every check, so the tests must classify the same input."""
+    subprocess.run(
+        [owm.GS, '-sDEVICE=png16m', f'-r{dpi}',
+         f'-dFirstPage={page_no}', f'-dLastPage={page_no}',
+         '-dNOPAUSE', '-dBATCH', '-dQUIET',
+         '-sOutputFile=' + str(out_png), owm.win_long(pdf)],
+        capture_output=True)
+    return out_png.exists()
+
+
 def render_gray(pdf: Path, page_no: int, dpi: int, out_png: Path) -> bool:
-    """Render one page of `pdf` to a grayscale PNG via the same Ghostscript call
-    the pipeline uses. Returns True on success."""
+    """Render one page of `pdf` to a grayscale PNG (used by the binarisation tests)."""
     subprocess.run(
         [owm.GS, '-sDEVICE=pnggray', f'-r{dpi}',
          f'-dFirstPage={page_no}', f'-dLastPage={page_no}',
@@ -70,21 +81,22 @@ def render_gray(pdf: Path, page_no: int, dpi: int, out_png: Path) -> bool:
 
 def classify(pdf: Path, page_no: int, dpi: int, work: Path,
              photo_thresh: float = 0.02, photo_dpi: int = 150):
-    """Render page `page_no` gray, then run the production classify_page() on it.
-    Returns (PageType, signals_dict). signals are the cheap measurements the
-    router keys off, recorded so a human can sanity-check a fixture's label."""
+    """Render page `page_no` the way the pipeline does — colour, at the page's own source
+    resolution — then run the production classify_page() on it. Returns (PageType,
+    signals_dict); signals are the cheap measurements the router keys off, recorded so a
+    human can sanity-check a fixture's label."""
+    pd = owm._page_render_dpi(owm._reader_page(pdf, page_no), dpi)
     png = work / f'g{page_no}.png'
-    if not render_gray(pdf, page_no, dpi, png):
+    if not render_page(pdf, page_no, pd, png):
         return None, {}
     g = np.asarray(Image.open(png).convert('L'))
     signals = {
         'ink_frac': round(float((g < 100).mean()), 6),
-        'photo_cov': round(owm.photo_coverage(png, dpi), 4),
+        'photo_cov': round(owm.photo_coverage(g, pd), 4),
+        'render_dpi': pd,
     }
-    pc = owm.classify_page(png, page_no, pdf, work, dpi, True, photo_thresh, photo_dpi)
+    pc = owm.classify_page(png, page_no, pdf, work, pd, True, photo_thresh, photo_dpi)
     signals['type'] = pc.type
-    if pc.color_png:
-        pc.color_png.unlink(missing_ok=True)
     return pc.type, signals
 
 
