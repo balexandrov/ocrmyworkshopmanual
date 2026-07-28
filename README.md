@@ -135,7 +135,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4) |
-| `--language L` | `eng` | Tesseract language(s), e.g. `eng+fra+spa+deu`. Use `auto` to detect each file's script from the image (Tesseract OSD) and pick the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng` |
+| `--language L` | `auto` | Tesseract language(s). The default detects each file's script from the image (Tesseract OSD) and picks the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng`, CJK→`jpn+eng`. Pass an explicit spec to override, e.g. `eng+fra+spa+deu`; a source whose existing text layer proves another script still gets that pack added, because OCR'ing Cyrillic as English replaces real text with Latin noise |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px |

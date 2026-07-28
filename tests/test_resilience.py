@@ -720,3 +720,133 @@ def test_in_place_keeps_the_ocr_layer_when_not_compressing(tmp_path, monkeypatch
     assert res.get('err') is None, res
     chars = len((PdfReader(str(src)).pages[0].extract_text() or '').strip())
     assert chars > 100, f'in-place OCR layer was discarded ({chars} chars)'
+
+
+# ── Duplicate object definitions (a download that stitched in a repeated chunk) ───
+# The FSU fixture defines objects 626-665 TWICE (96032 bytes of duplication, exactly the
+# gap between its linearization /L and the real file size), each copy damaged in different
+# places. qpdf resolves duplicates by last-definition-wins and so picked corrupt copies:
+# a /Widths array with 221 entries for a 119-slot range (every heading glyph mis-advanced,
+# rendering "SECT I ON") and an unparseable footer Form XObject (footer gone from all 21
+# pages) — while the intact copies sat in the same file. Page count, link count and text
+# recall all passed on that output, which is why these assertions are structural.
+
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_dedupe_picks_the_sound_copy_of_each_duplicated_object():
+    """Not "prefer the xref copy" and not "prefer the last" — either rule gets half of
+    these wrong. 644/659 must come from copy 1 and 664 from copy 2."""
+    work = U.workdir()
+    try:
+        out, stats = U.owm._dedupe_objects(CORRUPT_FIXTURE, work)
+        assert out is not None, 'duplicates were not resolved'
+        assert stats['dup'] == 4, f'expected 4 differing duplicates, got {stats}'
+        assert set(stats['picked']) == {'644#1of2', '659#1of2', '664#2of2'}, stats['picked']
+        assert out.stat().st_size == CORRUPT_FIXTURE.stat().st_size, \
+            'the losing copy must be blanked in place so no byte offset shifts'
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_repair_keeps_the_footer_form_and_correct_font_metrics():
+    """The repaired file must keep what the pages still draw, with usable metrics."""
+    from pypdf import PdfReader
+    work = U.workdir()
+    try:
+        stats = {}
+        fixed = U.owm._repair_pdf(CORRUPT_FIXTURE, work, 21, 0, stats)
+        assert fixed is not None
+        page = PdfReader(str(fixed)).pages[0]
+        forms = {n: o for n, o in U.owm._xobjects(page.get_inherited('/Resources')).items()
+                 if o.get('/Subtype') == '/Form'}
+        assert '/Fm0' in forms, 'the footer Form XObject was dropped again'
+        assert [float(x) for x in forms['/Fm0'].get('/Matrix')] == [1, 0, 0, 1, 0, 0]
+        assert len(forms['/Fm0'].get_data()) == 139, 'footer stream is not the intact one'
+        assert U.owm._dangling_xobjects(page) == set()
+        assert U.owm._bad_font_widths(page) == []
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_audit_rejects_output_that_dropped_something_still_drawn():
+    """A plain qpdf rewrite (no duplicate resolution) drops /Fm0 while every page still
+    ends `q /GS1 gs /Fm0 Do Q`. Page count, links and recall all pass on it — the audit
+    must still refuse it, or the footer silently vanishes from 21 pages."""
+    import pikepdf
+    work = U.workdir()
+    try:
+        naive = work / 'naive.pdf'
+        with pikepdf.open(str(CORRUPT_FIXTURE)) as p:
+            p.save(str(naive))
+        fatal, _warn = U.owm._audit_output(naive, 21, CORRUPT_FIXTURE)
+        assert fatal, 'audit passed a file that dropped a drawn XObject'
+        assert 'Fm0' in fatal or 'font metrics' in fatal, fatal
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@pytest.mark.skipif(not CORRUPT_FIXTURE.exists(), reason='corrupt fixture missing')
+def test_one_unreadable_page_does_not_blank_the_whole_text_sample():
+    """`_sampled_text` used to wrap all six pages in one try: a single page whose content
+    stream cannot be decoded returned '' for the entire sample, which silently disabled the
+    text-survival check on the source side and faked 'searchable text lost' on the output
+    side. Page index 2 of this fixture raises while the other 20 extract fine."""
+    text, bad = U.owm._sampled_text(CORRUPT_FIXTURE, list(range(21)))
+    assert bad == {2}, f'expected exactly page index 2 to be unreadable, got {bad}'
+    assert len(text) == 20, f'the other 20 pages must still be returned, got {len(text)}'
+    assert sum(len(t) for t in text.values()) > 20000, 'text was lost with the bad page'
+
+
+# ── OCR language ─────────────────────────────────────────────────────────────────
+# --language defaulted to 'eng', so a 532-page Cyrillic Suzuki manual was re-OCR'd as
+# English: that does not read it worse, it REPLACES real text with Latin noise. It scored
+# word recall 0.00 against its own source and the audit had to discard the whole file.
+
+def test_text_script_needs_a_real_share_of_letters():
+    """A stray Cyrillic glyph in an English manual must not swing the verdict."""
+    assert U.owm._text_script('руководство по ремонту и обслуживанию автомобиля ' * 3) == 'Cyrillic'
+    assert U.owm._text_script('front suspension removal installation inspection ' * 3) == ''
+    assert U.owm._text_script('front suspension removal inspection disposal ' * 3 + 'абв') == ''
+    assert U.owm._text_script('абв') == '', 'too little text to judge'
+
+
+def test_language_guard_adds_the_script_its_text_layer_proves(monkeypatch, tmp_path):
+    """Whatever the language came from, a source whose existing text layer is Cyrillic must
+    get a Cyrillic pack added. OSD cannot cover this case: it reads rendered images, so it
+    ignores a text layer, and it falls back to 'eng' whenever no page clears its confidence
+    floor. The guard only ADDS, so an explicit --language is still honoured."""
+    pdf = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=2)
+    monkeypatch.setattr(U.owm, '_installed_langs', lambda: {'eng', 'rus', 'osd'})
+    monkeypatch.setattr(U.owm, '_sampled_text',
+                        lambda *a, **k: ({0: 'руководство по ремонту автомобиля ' * 4}, set()))
+    lang, note = U.owm._resolve_language(pdf, U.workdir(), 'eng', 0)
+    assert set(lang.split('+')) == {'eng', 'rus'}, lang
+    assert 'Cyrillic' in note, note
+
+
+def test_language_guard_leaves_a_latin_source_alone(monkeypatch, tmp_path):
+    """The inverse: an English text layer must not attract extra packs (slower, worse)."""
+    pdf = U.make_born_digital_pdf(tmp_path / 'src2.pdf', npages=2)
+    monkeypatch.setattr(U.owm, '_installed_langs', lambda: {'eng', 'rus', 'osd'})
+    lang, note = U.owm._resolve_language(pdf, U.workdir(), 'eng', 0)
+    assert lang == 'eng', lang
+    assert note == '', note
+
+
+def test_osd_never_votes_on_a_stale_render(tmp_path):
+    """`_detect_language` treated `png.exists()` as proof the render worked, so a leftover
+    file from an earlier call in the same work dir passed it and OSD voted on the WRONG
+    image — measured: a PDF Ghostscript cannot open at all was labelled Cyrillic from a
+    different manual's page. An unopenable file must yield the safe default."""
+    broken = tmp_path / 'broken.pdf'
+    broken.write_bytes(b'%PDF-1.4\nnot a pdf at all\n')
+    work = U.workdir()
+    try:
+        (work / 'osd_1.png').write_bytes((U.FIXTURES_DIR / 'stale.png').read_bytes()
+                                         if (U.FIXTURES_DIR / 'stale.png').exists()
+                                         else b'\x89PNG\r\n\x1a\n' + b'\x00' * 64)
+        assert U.owm._detect_language(broken, work, 0) == 'eng'
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

@@ -5,6 +5,92 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (a run whose console noise was hiding four ways to damage a file)
+
+A 61-file pass printed ~120 unattributed PDF-library warnings. Chasing them down found
+that the noise was mostly benign and the real defects were silent.
+
+- **Library warnings now name their file and reach the report.** Nothing configured
+  `logging`, so Python's `logging.lastResort` printed bare messages to stderr — no logger,
+  no level, no filename — from six worker processes sharing one unlocked stderr, while the
+  only per-file anchor on screen (`[n/61] name`) is printed at *completion* order. Warnings
+  were therefore unattributable in principle, and recorded nowhere: grepping a run log for
+  every message family returned 0. They are now captured per file in the worker (the pool
+  is processes, so the handler must live there), deduped with counts, and carried on the
+  result into the report `.log` and a new `warnings` CSV column. The console shows a compact
+  `[3 pdf warnings]` tag; `--verbose` echoes each one prefixed with its file.
+- **Repair silently preferred corrupt duplicates of an object.** A download that stitches a
+  repeated chunk into a file leaves two definitions of every object in that range, damaged
+  in *different* places, and qpdf resolves duplicates by last-definition-wins. Measured on a
+  real Nissan manual (objects 626–665 duplicated, 96,032 bytes — exactly the gap between its
+  linearization `/L` and the real file size): it chose a `/Widths` array with 221 entries for
+  a 119-slot range, mis-advancing every heading glyph so `SECTION` rendered as `SECT I ON`,
+  and an unparseable footer Form XObject, dropping the footer from all 21 pages — while the
+  intact copies sat in the same file. Duplicates are now scored and the sound copy kept
+  (neither "prefer the xref copy" nor "prefer the last" is right; each gets half of them
+  wrong), the losing copy is blanked in place so no byte offset shifts, and what repair did
+  is reported instead of vanishing.
+- **The audit could not see dropped content or broken metrics.** Page count, link count and
+  word recall all passed on that visibly wrong output. The audit now also fails a file whose
+  page still paints an XObject the output no longer defines (a dangling `Do`), and one whose
+  font `/Widths` contradicts its own `/FirstChar../LastChar`.
+- **One unreadable page no longer blanks the whole text sample.** `_sampled_text` wrapped six
+  pages in a single `try`, so a page whose content stream cannot be decoded returned `''` for
+  the entire sample — silently disabling the text-survival check on the source side and
+  faking `searchable text lost` on the output side, discarding a good file. Extraction is now
+  per page, and pages neither side can read are excluded from *both* word sets.
+- **Visible text nested in a Form XObject was invisible to the protection that exists for
+  it.** `_largest_image_dpi` recursed into Form XObjects; `_visible_text_chars` did not. A
+  producer that wraps a whole page in one form (measured on two iText Subaru manuals: page
+  stream 27 bytes, `q /Xf1 Do Q`, with all 42 text ops and every raster nested inside) read
+  as "full-page raster, no text" — a scan. One was rasterised to 39% and re-OCR'd, replacing
+  ~590 chars/page of publisher type with an OCR guess. Both detectors now recurse to the same
+  depth, and the hidden-text rule is evaluated within each stream so a 258 MB manual whose
+  text is painted under its scan still compresses.
+- **A born-digital file is no longer copied through without checking it opens.** That path
+  copies bytes, so a corrupt source was reproduced as a file rendering nothing — the trap the
+  OCR-only and kept-original paths were fixed for, which this one was missed by. It now
+  repairs first, or fails the file loudly.
+- **OSD could vote on a stale render.** `_detect_language` treated `png.exists()` as proof the
+  render worked, so a leftover file from an earlier call in the same work dir passed it:
+  measured, a PDF Ghostscript cannot open at all was labelled Cyrillic from a *different*
+  manual's page.
+
+### Changed
+
+- **`--language` now defaults to `auto`**, and whatever the language came from, a source whose
+  existing text layer proves another script gets that script's pack added. OCR'ing a Cyrillic
+  manual as English does not read it worse — it replaces real text with Latin noise: a
+  532-page Russian manual re-OCR'd as `eng` scored word recall 0.00 against its own source and
+  the audit had to discard the whole file.
+- **`looks_born_digital` is biased toward never damaging a file, not toward never skipping a
+  scan.** A page carrying real *visible* text is a text page even when it also carries a
+  full-page image. Visibility is judged by `_visible_text_chars`, never raw `extract_text()` —
+  a scanned page with an invisible OCR layer has thousands of extractable chars, and keying
+  off those would declare a genuinely scanned archive born-digital. Measured cost on a
+  54-file corpus: 3 files stop compressing, 0.5 MB of savings, one of which is a file that
+  should never have been rasterised in the first place.
+- The report gains a machine-readable `page types` column (`line=12 vector=3`), so the
+  classification that actually produced each output can be grouped on without regex-parsing
+  the English `note`. With a review corpus grouped into per-type subfolders, the tool's
+  existing per-folder rollup (`<report>_by_folder.csv`) becomes a per-type breakdown for free,
+  because `--dest` mirrors source subfolders.
+- **`verify_run.py` audits grouped corpora.** Pairs are matched by path relative to each tree
+  rather than by a flat glob, so `before/` and `after/` may be organised into subfolders as long
+  as they mirror each other; the report names each row by that relative path so its bucket is
+  visible. A flat corpus takes the identical code path.
+- `verify_run.py` no longer leaks pypdf warnings to stderr while auditing (a plain
+  `NullHandler`, deliberately not the tool's own capture helper — this auditor shares no code
+  with what it audits), and its summary percentage no longer misreports corpora under 1 MB: the
+  divide-by-zero guard `max(total, 1)` was applied to a MEGABYTE total, so two identical 68 KB
+  files were reported as "7%".
+- **Companion scripts moved to `helpers/`** — `verify_run.py` is now
+  `helpers/verify_run.py`. `ocrmyworkshopmanual.py` stays at the root with `scan_candidates.py`
+  and `combine_manual.py`, which are `[project.scripts]` console entry points and would need a
+  packaging change to move. Scripts under `helpers/` resolve `reports/` against the REPO ROOT,
+  not their own folder: the `/reports/` rule in `.gitignore` is root-anchored, so a
+  `helpers/reports/` would have started getting committed.
+
 ### Changed (OCR now reads the source, not our output)
 
 - **OCR runs on the ORIGINAL at full resolution, before compression.** Every

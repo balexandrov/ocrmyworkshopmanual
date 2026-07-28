@@ -67,7 +67,9 @@ Dependencies:
 import argparse
 import concurrent.futures as cf
 import csv
+import contextlib
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -113,6 +115,11 @@ _PT_PASSTHROUGH = (PT_COLOR_LINE, PT_VECTOR)  # types copied through from the so
 # A page whose largest raster image is below this effective DPI has no full-page scan
 # on it -> treat it as a born-digital/vector page and pass it through untouched.
 VECTOR_DPI_FLOOR = 50
+# How deep to follow nested Form XObjects when inspecting a page for images and for
+# visible text. Producers wrap whole pages in one Form (measured: iText-produced Subaru
+# manuals, page stream `q /Xf1 Do Q`), so both inspections must recurse — and to the SAME
+# depth, or they disagree about what is on the page.
+_FORM_MAX_DEPTH = 4
 # Cap for auto-raising the render DPI to a scan's native resolution (avoid huge foldouts).
 MAX_RENDER_DPI = 400
 
@@ -263,12 +270,15 @@ def _available_ocr_lang(lang: str) -> str:
 
 
 def _init_worker(ocr_jobs: int = 1):
-    """Worker start-up: run below normal priority and tell ocrmypdf how many threads it
-    may use in THIS process. The pool parallelises across files, so the budget is the
-    machine's cores divided among the workers — that keeps a short run (fewer files than
-    cores) from leaving most of the CPU idle."""
+    """Worker start-up: run below normal priority, tell ocrmypdf how many threads it may
+    use in THIS process, and capture library logging so it stops leaking to the shared
+    stderr. The pool parallelises across files, so the thread budget is the machine's cores
+    divided among the workers — that keeps a short run (fewer files than cores) from leaving
+    most of the CPU idle. The log capture must be installed HERE: the pool is processes, so
+    a handler attached in the parent cannot see a child's records."""
     global OCR_JOBS
     OCR_JOBS = max(1, int(ocr_jobs))
+    _install_lib_log_capture()
     set_below_normal_priority()
 
 
@@ -294,6 +304,84 @@ def _say(*a, **k):
         print(*a, **k)
     except (BrokenPipeError, OSError):
         pass
+
+
+# Library warnings are per-file evidence, so they are captured and reported against the
+# file — not left to leak. Caps keep one pathological PDF from bloating the report.
+_LIB_LOG_MAXLEN = 200
+_LIB_LOG_MAXN = 20
+
+
+class _LibLogCapture(logging.Handler):
+    """Collects WARNINGs from pypdf/pikepdf/PIL instead of letting them reach stderr."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.records = []
+
+    def emit(self, record):
+        try:
+            self.records.append((record.name, record.getMessage()))
+        except Exception:
+            pass
+
+
+_LIB_CAPTURE = None
+
+
+def _install_lib_log_capture():
+    """Attach the capture handler to the ROOT logger, once per process.
+
+    This is what stops the noise: with no handler anywhere, Python falls back to
+    `logging.lastResort`, a bare stderr StreamHandler whose format is just the message —
+    no logger name, no level, no file. Six worker processes inherit one stderr and write
+    to it unlocked, so those lines interleave across files and cannot be traced afterwards.
+    Attaching any root handler bypasses lastResort, and doing it on the root logger catches
+    pikepdf and PIL too, not only pypdf."""
+    global _LIB_CAPTURE
+    if _LIB_CAPTURE is None:
+        _LIB_CAPTURE = _LibLogCapture()
+        root = logging.getLogger()
+        root.addHandler(_LIB_CAPTURE)
+        if root.level == logging.NOTSET or root.level > logging.WARNING:
+            root.setLevel(logging.WARNING)
+    return _LIB_CAPTURE
+
+
+def _drain_lib_logs(label: str = '', verbose: bool = False) -> list:
+    """Empty the capture into a deduped `(logger, message, count)` tally."""
+    cap = _install_lib_log_capture()
+    counts = {}
+    for name, msg in cap.records:
+        key = (name, msg[:_LIB_LOG_MAXLEN])
+        counts[key] = counts.get(key, 0) + 1
+    cap.records.clear()
+    tally = []
+    for (name, msg), n in list(counts.items())[:_LIB_LOG_MAXN]:
+        tally.append((name, msg, n))
+        if verbose:
+            _say(f'      {label} | {name}: {msg}' + (f'  (x{n})' if n > 1 else ''))
+    return tally
+
+
+@contextlib.contextmanager
+def _lib_logs(label: str, verbose: bool = False):
+    """Capture library warnings raised while handling ONE file.
+
+    Yields a list that, on exit, holds `(logger, message, count)` deduped — ready to travel
+    back to the parent on the result dict, into the report CSV and the run log. With
+    `verbose` each one is also echoed to the console prefixed by the file it belongs to."""
+    _install_lib_log_capture().records.clear()
+    tally = []
+    try:
+        yield tally
+    finally:
+        tally.extend(_drain_lib_logs(label, verbose))
+
+
+def _warns_text(warns) -> str:
+    """One-cell rendering of a warning tally for the report CSV."""
+    return '; '.join(f'{n}x {name}: {msg}' for name, msg, n in (warns or []))
 
 
 def _sweep_stale_scratch(max_age_h: float = 6.0) -> None:
@@ -864,8 +952,7 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     fully decoupled. Mode matters: --redo-ocr upgrades a stale OCR layer, but on a
     VECTOR page it stacks OCR text on top of real text (measured: 1467 -> 2937 chars),
     so it is only used when the file has no vector pages."""
-    if language == 'auto':
-        language = _detect_language(src_p, work, timeout)
+    language, _lnote = _resolve_language(src_p, work, language, timeout)
     language = _available_ocr_lang(language)
     # Mode matters, and the harvestable place for the text is the /OCR-* Form XObject:
     #  --skip-text  skips any page carrying ANY text, so a page holding just a page number
@@ -903,40 +990,48 @@ _TEXT_SHOW = re.compile(rb"(?<![A-Za-z0-9])(Tj|TJ|'|\")(?![A-Za-z0-9])")
 _TR_MODE = re.compile(rb"(?<![\d.])(\d)\s+Tr(?![A-Za-z0-9])")
 
 
-def _visible_text_chars(page, min_chars: int = 100) -> int:
-    """Characters of REAL (visible) text on the page — 0 if its only text is an
-    invisible OCR layer.
-
-    This is the line between text we may destroy and text we may not. An OCR layer is
-    drawn in text-render mode 3 (invisible): rasterising the page loses nothing we
-    cannot regenerate by OCR'ing it again. Text drawn visibly is publisher content —
-    real vector type over a background scan — and rasterising it destroys the original
-    permanently (measured on a Toyota RAV4 manual: 731 chars of visible 6.5-15pt text
-    on pages that also carry a full-page image, so the DPI test alone called them scans).
-    Pages below `min_chars` are ignored so a bare page number does not veto compression."""
+def _xobjects(resources):
+    """{name: object} for the /XObject entries of a resource dict, or {} — resolved and
+    exception-proof, so callers can just iterate."""
     try:
-        data = page.get_contents().get_data()
+        xo = resources.get_object().get('/XObject')
+        if not xo:
+            return {}
+        xo = xo.get_object()
+        return {str(n): xo[n].get_object() for n in xo.keys()}
     except Exception:
-        return 0
+        return {}
+
+
+def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
+    """Is any VISIBLE text drawn by this content stream, or by a Form XObject it paints
+    on top of its own imagery?
+
+    Split out of `_visible_text_chars` so the same judgement can be applied one level
+    down. Producers routinely wrap an entire page in a single Form XObject — measured on
+    two Subaru manuals (iText) whose page stream is 27 bytes, `q /Xf1 Do Q`, with all 42
+    text ops and every raster nested inside `/Xf1`. Looking only at the page stream saw no
+    text at all and let real publisher type be rasterised and re-OCR'd."""
     if not data:
-        return 0
+        return False
+    xo = _xobjects(resources)
+    img_names = {n for n, o in xo.items() if o.get('/Subtype') == '/Image'}
+    forms = {n: o for n, o in xo.items() if o.get('/Subtype') == '/Form'}
     # Text painted BEFORE a full-page image is hidden underneath it — a searchable layer,
     # not something the reader sees. Verified on a Toyota RAV4 page: all 44 text ops
     # precede the image draw, and the rendered page is pixel-identical to the background
     # image alone. Judging by render mode alone wrongly called that "real text" and
-    # blocked compression of a 258 MB manual.
+    # blocked compression of a 258 MB manual. Ordering is only meaningful WITHIN one
+    # stream, so this is evaluated per stream and never across the nesting boundary.
     last_img = -1
-    try:
-        xo = page['/Resources']['/XObject'].get_object()
-        names = {str(n) for n, o in xo.items()
-                 if o.get_object().get('/Subtype') == '/Image'}
-        for m in re.finditer(rb'(/[A-Za-z0-9_.\-]+)\s+Do\b', data):
-            if m.group(1).decode('latin1', 'replace') in names:
-                last_img = max(last_img, m.start())
-    except Exception:
-        last_img = -1
+    form_calls = []
+    for m in re.finditer(rb'(/[A-Za-z0-9_.\-]+)\s+Do\b', data):
+        name = m.group(1).decode('latin1', 'replace')
+        if name in img_names:
+            last_img = max(last_img, m.start())
+        elif name in forms:
+            form_calls.append((m.start(), name))
     modes = [(m.start(), int(m.group(1))) for m in _TR_MODE.finditer(data)]
-    visible = False
     for show in _TEXT_SHOW.finditer(data):
         if show.start() < last_img:
             continue                          # covered by the scan painted over it
@@ -947,9 +1042,56 @@ def _visible_text_chars(page, min_chars: int = 100) -> int:
             else:
                 break
         if mode != 3:                         # mode 3 = invisible OCR layer
-            visible = True
-            break
-    if not visible:
+            return True
+    if depth >= _FORM_MAX_DEPTH:
+        return False
+    # Only recurse once this stream itself yielded nothing: the common (unwrapped) page
+    # returns above, so form streams are decompressed only for pages that would otherwise
+    # be judged text-free. Keeps the cost off the hot path on a 500-page manual.
+    for pos, name in form_calls:
+        if pos < last_img:
+            continue                          # this form is painted under a later scan
+        form = forms[name]
+        try:
+            sub_data = form.get_data()
+        except Exception:
+            continue
+        # A Form without its own /Resources inherits the parent's, or nested names
+        # (images, further forms) would not resolve.
+        sub_res = form.get('/Resources') or resources
+        if _stream_visible_text(sub_data, sub_res, depth + 1):
+            return True
+    return False
+
+
+def _visible_text_chars(page, min_chars: int = 100) -> int:
+    """Characters of REAL (visible) text on the page — 0 if its only text is an
+    invisible OCR layer.
+
+    This is the line between text we may destroy and text we may not. An OCR layer is
+    drawn in text-render mode 3 (invisible): rasterising the page loses nothing we
+    cannot regenerate by OCR'ing it again. Text drawn visibly is publisher content —
+    real vector type over a background scan — and rasterising it destroys the original
+    permanently (measured on a Toyota RAV4 manual: 731 chars of visible 6.5-15pt text
+    on pages that also carry a full-page image, so the DPI test alone called them scans).
+    Pages below `min_chars` are ignored so a bare page number does not veto compression.
+
+    The visibility test runs over the page stream AND any Form XObject it draws (see
+    `_stream_visible_text`); `extract_text()` already recurses, so the `min_chars` floor
+    keeps a bare page number inside a wrapper from vetoing compression."""
+    try:
+        data = page.get_contents().get_data()
+    except Exception:
+        return 0
+    if not data:
+        return 0
+    try:
+        res = page.get_inherited('/Resources')
+    except Exception:
+        res = None
+    if res is None:
+        res = page.get('/Resources')
+    if not _stream_visible_text(data, res):
         return 0
     try:
         n = len((page.extract_text() or '').strip())
@@ -1106,7 +1248,7 @@ def _largest_image_dpi(page) -> float:
 
     def walk(res, depth=0):
         nonlocal largest
-        if not res or depth > 4:
+        if not res or depth > _FORM_MAX_DEPTH:
             return
         try:
             xo = res.get_object().get('/XObject')
@@ -1135,14 +1277,19 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
     """SAFETY heuristic: is this a born-digital (vector/text) PDF rather than a scan?
     A scanned page is dominated by a full-page raster image; a born-digital page is
     text/vector with at most small images. We sample pages and count 'scan pages'
-    (those carrying a full-page image, DPI-equiv >= dpi_floor). The file is called
-    born-digital when the scan-page fraction is below `scan_fraction`.
+    (those carrying a full-page image, DPI-equiv >= dpi_floor AND no real visible text).
+    The file is called born-digital when the scan-page fraction is below `scan_fraction`.
 
-    Deliberately conservative toward NEVER skipping a real scan: a genuine scanned
-    archive has a full-page image on ~every page (scan_frac ~1.0), while a born-
-    digital file has ~none (scan_frac ~0.0), so the two separate cleanly and ties
-    fall to 'scanned'. An all-raster 'image PDF' (e.g. images exported to PDF) reads
-    as scanned and is compressed — only genuine vector/text content is protected.
+    Biased toward NEVER DAMAGING a file, not toward never skipping a scan: rasterising
+    vector type is damage, while failing to compress a scan only costs savings. So a page
+    carrying real VISIBLE text is a text page even when it also carries a full-page image
+    — measured on two iText-produced Subaru manuals whose every page has both, where
+    counting them as scans rasterised ~1000 chars/page of publisher type and re-OCR'd it.
+    Visibility is judged by `_visible_text_chars`, never by raw `extract_text()`: a scanned
+    page with an invisible mode-3 OCR layer has thousands of extractable chars, and keying
+    off those would declare a genuinely scanned archive born-digital and skip it entirely.
+    An all-raster 'image PDF' (images exported to PDF, no text) still reads as scanned and
+    is compressed.
     Returns (is_born_digital, signals_dict) — signals go to the run log for review."""
     sig = {'sampled': 0, 'scan_pages': 0, 'text_pages': 0, 'scan_frac': 0.0, 'chars': 0}
     try:
@@ -1168,7 +1315,14 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
         except Exception:
             nchars = 0
         sig['chars'] += nchars
-        if _largest_image_dpi(page) >= dpi_floor:
+        # Real visible text wins over the presence of a big image: a page can legitimately
+        # be both (publisher type plus a photo figure), and rasterising it would destroy
+        # the type. `_visible_text_chars` discounts an invisible OCR layer, so a true scan
+        # is unaffected and still counts as a scan page.
+        visible = _visible_text_chars(page, min_chars)
+        if visible >= min_chars:
+            text += 1
+        elif _largest_image_dpi(page) >= dpi_floor:
             scan += 1
         elif nchars >= min_chars:
             text += 1
@@ -1262,7 +1416,114 @@ def _run_retry(fn, attempts: int = 3, backoff: float = 2.0):
     return last, attempts
 
 
-def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0):
+_OBJ_HEADER = re.compile(rb'(?:^|[\r\n>\s])(\d+)\s+(\d+)\s+obj\b')
+
+
+def _object_spans(data: bytes) -> dict:
+    """{(num, gen): [(start, end), ...]} for every object definition in the raw bytes.
+
+    A span runs from its `N G obj` header to the last `endobj` before the NEXT header, so
+    it still covers an object whose middle has been overwritten by foreign bytes."""
+    heads = [(m.start(1), int(m.group(1)), int(m.group(2)))
+             for m in _OBJ_HEADER.finditer(data)]
+    spans = {}
+    for i, (start, num, gen) in enumerate(heads):
+        limit = heads[i + 1][0] if i + 1 < len(heads) else len(data)
+        e = data.rfind(b'endobj', start, limit)
+        spans.setdefault((num, gen), []).append((start, (e + 6) if e >= 0 else limit))
+    return spans
+
+
+def _object_soundness(blob: bytes) -> int:
+    """Score how intact one `N G obj … endobj` blob looks; higher is better, <= 0 is damaged.
+
+    These are the checks that actually caught real damage in a stitched download:
+    a dictionary that does not close, binary garbage spliced into the dictionary, a
+    /Widths array whose length contradicts its own /FirstChar../LastChar range, and a
+    stream that is truncated or cannot inflate."""
+    head = blob.split(b'stream', 1)[0]
+    if head.count(b'<<') != head.count(b'>>') or head.count(b'[') != head.count(b']'):
+        return -1                                # dictionary does not close
+    if any(b < 9 or 13 < b < 32 for b in head):
+        return -1                                # binary spliced into the dictionary
+    score = 1
+    fc = re.search(rb'/FirstChar\s+(\d+)', head)
+    lc = re.search(rb'/LastChar\s+(\d+)', head)
+    wm = re.search(rb'/Widths\s*\[([^\]]*)\]', head, re.S)
+    if fc and lc and wm:
+        want = int(lc.group(1)) - int(fc.group(1)) + 1
+        if len(re.findall(rb'-?\d+\.?\d*', wm.group(1))) != want:
+            return -1                            # metrics contradict their own range
+        score += 1
+    if b'stream' in blob:
+        if b'endstream' not in blob:
+            return -1                            # truncated stream
+        score += 1
+        lm = re.search(rb'/Length\s+(\d+)\s*[^0-9R]', head)
+        if lm and b'/FlateDecode' in head:
+            body = blob.split(b'stream', 1)[1].lstrip(b'\r\n')[:int(lm.group(1))]
+            try:
+                import zlib
+                zlib.decompress(body)
+                score += 1
+            except Exception:
+                return -1
+    return score
+
+
+def _dedupe_objects(src_p: Path, work: Path):
+    """Resolve DUPLICATE object definitions in a damaged PDF before qpdf ever sees it.
+
+    A download that stitches a repeated chunk into a file leaves two definitions of every
+    object in that range, damaged in DIFFERENT places. qpdf resolves duplicates by
+    last-definition-wins, so it silently picks corrupt copies. Measured on a Nissan FSU
+    manual: objects 626-665 are each defined twice (96032 bytes of duplication, exactly the
+    gap between the linearization dict's /L and the real file size); qpdf chose a /Widths
+    array with 221 entries for a 119-slot range — mis-advancing every heading glyph — and an
+    unparseable footer Form XObject, dropping the footer from all 21 pages, while the intact
+    copies sat in the same file. Blanking the damaged copy (with spaces, same byte length,
+    so no offset anywhere in the file shifts) leaves qpdf a file it reconstructs correctly.
+
+    Duplicate object numbers are LEGAL in a valid PDF (incremental update), where
+    last-wins is right. This only ever runs from `_repair_pdf`, i.e. on a file that already
+    failed to open, and only acts where the copies differ AND exactly one scores best — so
+    a genuine incremental update is left alone. Returns (Path|None, stats)."""
+    stats = {'dup': 0, 'resolved': 0, 'picked': []}
+    try:
+        data = src_p.read_bytes()
+    except Exception:
+        return None, stats
+    edits = []
+    for (num, _gen), places in _object_spans(data).items():
+        if len(places) < 2:
+            continue
+        blobs = [data[a:b] for a, b in places]
+        if len(set(blobs)) == 1:
+            continue                             # identical copies -> nothing to choose
+        stats['dup'] += 1
+        scores = [_object_soundness(x) for x in blobs]
+        best = max(scores)
+        if best <= 0 or scores.count(best) != 1:
+            continue                             # cannot tell them apart -> leave to qpdf
+        keep = scores.index(best)
+        edits += [places[i] for i in range(len(places)) if i != keep]
+        stats['resolved'] += 1
+        stats['picked'].append(f'{num}#{keep + 1}of{len(places)}')
+    if not edits:
+        return None, stats
+    out = bytearray(data)
+    for a, b in edits:
+        out[a:b] = b' ' * (b - a)                # same length: nothing in the file shifts
+    dst = work / 'deduped.pdf'
+    try:
+        dst.write_bytes(bytes(out))
+    except Exception:
+        return None, stats
+    return dst, stats
+
+
+def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0,
+                stats: dict = None):
     """Try to repair a malformed/corrupt PDF. qpdf FIRST, Ghostscript second.
 
     They fail differently and qpdf is far better at this: on a real corrupt manual
@@ -1270,10 +1531,21 @@ def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0
     salvaged 1 of 21 pages while qpdf recovered all 21 perfectly. Preferring GS therefore
     turned a fully recoverable file into a lost one. A repair that returns FEWER pages
     than the source is rejected outright — a truncated 'repair' is worse than none.
+
+    Duplicate object definitions are resolved FIRST (see `_dedupe_objects`), because qpdf's
+    last-definition-wins silently prefers corrupt copies when a file contains a stitched-in
+    duplicate of part of itself. `stats`, if given, is filled with what happened so the
+    caller can report it instead of dropping content silently.
     Returns the repaired Path, else None."""
-    for name, fn in (('qpdf', _qpdf_repair), ('gs', _gs_repair)):
+    src = src_p
+    fixed, dstats = _dedupe_objects(src_p, work)
+    if stats is not None:
+        stats.update(dstats)
+    if fixed is not None:
+        src = fixed
+    for _name, fn in (('qpdf', _qpdf_repair), ('gs', _gs_repair)):
         try:
-            out = fn(src_p, work, timeout)
+            out = fn(src, work, timeout)
         except Exception:
             out = None
         if not out or not out.exists() or out.stat().st_size == 0:
@@ -1284,8 +1556,39 @@ def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0
                     continue                     # partial salvage -> keep looking
             except Exception:
                 continue
+        if stats is not None:
+            stats['objects'] = _object_count(src_p)
+            stats['objects_out'] = _object_count(out)
         return out
     return None
+
+
+def _object_count(pdf: Path) -> int:
+    """Number of objects pikepdf can see in a PDF, or -1. Used to report whether a repair
+    dropped content rather than letting it vanish silently."""
+    try:
+        import pikepdf
+        with pikepdf.open(str(pdf)) as p:
+            return len(p.objects)
+    except Exception:
+        return -1
+
+
+def _repair_note(stats: dict) -> str:
+    """What the repair actually DID, for the per-file note and the report CSV.
+
+    A repair used to report only that it happened, while quietly dropping objects — on the
+    Nissan FSU manual it discarded a Form XObject drawn on all 21 pages and nobody could
+    tell from the log. The object delta alone is a noisy signal (qpdf legitimately inlines
+    indirect /Length objects, so a clean repair still shows a drop), which is why the real
+    gate is the dangling-reference check in `_audit_output`; this is the audit trail."""
+    bits = []
+    if stats.get('dup'):
+        bits.append(f"{stats['dup']} duplicate object(s), {stats.get('resolved', 0)} resolved")
+    before, after = stats.get('objects', -1), stats.get('objects_out', -1)
+    if before > 0 and after > 0 and after != before:
+        bits.append(f'objects {before}->{after}')
+    return ' (repaired malformed PDF' + (': ' + '; '.join(bits) if bits else '') + ')'
 
 
 def _renders_ok(pdf: Path, timeout: int = 0) -> bool:
@@ -1336,13 +1639,82 @@ def _words(t: str) -> list:
     return re.findall(r'[^\W\d_]{3,}', (t or '').lower())
 
 
-def _sampled_text(pdf: Path, idxs) -> str:
+def _sampled_text(pdf: Path, idxs) -> tuple:
+    """({page_index: text}, {unreadable page indexes}) for the sampled pages.
+
+    Per-page, deliberately: a single page whose content stream cannot be decoded used to
+    abort the whole sample and return ''. That silently disabled the text-survival check
+    when it happened on the source side (too few words to compare), and produced a FALSE
+    'searchable text lost' when it happened on the output side, throwing away a good file.
+    Real case: page index 2 of a Nissan FSU manual raises PdfReadError while the other 20
+    pages extract fine."""
+    out, bad = {}, set()
     try:
         r = PdfReader(str(pdf))
-        return '\n'.join((r.pages[i].extract_text() or '') for i in idxs
-                         if 0 <= i < len(r.pages))
+        n = len(r.pages)
     except Exception:
-        return ''
+        return {}, set(idxs)
+    for i in idxs:
+        if not (0 <= i < n):
+            continue
+        try:
+            out[i] = r.pages[i].extract_text() or ''
+        except Exception:
+            bad.add(i)
+    return out, bad
+
+
+def _dangling_xobjects(page) -> set:
+    """Names a page's content stream paints with `Do` that its resources do not define.
+
+    A repair or rebuild that drops an XObject leaves the content stream still invoking it.
+    Nothing else in the audit can see that: page count, links and text recall all pass while
+    the page is missing whatever the object drew. Measured on a Nissan FSU manual whose
+    repaired output kept `q /GS1 gs /Fm0 Do Q` on all 21 pages after /Fm0 was discarded,
+    silently removing the footer."""
+    try:
+        data = page.get_contents().get_data()
+    except Exception:
+        return set()
+    if not data:
+        return set()
+    try:
+        res = page.get_inherited('/Resources')
+    except Exception:
+        res = None
+    if res is None:
+        res = page.get('/Resources')
+    have = set(_xobjects(res))
+    used = {m.group(1).decode('latin1', 'replace')
+            for m in re.finditer(rb'(/[A-Za-z0-9_.\-]+)\s+Do\b', data)}
+    return used - have
+
+
+def _bad_font_widths(page) -> list:
+    """Fonts on this page whose /Widths length contradicts /FirstChar../LastChar.
+
+    Wrong glyph advances are invisible to every size- or count-based check but wreck the
+    page: measured on a Nissan FSU manual where a repair picked a duplicate Helvetica-Bold
+    dict carrying 221 widths for a 119-slot range, so headings rendered as `SECT I ON`."""
+    out = []
+    try:
+        res = page.get_inherited('/Resources') or page.get('/Resources')
+        fonts = res.get_object().get('/Font')
+        fonts = fonts.get_object() if fonts else {}
+    except Exception:
+        return out
+    for name in list(fonts.keys()):
+        try:
+            f = fonts[name].get_object()
+            w, fc, lc = f.get('/Widths'), f.get('/FirstChar'), f.get('/LastChar')
+            if w is None or fc is None or lc is None:
+                continue
+            want = int(lc) - int(fc) + 1
+            if len(w.get_object()) != want:
+                out.append(f'{name} {len(w.get_object())}!={want}')
+        except Exception:
+            continue
+    return out
 
 
 def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
@@ -1359,6 +1731,10 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
       * opens, and has exactly the source's page count       -> fatal
       * a page classified as COLOUR is not 1-bit in the output -> fatal (the failure that
         silently destroyed colour wiring diagrams archive-wide)
+      * nothing the content stream still paints has been dropped (`Do` on an XObject the
+        resources no longer define)                           -> fatal
+      * font /Widths arrays match their own /FirstChar../LastChar range — wrong advances
+        wreck a page while every count-based check passes     -> fatal
       * searchable text survives, by WORD RECALL on sampled pages, not character count
         (a legitimate re-OCR differs in character count)      -> fatal below 50%
       * link annotations and bookmarks are not fewer          -> warning
@@ -1382,18 +1758,41 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
                     return f'colour page {i + 1} was binarised to 1-bit', ''
         except Exception:
             pass
+    idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
+    # nothing still painted may have been dropped, and glyph metrics must be self-consistent
+    for i in idxs:
+        try:
+            page = r.pages[i]
+        except Exception:
+            continue
+        missing = _dangling_xobjects(page)
+        if missing:
+            return (f'page {i + 1} still draws {", ".join(sorted(missing))} but the output '
+                    f'no longer defines it (content dropped)'), ''
+        bad_w = _bad_font_widths(page)
+        if bad_w:
+            return f'page {i + 1} has broken font metrics: {", ".join(bad_w)}', ''
     if src_p is None or not src_p.exists():
         return None, ''
-    # text must survive
-    idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
-    wb = Counter(_words(_sampled_text(src_p, idxs)))
-    if sum(wb.values()) >= 50:
-        wa = Counter(_words(_sampled_text(out_p, idxs)))
+    # text must survive. Pages neither side could read are excluded from BOTH word sets, so
+    # one undecodable page can neither blind the check nor fake a loss.
+    tb, bad_b = _sampled_text(src_p, idxs)
+    ta, bad_a = _sampled_text(out_p, idxs)
+    skip = bad_b | bad_a
+    usable = [i for i in idxs if i not in skip]
+    wb = Counter(_words('\n'.join(tb.get(i, '') for i in usable)))
+    if not usable:
+        warn.append(f'text check skipped: none of the {len(idxs)} sampled pages could be read')
+    elif sum(wb.values()) >= 50:
+        wa = Counter(_words('\n'.join(ta.get(i, '') for i in usable)))
         recall = sum(min(n, wa[w]) for w, n in wb.items()) / sum(wb.values())
+        excl = f' ({len(skip)} of {len(idxs)} pages unreadable, excluded)' if skip else ''
         if recall < 0.5:
-            return f'searchable text lost (word recall {recall:.2f})', ''
+            return f'searchable text lost (word recall {recall:.2f}){excl}', ''
         if recall < 0.8:
-            warn.append(f'text recall {recall:.2f}')
+            warn.append(f'text recall {recall:.2f}{excl}')
+        elif skip:
+            warn.append(f'text recall {recall:.2f}{excl}')
     # structure should not shrink
     try:
         s = PdfReader(str(src_p))
@@ -1455,11 +1854,17 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
     for pageno in idxs:
         png = work / f'osd_{pageno}.png'
         try:
+            # Clear any earlier render FIRST: `png.exists()` is the only check that the
+            # render worked, and a stale file left by a previous call in the same work dir
+            # would silently pass it — OSD would then vote on the wrong image. Measured: a
+            # corrupt PDF that Ghostscript cannot open at all was labelled Cyrillic from a
+            # leftover page of a different manual.
+            png.unlink(missing_ok=True)
             subprocess.run([GS, '-sDEVICE=pnggray', '-r200', '-dNOPAUSE', '-dBATCH',
                             '-dQUIET', f'-dFirstPage={pageno}', f'-dLastPage={pageno}',
                             '-sOutputFile=' + str(png), win_long(pdf)],
                            capture_output=True, timeout=timeout or 120)
-            if not png.exists():
+            if not png.exists() or png.stat().st_size == 0:
                 continue
             r = subprocess.run([TESS, str(png), 'stdout', '--psm', '0'],
                                capture_output=True, text=True, timeout=timeout or 120)
@@ -1484,6 +1889,69 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
     return _available_ocr_lang(_SCRIPT_LANG.get(max(scores, key=scores.get), 'eng'))
 
 
+# Script -> the Unicode ranges that prove it, for the text-layer guard below.
+_SCRIPT_RANGES = {
+    'Cyrillic': ((0x0400, 0x052F),),
+    'Japanese': ((0x3040, 0x30FF), (0x4E00, 0x9FFF), (0xFF66, 0xFF9D)),
+}
+
+
+def _text_script(text: str, floor: float = 0.20) -> str:
+    """Which non-Latin script dominates this text, or '' — by share of its LETTERS.
+
+    Used to cross-check the OCR language against a text layer the source already has.
+    Needs a real share (default 20%) so a stray Cyrillic glyph in an English manual, or a
+    trademark sign, cannot swing the verdict."""
+    letters = [c for c in (text or '') if c.isalpha()]
+    if len(letters) < 50:
+        return ''
+    for script, ranges in _SCRIPT_RANGES.items():
+        n = sum(1 for c in letters if any(lo <= ord(c) <= hi for lo, hi in ranges))
+        if n / len(letters) >= floor:
+            return script
+    return ''
+
+
+def _resolve_language(src_p: Path, work: Path, language: str, timeout: int = 0) -> tuple:
+    """(language, note) — settle the OCR language for one file, and say so in the note.
+
+    Two independent sources, because either alone gets it wrong:
+      * 'auto' -> `_detect_language`, Tesseract OSD over rendered sample pages. It reads
+        images, so it works on an image-only scan — but it returns 'eng' whenever no page
+        clears MIN_OSD_SCRIPT_CONF, and it cannot see a text layer that already proves the
+        script.
+      * a GUARD on the source's existing text layer, applied however the language was
+        chosen. OCR'ing a Cyrillic manual as English does not merely read it worse: it
+        replaces real text with Latin noise. Measured on a 532-page Suzuki Vitara manual
+        whose every sampled page is Cyrillic — re-OCR'd as 'eng' it scored word recall 0.00
+        against its own source and the audit had to throw the whole file away.
+    The guard only ever ADDS the script's pack (filtered to what is installed), so an
+    explicit --language is honoured for everything it can actually cover."""
+    note = ''
+    if language == 'auto':
+        language = _detect_language(src_p, work, timeout)
+        note = f' (lang:{language} auto)'
+    try:
+        n = len(PdfReader(str(src_p)).pages)
+    except Exception:
+        n = 0
+    if not n:
+        return language, note
+    idxs = sorted({round(i * (n - 1) / 3) for i in range(min(4, n))})
+    text, _bad = _sampled_text(src_p, idxs)
+    script = _text_script('\n'.join(text.values()))
+    if not script:
+        return language, note
+    want = _available_ocr_lang(_SCRIPT_LANG.get(script, 'eng'))
+    have = set(language.split('+'))
+    missing = [p for p in want.split('+') if p not in have]
+    if missing:
+        language = '+'.join(list(dict.fromkeys(language.split('+') + missing)))
+        note = (f' (lang:{language} — source text layer is {script}, '
+                f'requested language lacked it)')
+    return language, note
+
+
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
                    timeout: int = 0, in_place: bool = False, colour_pages=None,
@@ -1500,12 +1968,11 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         if has_text(base):
             note += ' (had text, OCR skipped)'
         else:
-            if language == 'auto':
-                language = _detect_language(base, work, timeout)
+            language, lnote = _resolve_language(base, work, language, timeout)
             # filter to installed packs so a missing pack degrades to eng/available
             # rather than erroring OCR out and leaving the file with no text at all.
             language = _available_ocr_lang(language)
-            note += f' (lang:{language})'
+            note += lnote or f' (lang:{language})'
             ocr_pdf = work / 'ocr.pdf'
             # NO timeout on OCR: ocrmypdf emits no usable progress signal (measured: it is
             # silent for ~90% of a run), so any wall-clock bound would just kill healthy
@@ -1648,9 +2115,10 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
     # never pass a BROKEN file through: this path copies bytes, so a corrupt PDF would be
     # faithfully reproduced as a file that opens nowhere.
     if not _renders_ok(base, timeout):
-        fixed = _repair_pdf(base, work, src_pages, timeout)
+        rstats = {}
+        fixed = _repair_pdf(base, work, src_pages, timeout, rstats)
         if fixed and _renders_ok(fixed, timeout):
-            base, note = fixed, note + ' (repaired malformed PDF)'
+            base, note = fixed, note + _repair_note(rstats)
         else:
             return None, language, note, False, ('unreadable PDF: renders no pages and '
                                                  'repair failed — original kept')
@@ -1666,14 +2134,27 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
     return base, language, note, did_ocr, None
 
 
-def compress_one(src: str, dest: str, dpi: int,
-                 despeckle: bool = True, min_size: int = 10,
-                 ocr: bool = True, language: str = 'eng',
-                 photo_thresh: float = 0.02,
-                 photo_dpi: int = 150, jpeg_quality: int = 60,
-                 min_savings: float = 0.25,
-                 sauvola_k: float = 0.30, photo_descreen: float = 0.6,
-                 timeout: int = 0, in_place: bool = False) -> dict:
+def compress_one(src: str, dest: str, *a, verbose: bool = False, **kw) -> dict:
+    """Run `_compress_one` with library logging captured and attached to THIS file's result.
+
+    A thin wrapper rather than in-body plumbing because the work has many return paths and
+    every one of them must carry the warnings. Without this the warnings reach stderr
+    unprefixed from six concurrent processes and cannot afterwards be tied to a file."""
+    with _lib_logs(Path(src).name, verbose) as warns:
+        res = _compress_one(src, dest, *a, **kw)
+    if isinstance(res, dict) and warns:
+        res['warns'] = warns
+    return res
+
+
+def _compress_one(src: str, dest: str, dpi: int,
+                  despeckle: bool = True, min_size: int = 10,
+                  ocr: bool = True, language: str = 'auto',
+                  photo_thresh: float = 0.02,
+                  photo_dpi: int = 150, jpeg_quality: int = 60,
+                  min_savings: float = 0.25,
+                  sauvola_k: float = 0.30, photo_descreen: float = 0.6,
+                  timeout: int = 0, in_place: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -1711,21 +2192,42 @@ def compress_one(src: str, dest: str, dpi: int,
         # not something a run should ever need to disable.
         born, bsig = looks_born_digital(src_p)
         if born:
+            # Born-digital does not mean readable. This path copies BYTES, so a corrupt
+            # source would be reproduced as a file that opens nowhere — the same trap the
+            # OCR-only and kept-original paths were fixed for, which this one was missed by.
+            # Repair it instead of propagating it; if it cannot be repaired, fail the file
+            # loudly rather than shipping a copy that renders nothing.
+            copy_from, rnote = src_p, ''
+            if not _renders_ok(src_p, timeout):
+                rstats = {}
+                fixed = _repair_pdf(src_p, work, src_pages, timeout, rstats)
+                if not (fixed and _renders_ok(fixed, timeout)):
+                    return {'src': src_p.name, 'orig': orig, 'new': 0,
+                            'err': 'unreadable born-digital PDF: renders no pages and repair '
+                                   'failed — original kept'}
+                if in_place:
+                    # Rewriting a user's original in place is out of scope for this path;
+                    # report it so the corruption is visible instead of silently left.
+                    return {'src': src_p.name, 'orig': orig, 'new': 0,
+                            'err': 'born-digital PDF is corrupt (repairable): re-run with '
+                                   '--dest to write the repaired copy'}
+                copy_from, rnote = fixed, _repair_note(rstats)
             if not in_place:   # in-place: leave the original vector PDF exactly as-is
                 dest_p.parent.mkdir(parents=True, exist_ok=True)
                 tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
                 try:
-                    shutil.copyfile(str(src_p), str(tmp_out))
+                    shutil.copyfile(str(copy_from), str(tmp_out))
                     os.replace(str(tmp_out), str(dest_p))
                 except Exception:
                     tmp_out.unlink(missing_ok=True)
                     raise
-            where = 'left untouched' if in_place else 'copied untouched'
+            where = 'left untouched' if in_place else ('repaired and copied' if rnote
+                                                       else 'copied untouched')
             return {'src': src_p.name, 'orig': orig,
                     'new': orig if in_place else dest_p.stat().st_size,
                     'pages': bsig.get('sampled'), 'kept': True, 'err': None,
                     'action': 'born_digital', 'signals': bsig,
-                    'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'}
+                    'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})' + rnote}
         note0 = ''
         skip_compression = False
         # Cheap pre-check: sample-compress a few pages; if it won't beat the original,
@@ -1755,6 +2257,7 @@ def compress_one(src: str, dest: str, dpi: int,
         #    happen only in the final encode, where they are the point.
         render_src = src_p
         did_repair = False
+        repair_stats = {}      # what the repair resolved/dropped, for the per-file note
         n_retry = [0]          # transient external-tool crashes that a retry recovered
 
         def _render():
@@ -1766,7 +2269,7 @@ def compress_one(src: str, dest: str, dpi: int,
         pngs = sorted(p.name for p in work.glob('p*.png'))
         if not ok or not pngs:
             # malformed PDF? repair (qpdf first, then Ghostscript) and render the copy
-            fixed = _repair_pdf(src_p, work, src_pages, timeout)
+            fixed = _repair_pdf(src_p, work, src_pages, timeout, repair_stats)
             if fixed:
                 render_src, did_repair = fixed, True
                 for old in work.glob('p*.png'):
@@ -1924,13 +2427,20 @@ def compress_one(src: str, dest: str, dpi: int,
             if err:
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             ocr_note = snote
-            n_photo = n_color = n_color_line = n_vector = n_native = 0
+            # Keep the page-type counts: on a KEPT file they are the only explanation of
+            # WHY nothing was compressed (e.g. "every page is vector/real-text"), which is
+            # exactly when a reviewer needs them. Only the photo split is dropped, since
+            # no photo re-encode happened.
+            n_photo = n_color = 0
         else:
             base = comp
 
         # 4) build the per-file note, then OCR (only if no text) + place into dest.
         if kept_original:
             note = ' (kept original — compression not worthwhile)'
+            if n_vector or n_color_line:
+                why = ([f'{n_vector} vector/real-text pg'] if n_vector else []) +                       ([f'{n_color_line} colour line-art pg'] if n_color_line else [])
+                note += f' [{", ".join(why)} of {len(pngs)} passed through]'
         elif n_photo:
             gray = n_photo - n_color
             bits = ([f'{gray} gray'] if gray else []) + ([f'{n_color} color'] if n_color else [])
@@ -1948,7 +2458,7 @@ def compress_one(src: str, dest: str, dpi: int,
         if n_retry[0]:
             note += f' (render retried x{n_retry[0]})'
         if did_repair:
-            note += ' (repaired malformed PDF)'
+            note += _repair_note(repair_stats)
         note += ocr_note
         # OCR already ran on the source above and its layer was grafted on, so the place
         # step must NOT re-run it against our compressed images.
@@ -1960,6 +2470,9 @@ def compress_one(src: str, dest: str, dpi: int,
                              already_ocred=(kept_ocred if kept_original else True),
                              was_repaired=did_repair)
         res['action'] = 'kept_original' if kept_original else 'compressed'
+        # Machine-readable page-type tally. The note says the same thing in English, but
+        # prose is not something a downstream index can group on without regex-guessing.
+        res['types'] = dict(Counter(c.type for c in classes))
         return res
     except subprocess.TimeoutExpired as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0,
@@ -2021,10 +2534,19 @@ def _default_workers() -> int:
 
 # ── Dry-run preview (runs in a worker process) ────────────────────────────────
 
-def preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
-                photo_thresh: float, photo_dpi: int,
-                jpeg_quality: int, min_savings: float,
-                sauvola_k: float, photo_descreen: float) -> dict:
+def preview_one(src: str, *a, verbose: bool = False, **kw) -> dict:
+    """`_preview_one` with library logging captured — see `compress_one`."""
+    with _lib_logs(Path(src).name, verbose) as warns:
+        res = _preview_one(src, *a, **kw)
+    if isinstance(res, dict) and warns:
+        res['warns'] = warns
+    return res
+
+
+def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
+                 photo_thresh: float, photo_dpi: int,
+                 jpeg_quality: int, min_savings: float,
+                 sauvola_k: float, photo_descreen: float) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check and the
@@ -2117,7 +2639,12 @@ def _csv_row(fields: list) -> str:
 # Human-friendly report columns, shared by the live-flushed CSV and the final one
 # so the two can never drift. Sizes are MB (2 dp), not raw bytes.
 REPORT_COLUMNS = ['file', 'action', 'orig size (MB)', 'new size (MB)', '%',
-                  'duplicate of', 'note', 'error']
+                  'duplicate of', 'page types', 'note', 'warnings', 'error']
+
+
+def _types_text(types) -> str:
+    """`line=12 vector=3` — the page-type tally in a form a downstream index can parse."""
+    return ' '.join(f'{k}={v}' for k, v in sorted((types or {}).items()))
 
 
 def _report_row(r: dict) -> list:
@@ -2128,7 +2655,8 @@ def _report_row(r: dict) -> list:
     return [r.get('rel', ''), _action_label(r),
             f'{o / 1048576:.2f}' if o else '0.00',
             f'{n / 1048576:.2f}' if (not err and n) else '',
-            pct, r.get('duplicate_of', ''), (r.get('note') or '').strip(), err or '']
+            pct, r.get('duplicate_of', ''), _types_text(r.get('types')),
+            (r.get('note') or '').strip(), _warns_text(r.get('warns')), err or '']
 
 
 # Per-folder rollup: one summary row per source subfolder (+ a grand total).
@@ -2163,7 +2691,7 @@ def _folder_rows(results: list) -> list:
 def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
                   t0: float, dt: float, n_found: int, skipped: int, limit: int,
                   fail: int, done: int, kept: int, dry_run: bool = False,
-                  report_dir: Path = None) -> Path:
+                  report_dir: Path = None, prescan_warns: list = None) -> Path:
     """Write a human-readable report of the folder run: which file, what was done
     (with the born-digital scan signals), and the final work stats. Also writes a
     machine-readable CSV sibling (same path, .csv) for filtering/sorting at scale.
@@ -2193,20 +2721,37 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
          + f' | processed this run: {len(results)}',
          '', '-' * 78, 'Per-file (this run):', '-' * 78]
 
+    if prescan_warns:
+        L.append('[(pre-scan)]  warnings raised while scanning the source, not tied to one file')
+        for name, msg, n in prescan_warns:
+            L.append(f'           pdf warning: {n}x {name}: {msg}')
+
+    def _warn_lines(r):
+        """What pypdf/pikepdf/PIL said about THIS file — the durable record. Console-only
+        was not one: these used to reach stderr from six processes at once, unprefixed."""
+        out = []
+        for name, msg, n in r.get('warns') or []:
+            out.append(f'           pdf warning: {n}x {name}: {msg}')
+        return out
+
     for r in sorted(results, key=lambda x: x['rel'].lower()):
         if r.get('err'):
             L.append(f'[FAILED]  {r["rel"]}')
             L.append(f'           error: {r["err"]}')
+            L += _warn_lines(r)
             continue
         pct = r['new'] * 100 // r['orig'] if r.get('orig') else 0
         L.append(f'[{_action_label(r)}]  {r["rel"]}')
         L.append(f'           {mb(r["orig"]):.2f} -> {mb(r["new"]):.2f} MB ({pct}%){r.get("note", "")}')
+        if r.get('types'):
+            L.append(f'           page types: {_types_text(r["types"])}')
         sg = r.get('signals')
         if sg:
             L.append(f'           scan signals: scan_frac={sg.get("scan_frac")} '
                      f'scan_pages={sg.get("scan_pages")}/{sg.get("sampled")} '
                      f'text_pages={sg.get("text_pages")} chars={sg.get("chars")}'
                      + (f' [{sg["error"]}]' if sg.get('error') else ''))
+        L += _warn_lines(r)
 
     L += ['', '-' * 78, 'Summary', '-' * 78]
     for label in ('compressed', 'kept original', 'OCR-only (not compressed)',
@@ -2353,9 +2898,16 @@ def main():
                     help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
                          'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
     ap.add_argument('--no-ocr', action='store_true', help='skip the searchable OCR text layer')
-    ap.add_argument('--language', default='eng',
-                    help='Tesseract OCR language(s), e.g. eng or eng+fra+spa+deu; '
-                         "'auto' detects each file's script (Latin->eng, Cyrillic->rus+eng) via Tesseract OSD")
+    ap.add_argument('--verbose', action='store_true',
+                    help='also echo each PDF-library warning to the console, prefixed with the '
+                         'file it came from. They always go to the report .log/.csv; this is for '
+                         'debugging one file without reading the report')
+    ap.add_argument('--language', default='auto',
+                    help="Tesseract OCR language(s); default 'auto' detects each file's script "
+                         '(Latin->eng, Cyrillic->rus+eng, CJK->jpn+eng) via Tesseract OSD. Pass an '
+                         'explicit spec to override, e.g. eng or eng+fra+spa+deu — a source whose '
+                         'existing text layer proves another script still gets that pack added, '
+                         'because OCR\'ing Cyrillic as English replaces real text with noise')
     ap.add_argument('--photo-threshold', type=float, default=0.02,
                     help='page kept as image if this fraction of tiles are continuous-tone (default 0.02)')
     ap.add_argument('--photo-dpi', type=int, default=150,
@@ -2395,6 +2947,11 @@ def main():
                          'names with dashes as underscores, e.g. dpi = 300, no_ocr = true')
     _apply_config_defaults(ap)
     args = ap.parse_args()
+
+    # The parent opens PDFs too (page counts, hashes, the from-list scan). Install the
+    # capture here as well or those warnings reach stderr via logging.lastResort, bare and
+    # with nothing to tie them to.
+    _install_lib_log_capture()
 
     err = _validate_numeric_args(args)
     if err:
@@ -2545,6 +3102,12 @@ def main():
             print(f'(could not open live CSV: {ex})', file=sys.stderr); csv_live = None
 
     N = len(jobs)
+    # Anything the libraries said during the parent's own scanning belongs to no single
+    # file; keep it, labelled, instead of discarding or leaking it.
+    prescan_warns = _drain_lib_logs('(pre-scan)', args.verbose)
+    if prescan_warns:
+        n = sum(c for _l, _m, c in prescan_warns)
+        _say(f'  ({n} pdf warning(s) while scanning — see the report)')
     # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
     dup_check = not args.dry_run
     seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
@@ -2560,7 +3123,8 @@ def main():
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size,
                                   args.photo_threshold, args.photo_dpi, args.jpeg_quality,
-                                  args.min_savings, args.sauvola_k, args.photo_descreen): (s, d)
+                                  args.min_savings, args.sauvola_k, args.photo_descreen,
+                                  verbose=args.verbose): (s, d)
                         for s, d in jobs}
             else:
                 futs = {ex.submit(compress_one, s, d, args.dpi,
@@ -2569,7 +3133,8 @@ def main():
                                   args.photo_threshold, args.photo_dpi, args.jpeg_quality,
                                   args.min_savings, args.sauvola_k,
                                   args.photo_descreen,
-                                  args.timeout, args.in_place): (s, d)
+                                  args.timeout, args.in_place,
+                                  verbose=args.verbose): (s, d)
                         for s, d in jobs}
             for i, fut in enumerate(cf.as_completed(futs), 1):
                 s, d = futs[fut]
@@ -2604,9 +3169,14 @@ def main():
                 elapsed = time.time() - t0
                 eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
                 eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
+                # A compact marker only: the warnings themselves go to the report (and to
+                # the console under --verbose). Printing them here is what made the old
+                # output unreadable AND unattributable.
+                nw = sum(n for _l, _m, n in res.get('warns') or [])
+                wmark = f'  [{nw} pdf warning{"s" if nw != 1 else ""}]' if nw else ''
                 if res['err']:
                     fail += 1
-                    _say(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{dmark}{eta_str}')
+                    _say(f'  [{i}/{N}] FAIL {res["src"]}: {res["err"]}{wmark}{dmark}{eta_str}')
                 else:
                     done += 1
                     if res.get('kept'):
@@ -2615,7 +3185,8 @@ def main():
                     pct = res['new'] * 100 // res['orig'] if res['orig'] else 0
                     arrow = f'~{mb(res["new"]):.0f}' if args.dry_run else f'{mb(res["new"]):.0f}'
                     _say(f'  [{i}/{N}] {res["src"][:60]}  '
-                         f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}{dmark}{eta_str}')
+                         f'{mb(res["orig"]):.0f}->{arrow} MB ({pct}%){res.get("note", "")}'
+                         f'{wmark}{dmark}{eta_str}')
                 if csv_live:   # flush a row per file so the report survives a hard stop
                     try:
                         csv_live.write(_csv_row(_report_row(res))); csv_live.flush()
@@ -2674,7 +3245,8 @@ def main():
             # were computed before the run); write_run_log (re)writes the full .log + .csv
             log_path = write_run_log(report_log_path, dest_root, src_root, results, settings,
                                      t0, dt, len(pdfs), skipped, args.limit, fail, done, kept,
-                                     dry_run=args.dry_run, report_dir=report_dir)
+                                     dry_run=args.dry_run, report_dir=report_dir,
+                                     prescan_warns=prescan_warns)
             _say(f'Log: {log_path}  (+ .csv)')
         except Exception as ex:
             _say(f'(could not write run log: {ex})')

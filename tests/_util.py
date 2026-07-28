@@ -245,3 +245,45 @@ def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(buf)
     return path
+
+
+def make_form_wrapped_pdf(path: Path, with_text: bool = True, img_px: int = 1200) -> Path:
+    """A page whose content stream ONLY invokes a Form XObject — everything real (a big
+    raster, and optionally VISIBLE vector text) lives inside the form.
+
+    Real producers do this: measured on iText-produced Subaru manuals whose page stream is
+    27 bytes, `q /Xf1 Do Q`, with all 42 text ops and every image nested one level down.
+    Inspecting only the page stream saw no text and let publisher type be rasterised.
+    `with_text=False` gives the opposite case — a genuine image-only wrapped scan, which
+    must still be recognised as compressible."""
+    import zlib
+
+    import pikepdf
+    from PIL import Image
+    pdf = pikepdf.Pdf.new()
+    im = Image.new('L', (img_px, round(img_px * 11 / 8.5)), 255)
+    img = pikepdf.Stream(pdf, zlib.compress(im.tobytes()))
+    img.Type, img.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+    img.Width, img.Height = im.width, im.height
+    img.ColorSpace, img.BitsPerComponent = pikepdf.Name.DeviceGray, 8
+    img.Filter = pikepdf.Name.FlateDecode
+    font = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+        BaseFont=pikepdf.Name.Helvetica, Encoding=pikepdf.Name.WinAnsiEncoding))
+    body = b'q 612 0 0 792 0 0 cm /Im0 Do Q\n'
+    if with_text:
+        for k, y in enumerate((700, 680, 660)):
+            body += (b'BT /F1 12 Tf 40 ' + str(y).encode() + b' Td ('
+                     + f'Publisher vector text line {k}, real visible type not an OCR layer. '
+                       .encode() + b')Tj ET\n')
+    form = pikepdf.Stream(pdf, body)
+    form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+    form.BBox = pikepdf.Array([0, 0, 612, 792])
+    form.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=img),
+                                        Font=pikepdf.Dictionary(F1=font))
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Contents = pikepdf.Stream(pdf, b'q /Xf1 Do Q\n')
+    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Xf1=form))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf.save(str(path))
+    return path

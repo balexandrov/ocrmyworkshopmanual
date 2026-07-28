@@ -11,7 +11,7 @@ workers = 8               # files processed in parallel
 # limit = 0               # process only the first N files (0 = all)
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
-language = "eng"          # Tesseract language(s), e.g. "eng+fra+deu"
+language = "auto"         # "auto" detects each file's script; or e.g. "eng+fra+deu"
 # no_ocr = false          # true = skip the searchable text layer
 # ocr_only = false        # true = don't compress, only add OCR
 

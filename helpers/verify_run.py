@@ -1,11 +1,12 @@
 """Audit a compression run: prove it did not lose anything.
 
-Point this at a folder holding `before/` and `after/` copies of the same files (same
-filenames) and it compares every pair on the things that matter — page count, colour,
-link annotations, bookmarks, searchable text, readability — and FLAGS any file that lost
-something, so a regression cannot hide in a long list.
+Point this at a folder holding `before/` and `after/` copies of the same files and it compares
+every pair on the things that matter — page count, colour, link annotations, bookmarks,
+searchable text, readability — and FLAGS any file that lost something, so a regression cannot
+hide in a long list. Pairs are matched by path relative to each tree, so the corpus may be flat
+or grouped into subfolders (by page type, say) as long as the two trees mirror each other.
 
-    python verify_run.py <dir>            # writes <dir>/REVIEW.md and <dir>/review.csv
+    python helpers/verify_run.py <dir>    # writes <dir>/REVIEW.md and <dir>/review.csv
 
 INDEPENDENCE IS THE POINT. This script deliberately does NOT import
 ocrmyworkshopmanual: an auditor that reuses the code it audits cannot catch that code
@@ -38,9 +39,17 @@ import sys
 import tempfile
 from pathlib import Path
 
+import logging
+
 import numpy as np
 from PIL import Image
 from pypdf import PdfReader
+
+# Keep pypdf's warnings off stderr while auditing a whole corpus: with no handler anywhere,
+# logging.lastResort prints them bare, interleaved with the audit's own findings. Done with
+# a plain handler rather than by importing the tool's helper — this auditor deliberately
+# shares no code with what it audits.
+logging.getLogger().addHandler(logging.NullHandler())
 
 # ── neutral tools (a renderer and a parser — no pipeline code) ────────────────
 
@@ -181,8 +190,13 @@ def main() -> None:
         origin = json.loads((rev / 'origin_map.json').read_text(encoding='utf-8'))
 
     rows = []
-    for b in sorted(before.glob('*.pdf')):
-        a = after / b.name
+    # Pair on the RELATIVE path, not a flat glob: a review corpus may be grouped into
+    # subfolders (e.g. by page type) as long as before/ and after/ mirror each other. A flat
+    # corpus is the same code path — the relative path is then just the filename.
+    for b in sorted(p for p in before.rglob('*')
+                    if p.is_file() and p.suffix.lower() == '.pdf'):
+        rel = b.relative_to(before)
+        a = after / rel
         if not a.exists():
             continue
         sb_st, sa_st = structure(b), structure(a)
@@ -215,7 +229,9 @@ def main() -> None:
             flags.append(f'GREW {100 * size_a / size_b:.0f}%')
 
         rows.append(dict(
-            name=b.name, src=origin.get(b.name, ''),
+            # the relative path, so a grouped corpus shows which subfolder a row is from;
+            # origin_map is keyed by BASENAME, so look that up with b.name
+            name=rel.as_posix(), src=origin.get(b.name, ''),
             mb_b=size_b / 1048576, mb_a=size_a / 1048576,
             pct=100 * size_a / max(size_b, 1), pages=sa_st['pages'],
             words_b=len(words(tb)), words_a=len(words(ta)),
@@ -236,7 +252,10 @@ def main() -> None:
     out = [
         '# Compression run audit', '',
         f'**{len(rows)} files** — {tot_b:.0f} MB -> {tot_a:.0f} MB '
-        f'(**{100 * tot_a / max(tot_b, 1):.0f}%**, saved {tot_b - tot_a:.0f} MB)', '',
+        # tot_b is MEGABYTES, so the usual `max(x, 1)` divide-by-zero guard would clamp any
+        # corpus under 1 MB to a 1 MB denominator and report a nonsense ratio (measured: two
+        # identical 68 KB files reported as "7%"). The per-row pct guards bytes, where 1 is fine.
+        f'(**{100 * tot_a / tot_b if tot_b else 0:.0f}%**, saved {tot_b - tot_a:.0f} MB)', '',
         f'- Files that LOST something: **{len(bad)}**',
         f'- Files carrying real colour: **{len(coloured)}** (all must keep it)',
         f'- Files that gained a searchable text layer: **{len(gained)}**',
