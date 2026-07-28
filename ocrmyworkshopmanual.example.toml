@@ -28,6 +28,8 @@ photo_descreen = 0.6      # 0 = skip only the halftone-smoothing blur (paper-whi
 min_savings = 0.25
 
 # ── resilience / large collections ────────────────────────────────────────────
-timeout = 1800            # per-file render/OCR ceiling in seconds (0 = off)
+timeout = 600             # STALL timeout: seconds a step may make NO progress before it is
+                          # treated as hung (not a time budget — a slow big file is never
+                          # killed; OCR is not bounded by it at all). 0 = off
 min_free_gb = 1.0         # abort if the dest drive has less than this free (0 = off)
 # no_log = false

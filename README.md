@@ -33,8 +33,9 @@ for the text layer.
 ## What it does, per page
 
 0. **Safety check first** — if a file doesn't look like a scan (it's a born-digital
-   vector/text PDF), it is **copied to the destination byte-for-byte, untouched** —
-   never rendered, binarized, or OCR'd. See [Born-digital safety](#born-digital-safety).
+   vector/text PDF), it is **copied to the destination untouched** — never rendered,
+   binarized, or OCR'd (the one exception: a corrupt one is repaired first rather than
+   reproduced unreadable). See [Born-digital safety](#born-digital-safety).
 1. **Render** the page (Ghostscript).
 2. **Classify** it into a **page type** and apply that type's strategy:
    - `LINE` / `BLANK` (text, line-art, gray-wash/shadow pages) → **background-flatten +
@@ -42,6 +43,12 @@ for the text layer.
    - `PHOTO_GRAY` (B&W photo / halftone / stipple) → **whiten the paper + trim dark scan
      edges** → **grayscale JPEG**
    - `PHOTO_COLOR` (genuine color — covers, color diagrams) → **color JPEG**
+   - `COLOR_LINE` (color **line-art** — wiring diagrams, schematics: low ink coverage but
+     the color carries the meaning) → **passed through losslessly**, never binarized. Getting
+     this wrong destroyed color wiring diagrams archive-wide, so it's a type of its own
+   - `VECTOR` (a born-digital page *inside* a scanned PDF — a TOC, an index, real type over a
+     background scan) → **passed through untouched**, so its vector text, color and
+     hyperlinks survive
 3. Merge pages back in order (consecutive bitonal pages share one JBIG2).
 4. **Skip it entirely** if a quick sample projects that compression won't shrink the
    file (already-efficient PDFs are kept as-is, never re-encoded/degraded).
@@ -146,7 +153,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
-| `--timeout SECS` | `7200` | Max seconds for the render step and the OCR step per file; a file that exceeds it is marked FAILED and the batch continues (`0` = no timeout) |
+| `--timeout SECS` | `600` | **Stall** timeout, not a time budget: max seconds a step may make **no progress** (no new page rendered, no bytes written) before it's treated as hung, killed, and the file marked FAILED. A slow-but-working file is never killed for being big, however long it takes. OCR is deliberately *not* bounded by it (ocrmypdf emits no usable progress signal, so any bound just killed healthy work). Transient crashes are retried automatically. (`0` = disable) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
 | `--from-list FILE` | — | Compress+OCR **in place** exactly the PDF paths listed in FILE (one per line), as one global pool. For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
@@ -154,6 +161,8 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
 | `--no-log` | off | Don't write a run report log |
 | `--limit N` | `0` | Process only the first N files (testing) |
+| `--verbose` | off | Also echo each PDF-library warning to the console, prefixed with the file it came from. They always go to the report `.log`/`.csv` regardless; this is for debugging one file without opening the report |
+| `--version` | — | Print the version and exit |
 
 A few things are **not** configurable on purpose, to keep the tool's guarantees simple
 and hard to accidentally weaken: binarization is always the adaptive Sauvola threshold
@@ -252,17 +261,32 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
 
 This tool rasterizes each page, which is exactly what you want for **scanned** PDFs but
 would **destroy** a born-digital (vector/text) PDF. So before touching a file it runs a
-cheap check (`looks_born_digital`): it samples pages and measures the fraction that are
-dominated by a full-page raster image. A real scan has one on ~every page; a born-digital
+cheap check (`looks_born_digital`): it samples pages and counts "scan pages" — those carrying
+a full-page raster image *and* no real text. A real scan has one on ~every page; a born-digital
 file has none. If that "scan fraction" is below 0.5 (fixed, not a flag — a real file is
 essentially always overwhelmingly one or the other, so this isn't a knob worth exposing),
-the file is **copied to the destination byte-for-byte — no render, no binarize, no OCR.**
+the file is **copied to the destination untouched — no render, no binarize, no OCR.**
 
-- Conservative by design: ties fall to "scanned", so a genuine scan archive is never
-  skipped. An all-raster "image PDF" (e.g. images exported to PDF) still counts as
-  scanned and gets compressed — only real vector/text content is protected.
-- A scanned PDF that already carries an OCR text layer is still detected as a scan
-  (it has full-page images) and compressed normally.
+The bias is **never damage a file**, not "never skip a scan". Rasterizing vector type is
+damage; failing to compress something only costs savings. Concretely:
+
+- A page carrying real **visible** text is a text page *even when it also carries a full-page
+  image* — publisher type over a background scan is content OCR cannot faithfully reproduce.
+  Measured cost of that bias on a 54-file corpus: 3 files stop compressing, 0.5 MB.
+- Visibility is what's judged, never raw text extraction. A scanned page whose only text is an
+  invisible OCR layer has thousands of extractable characters, so keying off those would
+  declare a genuinely scanned archive born-digital and skip the whole thing; such a page still
+  counts as a scan and compresses normally. Text painted *underneath* a full-page image is
+  hidden too, and likewise doesn't protect the page.
+- Text nested inside a Form XObject counts. Some producers wrap an entire page in one form, so
+  the page's own content stream is a couple of dozen bytes — inspecting only that stream saw no
+  text at all and let real type be rasterized and re-OCR'd.
+- An all-raster "image PDF" (e.g. images exported to PDF, no text) still counts as scanned and
+  gets compressed — only real vector/text content is protected.
+- One exception to "untouched": if a born-digital file is too corrupt to render, copying its
+  bytes would faithfully reproduce a file that opens nowhere, so it's **repaired** and the
+  repaired copy is shipped (noted as `born-digital: repaired and copied`). Under `--in-place`
+  it's reported as a failure instead, rather than rewriting your original.
 - Always on — there's no flag to force-rasterize a file this check calls born-digital,
   because doing so would defeat the one thing this safety check exists for.
 
@@ -276,10 +300,21 @@ total bytes saved** — so a big batch is reviewable at a glance. Two machine-re
 **`.csv` siblings** are written alongside it and **flushed per file** (so you can open
 them while a run is still going):
 - the main `.csv` — one row per file: `file, action, orig size (MB), new size (MB), %,
-  duplicate of, note, error` (sizes in MB; filter `error` non-blank to feed `--retry-failed`).
+  duplicate of, page types, note, warnings, error` (sizes in MB; filter `error` non-blank to
+  feed `--retry-failed`). `page types` is a machine-readable tally of how the pages were
+  classified (`line=12 vector=3`), so a collection can be grouped by content type without
+  parsing the prose `note`. `warnings` carries whatever the PDF libraries said about *that*
+  file — see below.
 - a `…_by_folder.csv` — one summary row per source subfolder (`folder, files, orig size
   (MB), new size (MB), %, saved (MB)`) plus a `(TOTAL)` row, so you can see which
   manual-series compress well. The same rollup is printed in the `.log`.
+
+**Malformed-PDF warnings are attributed, not dumped.** The PDF libraries have plenty to say
+about a damaged source (`invalid pdf header`, `incorrect startxref pointer`, …). Those messages
+carry no filename, and with several worker processes writing to one console they interleave
+across files — so they are captured per file instead, tallied with counts, and written into the
+`.log` as `pdf warning:` lines under that file plus the `warnings` CSV column. The console shows
+only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed with its file.
 
 ## Resilience & preview (for large collections)
 
@@ -288,14 +323,25 @@ them while a run is still going):
   pre-check the real run uses, and reports the per-file plan **plus projected total
   savings**. The report/CSV are written next to the source (never inside a created dest
   tree). Run this first on a big archive to see what you're in for.
-- **`--timeout SECS`** (default 7200 = 2h) — bounds the render and OCR steps per file. A
-  pathological or corrupt PDF that would otherwise hang a worker forever is marked
-  `FAILED` and the batch moves on; because it leaves no output, a later re-run retries
-  it. Set `0` to disable.
-- **Output verification** (always on) — after writing each output, it's re-opened and
-  its page count checked against the source. A silently-corrupt result is flagged
-  loudly in the log/CSV instead of shipping unnoticed (and with `--in-place`, a failed
-  verify keeps the original rather than overwriting it with a bad file).
+- **`--timeout SECS`** (default 600 = 10 min) — a **stall** timeout, not a time budget: the
+  most seconds a step may go without making progress (no new page rendered, no bytes
+  written) before it's treated as hung. A pathological PDF that would otherwise hang a
+  worker forever is marked `FAILED` and the batch moves on; because it leaves no output, a
+  later re-run retries it. A slow-but-working file is never killed for being big, however
+  long it takes — which is how a 6,855-page manual once "failed" while OCR'ing correctly, so
+  OCR is deliberately not bounded by this at all (ocrmypdf gives no usable progress signal).
+  Set `0` to disable.
+- **Output verification** (always on) — after writing each output it is re-opened and audited
+  against the **source**, because size alone cannot tell success from damage: losing a page, a
+  colour, a link or the text layer all make a file *smaller*. Checked: exact page count; that
+  a page classified as colour was not binarised to 1-bit; that no page still paints an
+  XObject the output no longer defines; that font `/Widths` match their own
+  `/FirstChar`..`/LastChar`; that searchable text survived, by **word recall** on sampled
+  pages rather than character count (a legitimate re-OCR differs in character count); and
+  that links and bookmarks did not shrink. A failure keeps the original rather than shipping
+  the bad file, and is reported loudly in the log/CSV. For an independent second opinion
+  after a run, `helpers/verify_run.py` re-audits a `before/`+`after/` pair from first
+  principles — it deliberately shares no code with the tool it audits.
 - **Resumable** — outputs are skip-if-exists, so an interrupted run just continues where
   it left off, and failed files (no output written) are retried next time.
 - **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
@@ -307,9 +353,17 @@ them while a run is still going):
   the report (console `[dup of …]`, a `duplicate_of` CSV column, and a note). Duplicates
   are **never skipped or merged** — a byte-identical file can legitimately belong to a
   different manual, so every file is still fully processed and gets its own output.
-- **PDF repair** (always on) — if a file is too malformed to render, it's rewritten
-  through Ghostscript's `pdfwrite` and retried once before being given up on. One bad
-  download shouldn't be silently lost.
+- **PDF repair** (always on) — if a file is too malformed to render, it's rewritten and
+  retried before being given up on. One bad download shouldn't be silently lost. **qpdf
+  first** (via pikepdf), Ghostscript's `pdfwrite` second: they fail differently, and on a real
+  corrupt manual pdfwrite salvaged 1 of 21 pages where qpdf recovered all 21 — so a repair
+  that returns fewer pages than the source is rejected outright and the next engine tried.
+  Duplicate object definitions are resolved first: a download that stitches a repeated chunk
+  into a file leaves two copies of each object in that range, damaged in *different* places,
+  and qpdf's last-definition-wins silently picks corrupt ones (measured: a `/Widths` array
+  with 221 entries for a 119-slot range, mis-advancing every heading glyph, plus a dropped
+  footer form) — so each copy is scored and the one that validates is kept. What repair did
+  is reported per file, never silent.
 - **`--min-free-gb N`** (default 1.0) — aborts up front if the destination drive is nearly
   full, instead of failing partway through a long run.
 - **Doesn't die on a partial failure** — a worker crashing (OOM, an OS kill, a native
