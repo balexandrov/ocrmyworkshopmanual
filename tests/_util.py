@@ -323,3 +323,106 @@ def make_striped_scan_pdf(path: Path, dpi: int = 300, strips: int = 10,
     path.parent.mkdir(parents=True, exist_ok=True)
     pdf.save(str(path))
     return path
+
+
+def make_linked_toc_pdf(path: Path, npages: int = 4, dpi: int = 200) -> Path:
+    """A scanned PDF with a vector Table of Contents page whose entries are INTERNAL links.
+
+    This is the case no real corpus file can cover: every archive file that carries links is
+    born-digital, so it is copied untouched and the compress path never sees one. Here the TOC
+    page is vector (passed through) while the scanned pages are recompressed, so the links live
+    on a page that survives untouched and point at pages whose content IS replaced — which is
+    exactly what a rebuild-from-rendered-pages destroys (measured: 5 of 249 links kept on one
+    manual, all 248 bookmarks lost on another).
+
+    Internal `/GoTo` destinations only, deliberately: a `/URI` is a self-contained string that
+    survives anything, so it proves nothing about the graft. A `/GoTo` points at a page OBJECT.
+    Two bookmarks are added as well. Returns the path; the TOC is page 1 and links target
+    pages 2..npages+1 in order."""
+    import pikepdf
+    scan = make_scan_pdf(path.with_name(path.stem + '_scan.pdf'), npages=npages, dpi=dpi)
+    pdf = pikepdf.open(str(scan))
+    n = len(pdf.pages)
+    mb = [float(x) for x in pdf.pages[0].obj['/MediaBox']]
+    W, H = mb[2] - mb[0], mb[3] - mb[1]
+    font = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+        BaseFont=pikepdf.Name.Helvetica, Encoding=pikepdf.Name.WinAnsiEncoding))
+    ops, rects = [f'BT /F1 16 Tf 70 {H-55:.1f} Td (TABLE OF CONTENTS) Tj ET'], []
+    for i in range(n):
+        y = H - 90 - i * 20.0
+        ops.append(f'BT /F1 11 Tf 70 {y:.1f} Td (Page {i + 1}) Tj ET')
+        rects.append((68, y - 3, W - 70, y + 12))
+    toc = pdf.add_blank_page(page_size=(W, H))
+    toc.obj['/Contents'] = pdf.make_stream(('\n'.join(ops) + '\n').encode())
+    toc.obj['/Resources'] = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+    annots = pikepdf.Array()
+    for i, (x0, y0, x1, y1) in enumerate(rects):
+        annots.append(pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Link,
+            Rect=pikepdf.Array([x0, y0, x1, y1]), Border=pikepdf.Array([0, 0, 0]),
+            A=pikepdf.Dictionary(S=pikepdf.Name.GoTo,
+                                 D=pikepdf.Array([pdf.pages[i].obj, pikepdf.Name.Fit])))))
+    toc.obj['/Annots'] = annots
+    with pdf.open_outline() as ol:
+        ol.root.append(pikepdf.OutlineItem('Front', 0))
+        ol.root.append(pikepdf.OutlineItem('Body', 1))
+    pdf.pages.remove(p=len(pdf.pages))          # unhook from the end...
+    pdf.pages.insert(0, toc)                    # ...and make it page 1
+    pdf.save(str(path))
+    pdf.close()
+    scan.unlink(missing_ok=True)
+    return path
+
+
+def link_report(pdf: Path) -> dict:
+    """Counts AND destination resolution for a PDF's links, plus bookmarks and image filters.
+
+    Resolution is the point: a link object can survive with a dangling target, and any
+    count-only check would call that success — the same blindness that let a dropped Form
+    XObject through elsewhere in this codebase. `goto_targets` is the 0-based page index each
+    TOC link actually resolves to, so a test can assert the ORDER, not just the number."""
+    from pypdf import PdfReader
+    r = PdfReader(str(pdf))
+    pages = r.pages
+    idx = {id(p.indirect_reference.get_object()): i for i, p in enumerate(pages)}
+    goto = uri = unresolved = 0
+    targets = []
+    for pg in pages:
+        for a in (pg.get('/Annots') or []):
+            o = a.get_object()
+            if o.get('/Subtype') != '/Link':
+                continue
+            act = o.get('/A')
+            kind = str(act.get_object().get('/S')) if act else ''
+            if kind == '/URI':
+                uri += 1
+                continue
+            if kind != '/GoTo':
+                continue
+            goto += 1
+            try:
+                targets.append(idx.get(id(act.get_object()['/D'][0].get_object()), -1))
+            except Exception:
+                unresolved += 1
+
+    def cnt(items):
+        n = 0
+        for it in items:
+            n += cnt(it) if isinstance(it, list) else 1
+        return n
+    try:
+        bookmarks = cnt(r.outline)
+    except Exception:
+        bookmarks = 0
+
+    def filters(i):
+        xo = pages[i].get('/Resources', {}).get('/XObject')
+        if not xo:
+            return []
+        xo = xo.get_object()
+        return [str(xo[k].get_object().get('/Filter')) for k in xo
+                if str(xo[k].get_object().get('/Subtype')) == '/Image']
+    return dict(pages=len(pages), goto=goto, uri=uri, unresolved=unresolved,
+                goto_targets=targets, bookmarks=bookmarks,
+                toc_filters=filters(0), last_filters=filters(len(pages) - 1))

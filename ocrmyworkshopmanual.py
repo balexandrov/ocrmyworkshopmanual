@@ -1161,6 +1161,16 @@ def _page_ocr_xobjects(page):
         return {}
 
 
+class GraftFailed(Exception):
+    """`_graft_into_source` could not put the compressed pages back into the original.
+
+    Exists so the reason is not thrown away. Every failure used to funnel into a bare
+    `return False` — a page-count mismatch, a missing pikepdf and a save error were
+    indistinguishable, and the caller silently shipped a rebuild that carries pages only.
+    Measured across 18 run reports and 318 files that took the compress path, this has fired
+    ZERO times, so the silence protected nothing and only discarded diagnostics."""
+
+
 def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
                        ocr_map: dict = None) -> bool:
     """Put the COMPRESSED page content back into the ORIGINAL document, instead of
@@ -1177,17 +1187,22 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
     ones, and save. Everything else is inherited by construction. qpdf drops the now
     unreferenced original images on write (object streams), so the size stays close to
     the rebuilt file. Requires an exact page-count match; returns False (leaving
-    comp_path untouched) on any problem, so the caller just ships the rebuild."""
+    comp_path untouched) on any problem, so the caller just ships the rebuild.
+
+    Raises `GraftFailed` with the reason rather than returning a bare False: the caller still
+    falls back to the rebuild, but the cause reaches the report instead of being discarded."""
     try:
         import pikepdf
-    except Exception:
-        return False
+    except Exception as ex:
+        raise GraftFailed(f'pikepdf unavailable: {ex}') from ex
     tmp = comp_path.with_name(comp_path.stem + '_graft.pdf')
     try:
         ctx = pikepdf.open(str(ocr_pdf)) if ocr_pdf else None
         with pikepdf.open(str(src_pdf)) as s, pikepdf.open(str(comp_path)) as c:
-            if len(s.pages) != len(c.pages) or not len(s.pages):
-                return False
+            if not len(s.pages):
+                raise GraftFailed('source has no pages')
+            if len(s.pages) != len(c.pages):
+                raise GraftFailed(f'page count {len(s.pages)} vs compressed {len(c.pages)}')
             for idx, (sp, cp) in enumerate(zip(s.pages, c.pages)):
                 # Keep this page's OCR text layer (a self-contained Form XObject) before
                 # its content is replaced: the text was read from the ORIGINAL at full
@@ -1223,15 +1238,17 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
             s.save(str(tmp), recompress_flate=True,
                    object_stream_mode=pikepdf.ObjectStreamMode.generate)
         if tmp.stat().st_size == 0:
-            raise RuntimeError('empty graft')
+            raise GraftFailed('graft produced an empty file')
         os.replace(str(tmp), str(comp_path))
         return True
-    except Exception:
+    except Exception as ex:
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        return False
+        if isinstance(ex, GraftFailed):
+            raise
+        raise GraftFailed(repr(ex)) from ex
 
 
 def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
@@ -1811,7 +1828,8 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
         wreck a page while every count-based check passes     -> fatal
       * searchable text survives, by WORD RECALL on sampled pages, not character count
         (a legitimate re-OCR differs in character count)      -> fatal below 50%
-      * link annotations and bookmarks are not fewer          -> warning
+      * link annotations and bookmarks are not fewer          -> fatal (losing navigation is
+        losing content; a file with none is unaffected, since the count cannot drop below 0)
     """
     try:
         r = PdfReader(str(out_p))
@@ -1895,10 +1913,20 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
                 return 0
         lb, la = links(s), links(r)
         bb, ba = bms(s), bms(r)
+        # FATAL, not a warning. Losing navigation is losing content, and it is the exact
+        # damage the graft exists to prevent: a plain rebuild from rendered pages kept 5 of
+        # 249 links on one manual and lost all 248 bookmarks on another. Checking the OUTCOME
+        # here (rather than only instrumenting `_graft_into_source`) catches every route to
+        # the loss — a failed graft, a refactor, a library change.
+        #
+        # No "did it have any?" guard is needed and none should be added: `la < lb` cannot
+        # fire when lb == 0, so a plain scan with no links still ships untouched, and only a
+        # file that genuinely had something to lose is refused. It reads like an omission; it
+        # is not.
         if la < lb:
-            warn.append(f'links {lb}->{la}')
+            return f'link annotations lost ({lb}->{la})', ''
         if ba < bb:
-            warn.append(f'bookmarks {bb}->{ba}')
+            return f'bookmarks lost ({bb}->{ba})', ''
     except Exception:
         pass
     return None, (' (WARN: ' + ', '.join(warn) + ')' if warn else '')
@@ -2486,8 +2514,17 @@ def _compress_one(src: str, dest: str, dpi: int,
         # Put the compressed pages back INTO the original document, so links, bookmarks,
         # named destinations, metadata AND the source-quality OCR layer are inherited
         # rather than rebuilt (and lost). Done BEFORE the size decision so min-savings
-        # judges the artefact we will ship. Falls back silently to the plain rebuild.
-        grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map)
+        # judges the artefact we will ship.
+        #
+        # A failure still falls back to the plain rebuild, but NOT silently any more: the
+        # reason travels into the note, and `_audit_output` refuses the result outright if the
+        # rebuild actually dropped links or bookmarks. So a file with nothing to lose still
+        # ships, and one that lost navigation keeps its original instead.
+        graft_err = None
+        try:
+            grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map)
+        except GraftFailed as ex:
+            grafted, graft_err = False, str(ex)
         kept_ocred = False
         kept_original = comp.stat().st_size >= orig * (1 - min_savings)
         if kept_original:
@@ -2529,7 +2566,8 @@ def _compress_one(src: str, dest: str, dpi: int,
         if n_native:
             note += f' [{n_native} hi-res pg at native dpi]'
         if not kept_original and not grafted:
-            note += ' (rebuilt — links/bookmarks not carried over)'
+            note += (f' (rebuilt — graft failed: {graft_err} — links/bookmarks not carried over)'
+                     if graft_err else ' (rebuilt — links/bookmarks not carried over)')
         if n_retry[0]:
             note += f' (render retried x{n_retry[0]})'
         if did_repair:

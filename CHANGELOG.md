@@ -5,6 +5,41 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (losing links is now refused, not warned about)
+
+Link preservation worked; noticing if it ever stopped did not.
+
+- **Losing link annotations or bookmarks is now FATAL**, where it was a warning
+  (`links 249->5` used to ship). The original is kept instead, the same treatment page loss and
+  colour loss already got — losing navigation is losing content, and it is precisely the damage
+  the graft exists to prevent (a plain rebuild from rendered pages kept 5 of 249 links on one
+  manual and lost all 248 bookmarks on another). Checking the OUTCOME catches every route to the
+  loss, not just one code path. A file with nothing to lose is unaffected: `la < lb` cannot fire
+  when `lb == 0`, so a plain scan still compresses — asserted by a test, because it looks like an
+  omission and invites a well-meaning guard.
+- **A failed graft now says why.** `_graft_into_source` funnelled every failure into one bare
+  `return False` — a page-count mismatch, a missing pikepdf and a save error were
+  indistinguishable, and it even raised `RuntimeError('empty graft')` only to swallow its own
+  exception. It now raises `GraftFailed` carrying the reason, and the note reads
+  `rebuilt — graft failed: page count 5 vs compressed 4 — links/bookmarks not carried over`.
+  The call-site comment previously advertised the silence outright.
+  Measured before changing anything: across **18 run reports, 1,173 file-rows and 318 files that
+  took the compress path, this fallback has fired ZERO times** — so the silence protected nothing
+  and only discarded diagnostics.
+- **Committed tests, because no corpus file can provide this coverage**: every archive file
+  carrying links is born-digital and copied untouched, so the compress path never sees one. New
+  `make_linked_toc_pdf` builds a scan with a vector TOC page of internal `/GoTo` links (no
+  `/URI` — a URI is a self-contained string that survives anything, while a `/GoTo` points at a
+  page object the compressor rewrites). The test asserts that every destination still resolves to
+  its expected page **in order**, not merely that the links exist: surviving link objects with
+  dangling targets pass any count-based check. It also asserts the targets really became JBIG2,
+  so a pass cannot come from nothing having happened. The failure branch is covered too, and was
+  confirmed to FAIL when the fatal check is reverted.
+
+Verified on the real sample: 32 pages, 31/31 `GoTo`, 0 `URI`, 18 bookmarks, destinations
+resolving to pages 2..32 in order, with the target pages going `/CCITTFaxDecode` ->
+`/JBIG2Decode`; and a zero-link file still compresses (318,119 -> 24,042 B). 112 tests pass.
+
 ### Fixed (hairlines lost on high-resolution scans)
 
 Reported as "slight loss of thin lines" on a 600 dpi wiring diagram, and it was two separate

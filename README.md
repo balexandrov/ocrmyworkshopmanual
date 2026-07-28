@@ -347,8 +347,10 @@ only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed w
   XObject the output no longer defines; that font `/Widths` match their own
   `/FirstChar`..`/LastChar`; that searchable text survived, by **word recall** on sampled
   pages rather than character count (a legitimate re-OCR differs in character count); and
-  that links and bookmarks did not shrink. A failure keeps the original rather than shipping
-  the bad file, and is reported loudly in the log/CSV. For an independent second opinion
+  that links and bookmarks did not shrink (a file that has none is unaffected — the count
+  cannot drop below zero — so a plain scan still compresses). Any of these failing keeps the
+  original rather than shipping the bad file, and is reported loudly in the log/CSV. For an
+  independent second opinion
   after a run, `helpers/verify_run.py` re-audits a `before/`+`after/` pair from first
   principles — it deliberately shares no code with the tool it audits.
 - **Resumable** — outputs are skip-if-exists, so an interrupted run just continues where

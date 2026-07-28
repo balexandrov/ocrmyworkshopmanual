@@ -850,3 +850,80 @@ def test_osd_never_votes_on_a_stale_render(tmp_path):
         assert U.owm._detect_language(broken, work, 0) == 'eng'
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ── Link / bookmark preservation through the compress path ───────────────────────
+# No corpus file can cover this: every archive file carrying links is born-digital, so it is
+# copied untouched and the compress path never sees one. Rebuilding a PDF from rendered pages
+# drops everything that is not page content — measured, a rebuild kept 5 of 249 links on one
+# manual and lost all 248 bookmarks on another — so `_graft_into_source` puts the compressed
+# pages back INTO the original document instead. These tests hold that behaviour in place.
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_internal_links_survive_compression(tmp_path):
+    """A TOC page of internal /GoTo links, pointing at pages the compressor rewrites."""
+    src = U.make_linked_toc_pdf(tmp_path / 'toc.pdf', npages=4, dpi=200)
+    before = U.link_report(src)
+    assert before['goto'] == 4 and before['uri'] == 0, before
+    assert before['goto_targets'] == [1, 2, 3, 4], before['goto_targets']
+
+    out = tmp_path / 'out.pdf'
+    res = U.owm.compress_one(str(src), str(out), 200, ocr=False, min_savings=0.0)
+    assert res.get('err') is None, res
+    note = res.get('note') or ''
+    # 'rebuilt' means the graft failed and links were dropped — the thing under test
+    assert 'rebuilt' not in note, f'graft did not run: {note}'
+
+    after = U.link_report(out)
+    assert after['pages'] == before['pages']
+    assert after['goto'] == before['goto'], f"links lost: {before['goto']} -> {after['goto']}"
+    assert after['bookmarks'] >= before['bookmarks']
+    assert after['unresolved'] == 0
+    # THE assertion: destinations must resolve to the same pages, in order. Surviving link
+    # objects with dangling targets would satisfy every count above.
+    assert after['goto_targets'] == before['goto_targets'], after['goto_targets']
+    # ...and the targets must really have been recompressed, or the test proves nothing:
+    # the TOC page stays vector (no images) while the scanned pages become JBIG2.
+    assert after['toc_filters'] == [], after['toc_filters']
+    assert any('JBIG2' in f for f in after['last_filters']), after['last_filters']
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_a_failed_graft_names_its_reason_and_is_refused(tmp_path, monkeypatch):
+    """The failure branch. It has never fired in production — 0 times across 18 run reports
+    and 318 files that took the compress path — which is exactly why it needs a test: an
+    unexercised silent fallback is where link loss would hide. Two things must hold: the
+    reason reaches the note, and the audit refuses a result that actually lost links."""
+    src = U.make_linked_toc_pdf(tmp_path / 'toc2.pdf', npages=4, dpi=200)
+
+    def boom(*a, **k):
+        raise U.owm.GraftFailed('page count 5 vs compressed 4')
+    monkeypatch.setattr(U.owm, '_graft_into_source', boom)
+
+    out = tmp_path / 'out2.pdf'
+    res = U.owm.compress_one(str(src), str(out), 200, ocr=False, min_savings=0.0)
+    err, note = res.get('err') or '', res.get('note') or ''
+    # 1. the CAUSE is named, not discarded into a bare False
+    assert 'page count 5 vs compressed 4' in note, f'reason not reported: {note!r}'
+    assert 'rebuilt' in note, note
+    # 2. the CONSEQUENCE is refused. Assert the audit's own wording and the counts, not just
+    #    the substring 'link' — 'links/bookmarks not carried over' already contains that, so a
+    #    looser check would pass even if the file shipped.
+    assert 'link annotations lost (4->0)' in err, f'audit did not refuse it: {err!r}'
+    assert 'original kept' in err, err
+    # 3. and nothing degraded was written
+    assert not out.exists() or out.read_bytes() == src.read_bytes(), \
+        'shipped a link-less rebuild'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_a_file_with_no_links_still_compresses(tmp_path):
+    """The other half: making link loss fatal must not refuse files with nothing to lose.
+    `la < lb` cannot fire when lb == 0, so a plain scan is unaffected — asserted, because it
+    would be an easy thing to break by adding a well-meaning guard."""
+    src = U.make_scan_pdf(tmp_path / 'plain.pdf', npages=3, dpi=200)
+    assert U.link_report(src)['goto'] == 0
+    out = tmp_path / 'plain_out.pdf'
+    res = U.owm.compress_one(str(src), str(out), 200, ocr=False)
+    assert res.get('err') is None, res
+    assert out.exists() and out.stat().st_size < src.stat().st_size
