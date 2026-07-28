@@ -17,18 +17,27 @@ crisp, and full-text searchable.
 
 ## Why this exists (vs. `ocrmypdf --optimize 3`)
 
-[ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF) is excellent and this tool uses it
-for the OCR step. But for *these* inputs its built-in optimizer falls short:
+[ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF) is excellent, and this tool uses it for the
+OCR step. The gap isn't tuning: a general-purpose optimizer improves *the images it finds*,
+while shrinking a scanned manual means deciding what each *page* is — then proving the decision
+cost nothing.
 
-- ocrmypdf only JBIG2-compresses images that are **already 1-bit**. It won't
-  **binarize a grayscale scan**, so a grayscale line-art manual lands around **37%**
-  (lossy JPEG) instead of **~8%** here.
-- Its JBIG2 page-grouping is no longer configurable, so it can emit a
-  **shared-dictionary** JBIG2 that renders as **blank pages in Chrome/Edge (PDFium)**.
-
-This tool binarizes first, uses **generic** (self-contained) JBIG2 that renders
-everywhere, keeps photos/color as images, and only then hands the file to ocrmypdf
-for the text layer.
+- **It optimizes the wrong representation.** ocrmypdf JBIG2-compresses only images that are
+  **already 1-bit**; it won't binarize a grayscale scan, so the one step that shrinks line-art
+  4–5× never happens: **~8% here vs ~37%** with `--optimize 3`.
+- **"Smaller" and "intact" are not the same, and file size cannot tell them apart** — losing a
+  page, a colour, a link or the text layer *all make a PDF smaller*. So pages are sorted into
+  six types before anything is re-encoded (colour wiring diagrams have line-art's low ink
+  coverage but their colour *is* the information; binarizing them destroyed diagrams
+  archive-wide here), and every output is audited against its source — page count, colour depth,
+  font metrics, text by word recall, links, bookmarks — keeping the original if a check fails.
+- **Compress-then-OCR reads a degraded image.** Measured: ~1 word error per 70 OCR'ing the
+  source at 400 dpi, ~5× that off the shipped 150-dpi page. So OCR runs on the **original** and
+  its text layer is grafted onto the compressed pages.
+- **It has to render everywhere, and survive an archive.** Generic, self-contained JBIG2 only —
+  PDFium (Chrome/Edge) draws a shared-dictionary JBIG2 as **blank pages**, and symbol mode being
+  ~30% smaller doesn't buy that back. Plus resumable, one corrupt file can't take down the
+  batch, malformed downloads repaired, duplicates flagged.
 
 ## What it does, per page
 
@@ -395,6 +404,22 @@ See `ocrmyworkshopmanual.example.toml` in the repo for a fuller template.
 
 ## Tuning notes (learned the hard way on real scans)
 
+- **Renders are interpolated, and that is not optional.** Ghostscript does not average pixels
+  when it scales a raster down unless told to, so reducing a 600 dpi scan to 200 keeps 1 of
+  every 9 source pixels and a hairline survives only if it lands on the sample grid. Measured
+  on a 600 dpi wiring diagram: 0.00% mid-grey in the render, and the shipped page's lines
+  broken into 2,455 pieces. With `-dDOINTERPOLATE` a hairline arrives as *grey* — which is
+  precisely what adaptive binarization is for — giving 1,425 pieces instead of 2,455 and a
+  JBIG2 **7.7% smaller**, since continuous lines cost fewer contexts than dotted ones. Note
+  both halves are needed: averaging judged against a fixed global cutoff looks like it
+  changes nothing, which is how this hid.
+- **A scan's resolution is measured two ways.** The effective dpi of the largest image over
+  the page area is only right when that image covers the page. Scans stored as full-width
+  *strips* break it — 68 strips of 4961×105 px read as 73 dpi against a true 604 — so an image
+  at least 4:1 wider than tall also contributes a width-based reading. That reading informs
+  classification (so a striped 600 dpi scan can't be mistaken for born-digital) but
+  deliberately does **not** raise the render dpi: doing so measured 2× the bytes and 2× the
+  runtime, while interpolation already fixes the hairlines for less.
 - **Adaptive binarization is the only mode — on purpose.** On low-contrast/yellowed
   scans a single global cutoff erodes faint strokes and drops dotted leaders, while a
   high cutoff turns a gray shaded wash (common on foldout wiring diagrams) into

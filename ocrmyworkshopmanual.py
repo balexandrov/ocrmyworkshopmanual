@@ -123,6 +123,28 @@ _FORM_MAX_DEPTH = 4
 # Cap for auto-raising the render DPI to a scan's native resolution (avoid huge foldouts).
 MAX_RENDER_DPI = 400
 
+# How much wider than tall an image must be before it is read as a full-width SCAN STRIP
+# rather than a figure (see `_largest_image_dpi`). Real strips are extreme — the measured
+# case is 4961x105, i.e. 47:1 — so a conservative gate separates them from any normal image.
+_STRIP_ASPECT = 4.0
+
+# Ghostscript does NOT average pixels when it scales a raster down — by default it
+# point-samples, so reducing a 600 dpi bitonal scan to 200 dpi keeps 1 of every 9 source
+# pixels and a hairline survives only if it happens to land on the sample grid. Measured on a
+# 600 dpi wiring diagram (stored as 68 full-width strips, so the native-dpi probe under-read
+# it and the page really was reduced 3x): the render contained 0.00% mid-grey pixels, and the
+# shipped page had its lines broken into 2,455 connected components.
+#
+# -dDOINTERPOLATE makes the reduction average instead, so a hairline arrives as GREY — which
+# is precisely what the Sauvola pass is for, and it keeps it. Same page, same 200 dpi, through
+# the real binarizer: 2,455 -> 1,425 components (42% fewer fragments), ink 4.19% -> 5.50%, and
+# the JBIG2 came out 7.7% SMALLER, because continuous lines cost fewer contexts to encode than
+# dotted ones. Note the two halves only work together: averaging alone, judged with a fixed
+# global cutoff, looks like it changes nothing.
+#
+# Not applied to the OSD language probe (that render feeds script detection, not output).
+_GS_INTERPOLATE = '-dDOINTERPOLATE'
+
 # DPI for the cheap colour PROBE that rescues colour line art from the bitonal path.
 # Only low enough to let _is_color() see chroma; the page itself is passed through at
 # full resolution (never re-rendered), so this never limits output quality.
@@ -615,6 +637,7 @@ def _render_color(src_p: Path, page_no: int, out_png: Path, dpi: int) -> bool:
     """Render one page to a full-colour (png16m / RGB) PNG at `dpi`. True on success."""
     subprocess.run([GS, '-sDEVICE=png16m', f'-r{dpi}', f'-dFirstPage={page_no}',
                     f'-dLastPage={page_no}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                    _GS_INTERPOLATE,
                     '-sOutputFile=' + str(out_png), win_long(src_p)], capture_output=True)
     return out_png.exists()
 
@@ -824,13 +847,20 @@ def _page_render_dpis(src_p: Path, base_dpi: int, cap: int = MAX_RENDER_DPI) -> 
     image and nothing has to be rendered twice. Floored at `base_dpi` because OCR needs
     the pixels — a 73 dpi scan OCR'd at 73 dpi yielded 11,728 characters against 16,319
     at a sane resolution, and upsampling loses nothing. Capped so a 600 dpi foldout
-    cannot produce a multi-gigabyte render."""
+    cannot produce a multi-gigabyte render.
+
+    Reads the dpi with `include_strips=False`, for the reason `_page_render_dpi` gives: a
+    scan stored as full-width strips really is 600 dpi, but rendering it there measured 2x
+    the output bytes and 2x the runtime, while image interpolation already recovers the
+    hairlines the reduction was breaking — at 7.7% SMALLER output. THIS is the function the
+    render loop calls; the singular `_page_render_dpi` only serves the photo re-render, so a
+    change made there alone silently does nothing."""
     try:
         r = PdfReader(str(src_p))
         out = []
         for pg in r.pages:
             try:
-                d = _largest_image_dpi(pg)
+                d = _largest_image_dpi(pg, include_strips=False)
             except Exception:
                 d = 0.0
             out.append(int(max(base_dpi, min(round(d) or base_dpi, cap))))
@@ -860,7 +890,7 @@ def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int
         sub = work / f'r{n:03d}'
         sub.mkdir(exist_ok=True)
         cmd = [GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={first}', f'-dLastPage={last}',
-               '-dNOPAUSE', '-dBATCH', '-dQUIET',
+               '-dNOPAUSE', '-dBATCH', '-dQUIET', _GS_INTERPOLATE,
                '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src_p)]
         try:
             rr, tries = _run_retry(lambda: _run_stalled(
@@ -1233,21 +1263,52 @@ def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
         return False
 
 
-def _largest_image_dpi(page) -> float:
-    """Effective DPI of the LARGEST single raster image on a page:
-    sqrt(image_pixel_area / page_area_in_sq_inches). A full-page scan yields the
-    scan resolution (~72-600); a small logo/figure on a born-digital page yields a
-    tiny number (a page-filling image and a stamp-sized one are worlds apart here).
-    Recurses into Form XObjects. Returns 0.0 if the page has no image."""
+def _largest_image_dpi(page, include_strips: bool = True) -> float:
+    """Effective DPI of the raster content on a page. 0.0 if the page has no image.
+
+    `include_strips=False` returns only the area reading below. That is not a correctness
+    switch — the strip reading is the more accurate one — it exists because `_page_render_dpi`
+    deliberately does not act on it: raising a striped 600 dpi page to a native-resolution
+    render measured 2x the output bytes and 2x the runtime on the file it was found in, while
+    image interpolation already fixes the hairline loss that motivated the change (and makes
+    the file 7.7% smaller). Classification still wants the honest number, so that a striped
+    600 dpi scan can never be read as a born-digital page.
+
+    Two readings, and the HIGHER wins:
+
+    * area: sqrt(largest_image_pixels / page_area_in²). Right when one image covers the
+      page — a full-page scan yields its scan resolution, a stamp-sized logo yields a tiny
+      number, which is the distinction this function exists to make.
+    * width, but only for a STRIP (an image at least `_STRIP_ASPECT`:1 wider than tall):
+      width_px / page_width_in. The area reading is only valid under the assumption it
+      states — that the image covers the page — and striped scans break it. Measured on a
+      600 dpi wiring diagram stored as 68 full-width strips of 4961x105 px: each strip
+      covers 1/68 of the height, so dividing by the whole page area under-read the page as
+      **73 dpi** against a true 604 — off by sqrt(68) = 8.2x. That made `_page_render_dpi`
+      skip the native-resolution raise and reduce the page 3x (breaking its hairlines into
+      2,455 fragments), and it left the reading only 23 dpi above VECTOR_DPI_FLOOR — one
+      slightly shorter strip away from calling a 600 dpi scan born-digital. A full-width
+      strip's width does not care how short it is: 4961 / 8.26 in = 600 dpi.
+
+    The aspect gate matters: applied to every image, the width reading OVER-reads whenever
+    an image is wide in pixels but not placed across the page (measured: a Subaru page went
+    341 -> 525 dpi), and over-reading is the unsafe direction — it pushes a page above
+    VECTOR_DPI_FLOOR and toward the raster path. Strips here are 47:1, far past the gate, so
+    the fix applies exactly where the assumption is broken and nowhere else.
+
+    A grid-tiled scan (tiles narrower than the page) still under-reads; summing pixels
+    across images would cover that, but over-reads a page of many small icons.
+    Recurses into Form XObjects, to the same depth as `_stream_visible_text`."""
     try:
         mb = page.mediabox
-        area_in = max((float(mb.width) / 72.0) * (float(mb.height) / 72.0), 1e-6)
+        w_in = max(float(mb.width) / 72.0, 1e-6)
+        area_in = max(w_in * (float(mb.height) / 72.0), 1e-6)
     except Exception:
         return 0.0
-    largest = 0
+    largest, widest = 0, 0
 
     def walk(res, depth=0):
-        nonlocal largest
+        nonlocal largest, widest
         if not res or depth > _FORM_MAX_DEPTH:
             return
         try:
@@ -1259,7 +1320,10 @@ def _largest_image_dpi(page) -> float:
                 obj = xo[name].get_object()
                 sub = obj.get('/Subtype')
                 if sub == '/Image':
-                    largest = max(largest, int(obj.get('/Width', 0)) * int(obj.get('/Height', 0)))
+                    w, h = int(obj.get('/Width', 0)), int(obj.get('/Height', 0))
+                    largest = max(largest, w * h)
+                    if include_strips and h and w >= h * _STRIP_ASPECT:   # full-width strip
+                        widest = max(widest, w)
                 elif sub == '/Form':
                     walk(obj.get('/Resources'), depth + 1)
         except Exception:
@@ -1269,7 +1333,9 @@ def _largest_image_dpi(page) -> float:
         walk(page.get('/Resources'))
     except Exception:
         pass
-    return (largest / area_in) ** 0.5 if largest else 0.0
+    if not largest:
+        return 0.0
+    return max((largest / area_in) ** 0.5, widest / w_in)
 
 
 def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
@@ -1337,9 +1403,16 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
 def _page_render_dpi(page, base_dpi: int, cap: int = MAX_RENDER_DPI) -> int:
     """Per-page render DPI: use the page's native scan resolution when it EXCEEDS the
     base (so a high-res scan isn't downsampled), capped to avoid a foldout blow-up; never
-    below base (don't upsample a low-res page and bloat it). Returns base if unknown."""
+    below base (don't upsample a low-res page and bloat it). Returns base if unknown.
+
+    Reads the dpi WITHOUT the strip correction, deliberately. A scan stored as full-width
+    strips really is 600 dpi, but rendering it there measured 2x the output bytes and 2x the
+    runtime, and image interpolation (`_GS_INTERPOLATE`) already recovers the hairlines that
+    the reduction was breaking — at 7.7% SMALLER output. So the strip reading informs
+    classification, not this cost decision. Raising this to the honest reading is a one-word
+    change (`include_strips=True`) if fidelity ever outweighs the size on a given archive."""
     try:
-        native = _largest_image_dpi(page)
+        native = _largest_image_dpi(page, include_strips=False)
     except Exception:
         return base_dpi
     if native > base_dpi:
@@ -1353,6 +1426,7 @@ def _render_page_gray(src_p: Path, page_no: int, out_png: Path, dpi: int, timeou
     try:
         subprocess.run([GS, '-sDEVICE=pnggray', f'-r{dpi}', f'-dFirstPage={page_no}',
                         f'-dLastPage={page_no}', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+                        _GS_INTERPOLATE,
                         '-sOutputFile=' + str(out_png), win_long(src_p)],
                        capture_output=True, timeout=timeout or None)
     except Exception:
@@ -2055,7 +2129,8 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
         # projection is measured on the same input and cannot disagree about colour
         pd = _page_render_dpi(_reader_page(src_p, p), dpi)
         subprocess.run([GS, '-sDEVICE=png16m', f'-r{pd}', f'-dFirstPage={p}', f'-dLastPage={p}',
-                        '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sOutputFile=' + str(png), win_long(src_p)],
+                        '-dNOPAUSE', '-dBATCH', '-dQUIET', _GS_INTERPOLATE,
+                        '-sOutputFile=' + str(png), win_long(src_p)],
                        capture_output=True)
         if not png.exists():
             continue

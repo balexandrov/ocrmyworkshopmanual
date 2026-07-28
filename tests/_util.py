@@ -287,3 +287,39 @@ def make_form_wrapped_pdf(path: Path, with_text: bool = True, img_px: int = 1200
     path.parent.mkdir(parents=True, exist_ok=True)
     pdf.save(str(path))
     return path
+
+
+def make_striped_scan_pdf(path: Path, dpi: int = 300, strips: int = 10,
+                          page_in=(8.5, 11.0)) -> Path:
+    """A scan stored as N FULL-WIDTH horizontal strips instead of one page-sized image.
+
+    Real producers do this (measured: a Nissan manual page held 68 strips of 4961x105 px at
+    600 dpi). It matters because the 'effective dpi' of the largest single image, taken over
+    the whole page area, under-reads such a page by sqrt(N) — 73 dpi against a true 604 —
+    which then suppresses the native-resolution render and reduces the page, breaking
+    hairlines."""
+    import zlib
+
+    import pikepdf
+    w_px = round(page_in[0] * dpi)
+    h_px = round(page_in[1] * dpi)
+    strip_h = h_px // strips
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(page_in[0] * 72, page_in[1] * 72))
+    xobj, content = pikepdf.Dictionary(), []
+    row = bytes([0xFF]) * ((w_px + 7) // 8)            # all-white 1-bit row
+    for i in range(strips):
+        img = pikepdf.Stream(pdf, zlib.compress(row * strip_h))
+        img.Type, img.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+        img.Width, img.Height = w_px, strip_h
+        img.ColorSpace, img.BitsPerComponent = pikepdf.Name.DeviceGray, 1
+        img.Filter = pikepdf.Name.FlateDecode
+        xobj[f'/Im{i}'] = img
+        y = page_in[1] * 72 * (strips - 1 - i) / strips
+        content.append(f'q {page_in[0]*72:.2f} 0 0 {page_in[1]*72/strips:.2f} 0 {y:.2f} cm '
+                       f'/Im{i} Do Q')
+    page.Resources = pikepdf.Dictionary(XObject=xobj)
+    page.Contents = pikepdf.Stream(pdf, ('\n'.join(content) + '\n').encode())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf.save(str(path))
+    return path

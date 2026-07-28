@@ -5,6 +5,46 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (hairlines lost on high-resolution scans)
+
+Reported as "slight loss of thin lines" on a 600 dpi wiring diagram, and it was two separate
+faults compounding.
+
+- **Ghostscript was point-sampling every reduction.** GS does not average pixels when it
+  scales a raster down unless told to, so reducing a 600 dpi bitonal scan to 200 dpi kept 1
+  of every 9 source pixels and a hairline survived only if it happened to land on the sample
+  grid. Measured on the reported page: the render contained **0.00%** mid-grey pixels, and
+  the shipped page had its lines broken into **2,455** connected components. `-dDOINTERPOLATE`
+  makes the reduction average, so a hairline arrives as grey — which is exactly what the
+  Sauvola pass is for, and it keeps it. Same page, same 200 dpi, through the real binarizer:
+  **2,455 → 1,425 components** (42% fewer fragments), ink 4.19% → 5.50%, and the JBIG2 came
+  out **7.7% smaller**, because continuous lines cost fewer contexts to encode than dotted
+  ones. The two halves only work as a pair: averaging alone, judged with a fixed global
+  cutoff, looks like it changes nothing — which is why this was missed.
+- **A striped scan read as 73 dpi instead of 604.** `_largest_image_dpi` divides the largest
+  image's pixel count by the whole page area, which is only valid when that image covers the
+  page. This page was stored as **68 full-width strips** of 4961×105 px, so the reading was
+  off by sqrt(68) = 8.2×, leaving a 600 dpi scan sitting **23 dpi above `VECTOR_DPI_FLOOR`** —
+  one shorter strip away from being classified born-digital and passed through unprocessed. A
+  strip's width does not care how short it is (4961 / 8.26 in = 600 dpi), so an image at least
+  4:1 wider than tall now also contributes a width-based reading. The aspect gate matters:
+  applied to every image the width reading over-reads anything wide but not placed across the
+  page (measured: a Subaru page 341 → 525 dpi), and over-reading pushes a page toward the
+  raster path — the unsafe direction.
+- The corrected reading feeds **classification only**. Letting it raise the render dpi to
+  native measured **2× the output bytes and 2× the runtime** on the affected file, while
+  interpolation already fixes the hairlines for 7.7% *less* — so the render path reads the dpi
+  with `include_strips=False`, deliberately, and says why. (Note for future edits: the render
+  loop calls the PLURAL `_page_render_dpis`; the singular `_page_render_dpi` serves only the
+  photo re-render, so changing one without the other silently does nothing.)
+
+Verified end to end on the reported file and the 54-file corpus. Page 609, both renders at
+200 dpi: **2,455 → 1,425 connected components (42% fewer fragments)**, ink 4.19% → 5.50%, and
+the file itself **24 MB → 22.9 MB** with only 2 of its 1179 pages taking native resolution
+(genuine foldouts). Corpus: 938 MB → 583 MB where it was 584 MB, **0 files lost anything**, 21
+colour files all kept their colour, and **24** files gained a searchable text layer where 23
+did before — measured by the independent auditor, which shares no code with the pipeline.
+
 ### Fixed (a run whose console noise was hiding four ways to damage a file)
 
 A 61-file pass printed ~120 unattributed PDF-library warnings. Chasing them down found
