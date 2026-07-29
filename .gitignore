@@ -20,3 +20,8 @@ tests/reports/
 
 # Run reports written to the tool folder (e.g. --in-place mode)
 /reports/
+
+# Run reports, wherever --log puts them. `reports/` is already ignored, but a bare
+# --log writes to the CURRENT folder, so running from the repo root would otherwise
+# show every report as untracked noise in `git status`.
+_ocrmyworkshopmanual_report_*
