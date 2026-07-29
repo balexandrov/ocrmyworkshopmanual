@@ -5,6 +5,64 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (consolidate a manual published as thousands of small PDFs)
+
+Some manuals ship as one small PDF per topic — `USDM Forester FSM 2006\BODY SECTION\AIRBAG
+SYSTEM AB\1. General Description.pdf` and 28,775 siblings. They are unusable as documents
+and they defeat compression. New `helpers/combine_sections.py` turns each section folder
+into one PDF named after it, verifies it, and (with `--delete`) removes the folder it came
+from. Run over one real make: **28,776 small PDFs became 308 section PDFs, 170,010 pages,
+303 source folders deleted, 0 failures.**
+
+- `combine_manual.py` gained **`--recursive`** — its `collect` was non-recursive, so a
+  section whose pages live in per-topic subfolders yielded *nothing at all*. Files and
+  subfolders are now ordered together by one natural key at every level, so a subfolder
+  takes its pages' place in the sequence rather than being appended last. Verified on the
+  real tree: 1,913 pages of one BODY SECTION come out as contiguous blocks in order.
+- It also gained **verification**, which this work cannot do without, since the driver
+  deletes sources: the result must reopen and carry exactly the sum of its inputs' page
+  counts. It is staged to a `.part` and moved into place only once that passes.
+- Deletion is additionally gated on combined bytes ≥ 0.90× the *merged* inputs (measured
+  0.996–1.007 across flat, nested and 714-file sections) and on none of 8 sampled pages
+  being blank — a page can merge as an empty page without changing the count. Anything
+  that fails leaves the folder and its PDF untouched. The **root** is never deleted, only
+  sections, so loose files already at a root survive.
+- An existing `<SECTION>.pdf` is **verified against its folder** rather than blindly
+  skipped: 46 sections had been combined by another tool years earlier and all 46 matched
+  exactly, so those folders were redundant; a mismatch is reported `CONFLICT` and nothing
+  is touched. The size ratio is deliberately not applied there — another tool made those
+  files and one is legitimately 0.877, so only the page count and blank sample are evidence.
+- **`--skip-unrecoverable`** combines a section whose parts are damaged beyond repair
+  instead of refusing it, moving the damaged originals to `<SECTION> (UNRECOVERABLE)\`
+  (subfolder paths preserved) before the folder goes, so skipping never destroys the only
+  copy. Opt-in, so an unattended run never ships a section with pages missing.
+- New **`helpers/find_split_manuals.py`** finds candidates before anything is touched
+  (read-only). Two detection signals, because neither is universal: a name marker, or ≥2
+  `*SECTION*` children. Each root gets a verdict — `SPLIT`, `CONTAINER` (children are
+  model years, so combining means one PDF per year), `ALREADY-SECTIONED`, `HTML-DUMP`
+  (more non-PDF files than PDFs — combining and deleting would destroy a browsable HTML
+  manual), `THIN`.
+
+**Three hazards the pre-flight caught, each of which would have destroyed pages:**
+
+- A page stored as a file named **`null`** — a genuine 1-page wiring diagram with no
+  extension and stray newlines before `%PDF`. The extension filter skipped it and the
+  folder was then to be deleted. PDFs are now recognised by header, anchored at the start
+  so a log merely mentioning `%PDF` is not mistaken for a page.
+- A section containing an **already-merged copy of itself** (`Wiring_diagram.pdf`, exactly
+  the 146 pages of its own nine parts); combining would have emitted every page twice.
+  Dropped on exact page-count identity — a 40%-of-total heuristic tried first flagged 31
+  genuine chapters and one real duplicate, so only identity is safe.
+- A **repair taken at face value**. The page-count gate is computed from the files handed
+  to the merge, so once a broken part was replaced by its repaired copy the count agreed
+  with itself. Three truncated parts holding 3, 9 and 6 page objects each yielded exactly
+  one salvaged page — ~15 pages would have gone silently. A repair must now recover at
+  least the page count read from the file's **raw bytes** (`/Type /Page` objects, readable
+  when no parser can open the file); `_repair_pdf` rejects a partial salvage when told what
+  to expect. Ghostscript's complaints are also captured rather than reaching a shared
+  console unattributed, and every broken part is named by its path relative to the section,
+  because one section holds two different `General Description.pdf` files.
+
 ### Changed (the report says what happened AND why; small files are no longer re-imaged)
 
 The report had one `action` column, so `kept original` covered three unrelated situations and

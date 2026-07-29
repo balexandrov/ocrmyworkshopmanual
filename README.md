@@ -291,6 +291,87 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
 - Images are wrapped losslessly (img2pdf embeds the JPEG as-is, no re-encode). As
   usual, if the combined scan won't benefit from JBIG2 (photo-heavy Haynes-style
   pages), the compress step keeps the images and just adds the OCR layer.
+- A PDF is recognised by its **header, not its extension**. One real archive page is a
+  valid 1-page PDF saved as a file literally named `null`; keying off the suffix dropped
+  it silently.
+- `--recursive` walks subfolders too, ordering files and subfolders together by the same
+  natural key at **every** level — so a subfolder's pages take their place in the
+  sequence instead of being appended at the end:
+
+  ```
+  1. Foreword.pdf … 8. Pre-delivery Inspection.pdf
+  PERIODIC MAINTENANCE SERVICES PM\1. …      <- follows 8., as printed
+  ```
+- **The combined PDF is verified before the tool exits**: it must reopen and carry
+  exactly the sum of its inputs' page counts. It is staged to a `.part` and moved into
+  place only once that passes, so a failure never leaves a half-written file that looks
+  finished. A malformed input is repaired first (qpdf, then Ghostscript) — and the repair
+  must recover the page count the file's raw bytes say it had, so a partial salvage can't
+  pass itself off as complete.
+
+## Consolidating a split manual (`helpers/combine_sections.py`)
+
+Some manuals are published as **one small PDF per topic**, thousands of them, arranged as
+sections. They're unusable as documents and they defeat compression. This turns each
+section folder into one PDF named after it:
+
+```
+USDM Impreza FSM 1995\BODY SECTION\*.pdf                     (flat)
+USDM Forester FSM 2006\BODY SECTION\AIRBAG SYSTEM AB\*.pdf    (nested)
+
+   ->  USDM Forester FSM 2006\BODY SECTION.pdf
+```
+
+Find the candidates first — never guess which folders qualify:
+
+```bash
+python helpers/find_split_manuals.py "D:\archive" --csv reports/split_manuals.csv
+```
+
+It detects a manual two ways (name marker, or ≥2 `*SECTION*` children — one convention
+is not universal) and gives each root a **verdict**, because consolidating deletes the
+sources: `SPLIT` (combinable) · `CONTAINER` (children are model years, so combining means
+one PDF per *year* — a different decision) · `ALREADY-SECTIONED` · `HTML-DUMP` (more
+non-PDF files than PDFs: a browsable HTML manual that combining would destroy) · `THIN`.
+It is strictly read-only.
+
+Then feed the `SPLIT` roots in, one path per line:
+
+```bash
+python helpers/combine_sections.py roots.txt --dry-run     # report only, writes nothing
+python helpers/combine_sections.py roots.txt --delete      # combine, verify, remove folders
+python helpers/combine_sections.py roots.txt --delete --skip-unrecoverable
+```
+
+**The root is never deleted — only the section folders that were successfully combined.**
+So a root ends up holding one PDF per section, and loose files already sitting at the root
+(standalone guides, an `index.htm`) are left exactly where they are.
+
+**Four gates gate every deletion.** A merge is where pages vanish silently, and a short
+PDF looks no different from a complete one:
+
+| gate | why |
+|---|---|
+| every input readable; the result reopens | an unreadable part would otherwise be skipped |
+| page count == **exact** sum of inputs | the primary check |
+| combined bytes ≥ 0.90× the merged inputs | measured 0.996–1.007 on real sections, so this only fires on gross loss |
+| none of 8 sampled pages blank | a page can merge as an *empty* page without changing the count |
+
+Anything that fails leaves the folder **and** its PDF untouched, and is reported. An
+existing `<SECTION>.pdf` is not blindly skipped either — it is verified against the folder,
+so a faithful one (perhaps from an earlier tool) means the folder is redundant and can go,
+while a mismatch is reported as `CONFLICT` and nothing is touched.
+
+`--skip-unrecoverable` combines a section even when some parts are damaged beyond repair,
+instead of refusing the whole section. It does **not** mean losing them: the damaged
+originals are *moved* to `<SECTION> (UNRECOVERABLE)\`, keeping their subfolder paths,
+before the folder is deleted — so a better tool can still be tried on them later. The row
+is reported `OK-PARTIAL` with the files and page count left out. It's opt-in, so an
+unattended run never ships a section with pages missing.
+
+Progress goes to `reports/combine_sections.csv` after every section (resumable), naming
+every unrecoverable file by its path **relative to the section** — a bare filename is
+ambiguous when one section holds two different `General Description.pdf` files.
 
 ## Born-digital safety
 
