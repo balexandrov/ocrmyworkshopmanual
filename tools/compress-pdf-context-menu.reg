@@ -1,0 +1,41 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Explorer right-click menu: "Compress + OCR (searchable)" on a .pdf FILE.
+;
+;  Double-click this file to install, then confirm the prompt. No admin rights
+;  are needed: it writes only under HKEY_CURRENT_USER, for your account.
+;  On Windows 11 the entry is under "Show more options" (Shift+F10 opens that
+;  menu directly).
+;
+;  Runs with DEFAULT OPTIONS, which means your original file is NOT touched --
+;  the result is written beside it as "<name> (COMPRESSED).pdf".
+;
+;  The one non-default flag is --no-log, so a single right-click does not drop
+;  three report files (.log / .csv / _by_folder.csv) next to your PDF. The
+;  console window shows the same information and stays open until you close it.
+;  Delete "--no-log" from the command below if you want those files kept.
+;
+;  It lives under SystemFileAssociations\.pdf rather than under a ProgID, so it
+;  appears whatever program currently owns the .pdf association (Acrobat, Edge,
+;  a viewer you install later) and does not have to be reinstalled if that
+;  changes.
+;
+;  Selecting several PDFs and clicking this starts one window per file, because
+;  the tool takes a single file at a time. For a whole folder of them, point the
+;  tool at the folder instead: it walks the tree and writes one report.
+;
+;  IF YOU MOVE THE REPO: change the one path below
+;      S:\Projects\Home\ocrmyworkshopmanual\tools\compress_pdf_here.cmd
+;  (keep the doubled backslashes) and re-import. The .cmd finds the script and
+;  the virtualenv relative to its own location, so nothing else needs editing.
+;
+;  To remove: run compress-pdf-context-menu-uninstall.reg.
+; ============================================================================
+
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.pdf\shell\CompressPDF]
+"MUIVerb"="Compress + OCR (searchable)"
+"Icon"="shell32.dll,-16826"
+
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.pdf\shell\CompressPDF\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\compress_pdf_here.cmd\" \"%1\" --no-log"

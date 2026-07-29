@@ -309,6 +309,23 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
   must recover the page count the file's raw bytes say it had, so a partial salvage can't
   pass itself off as complete.
 
+### Right-click "Compress + OCR" on a PDF (Windows)
+
+`tools\compress-pdf-context-menu.reg` adds **Compress + OCR (searchable)** to a `.pdf` file's
+right-click menu. Double-click to install and confirm the prompt — `HKEY_CURRENT_USER` only,
+so no admin rights. Uninstall with `tools\compress-pdf-context-menu-uninstall.reg`.
+
+Default options, so **your original is never touched**: the result is written beside it as
+`<name> (COMPRESSED).pdf`. The one non-default flag is `--no-log`, so a single right-click
+doesn't drop three report files next to your PDF — the console window shows the same
+information and stays open until you close it. Remove `--no-log` from the `.reg` if you want
+them kept.
+
+It installs under `SystemFileAssociations\.pdf`, not under a ProgID, so it shows up whatever
+program currently owns the `.pdf` association and survives changing your default viewer.
+Selecting several PDFs opens one window each, since the tool takes one file at a time — for a
+whole folder, point the tool at the folder instead and it walks the tree with one report.
+
 ### Right-click "Combine PDF" in Explorer (Windows)
 
 `tools\combine-pdf-context-menu.reg` adds a **Combine PDF** submenu to any folder's

@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Removes the "Compress + OCR (searchable)" .pdf context menu installed by
+;  compress-pdf-context-menu.reg.
+;
+;  The leading "-" on the key name means DELETE THAT KEY AND EVERYTHING UNDER
+;  IT. Only this one verb is removed -- the rest of the .pdf association, and
+;  any other tool's entries, are untouched. No files are affected.
+; ============================================================================
+
+[-HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.pdf\shell\CompressPDF]

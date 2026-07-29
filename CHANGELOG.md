@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (Explorer right-click "Compress + OCR" on a PDF)
+
+`tools\compress-pdf-context-menu.reg` adds **Compress + OCR (searchable)** to a `.pdf` file's
+right-click menu, with an uninstall `.reg` beside it. `HKEY_CURRENT_USER` only, so no admin
+rights. Default options, so the original is never touched — the result lands beside it as
+`<name> (COMPRESSED).pdf`.
+
+Installed under `SystemFileAssociations\.pdf` rather than under a ProgID, so it appears
+whatever program owns the `.pdf` association and does not need reinstalling when the default
+viewer changes.
+
+Two judgement calls, both stated in the `.reg` so they can be undone: `--no-log` is passed, so
+one right-click does not leave three report files (`.log`, `.csv`, `_by_folder.csv`) beside the
+PDF — measured on a test run, which is what prompted it — and the console window `pause`s
+instead, showing the same summary. The wrapper also refuses a non-`.pdf`, a missing file or a
+missing argument with a readable message rather than handing them to the tool.
+
 ### Added (Explorer right-click "Combine PDF")
 
 `tools\combine-pdf-context-menu.reg` puts a **Combine PDF** submenu on every folder's
