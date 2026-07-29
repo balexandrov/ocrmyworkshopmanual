@@ -33,8 +33,10 @@ DELETION IS GATED on all of these passing, because a merge is where pages vanish
 silently and a short PDF looks no different from a complete one:
   * every input PDF is readable, and the combined file reopens
   * combined page count == the exact sum of the inputs' page counts
-  * combined bytes >= MIN_SIZE_RATIO x the inputs' bytes (measured 0.996-1.007 on real
-    sections, so this only ever fires on gross loss, not on pypdf sharing resources)
+  * combined bytes >= MIN_SIZE_RATIO x the inputs' bytes — a cheap PROXY only. If it
+    trips, WORD RECALL against the inputs decides: a manual printed from the web merges
+    to ~0.83 of its input bytes with every word intact, so size alone condemned a
+    perfect merge. Recall below MIN_WORD_RECALL is what actually fails the section.
   * of SAMPLE_PAGES pages spread through the result, none is blank (neither text nor
     an image) — a page can merge as an empty page without changing the count
 Any failure leaves the section folder and its PDF untouched and is reported.
@@ -56,11 +58,15 @@ sys.path.insert(0, str(REPO))
 import combine_manual as CM                                    # noqa: E402
 from pypdf import PdfReader                                     # noqa: E402
 
-# Combined bytes must be at least this fraction of the inputs' bytes. Merging copies
-# page streams through, so the real ratio sits at ~1.00 (measured 0.996-1.007 across
-# flat, nested and 714-file sections); this is a floor against gross loss, not a
-# tolerance to tune.
+# Combined bytes as a fraction of the inputs' bytes. Merging copies page streams through,
+# so on a scanned manual the ratio sits at ~1.00 (measured 0.996-1.007 across flat, nested
+# and 714-file sections). It is a cheap PROXY for "did we lose content", not the property
+# itself — see `word_recall` below for what happens when it trips.
 MIN_SIZE_RATIO = 0.90
+
+# Fraction of the inputs' words that must survive into the combined PDF when the size proxy
+# trips. A lossless concatenation scores 1.0; this is the real check, so it is strict.
+MIN_WORD_RECALL = 0.98
 SAMPLE_PAGES = 8
 
 
@@ -101,6 +107,45 @@ def blank_sampled(pdf: Path, k: int = SAMPLE_PAGES) -> tuple:
     return len(idxs), bad
 
 
+def word_recall(inputs: list, out: Path) -> float:
+    """Fraction of the inputs' words present in the combined PDF (1.0 = all of them).
+
+    This is what the size ratio was only ever standing in for. That proxy is calibrated on
+    scanned manuals, where merging copies page streams through and the ratio lands at ~1.00;
+    but a manual captured by PRINTING an online one arrives as many small browser PDFs that
+    each carry their own catalogue, metadata and xref, and pypdf writes the merge more
+    compactly. Measured on a real Outlander section: 0.829 of the input bytes with word
+    recall 1.0000, all 60 images and all 13 embedded font programs intact — nothing missing
+    at all. Rejecting that on size alone threw away a perfect merge, so when the proxy trips
+    the actual content is compared instead.
+
+    Order-independent (multiset of words), so it does not care how the pages were sequenced.
+    Reuses the main tool's `_words` so 'a word' means the same thing here as in its audit."""
+    import ocrmyworkshopmanual as owm
+    from collections import Counter
+
+    def count(pdf: Path) -> Counter:
+        c = Counter()
+        try:
+            rd = PdfReader(str(pdf))
+        except Exception:
+            return c
+        for pg in rd.pages:
+            try:
+                c.update(owm._words(pg.extract_text()))
+            except Exception:
+                pass
+        return c
+
+    want = Counter()
+    for p in inputs:
+        want.update(count(p))
+    if not want:
+        return 1.0                    # nothing extractable to compare (pure image scans)
+    got = count(out)
+    return sum(min(n, got[w]) for w, n in want.items()) / sum(want.values())
+
+
 def drop_self_combined(sec: Path, files: list) -> tuple:
     """(files without any already-combined copy of the folder itself, [names dropped]).
 
@@ -139,12 +184,13 @@ def sections_of(root: Path) -> list:
 
 
 def process_section(sec: Path, root: Path, delete: bool, dry: bool,
-                    skip_broken: bool = False) -> dict:
+                    skip_broken: bool = False, order: str = 'natural') -> dict:
     """Combine one section folder -> <root>\\<section>.pdf, verify, optionally delete
     the folder. Returns a row for the progress CSV; never raises."""
     row = {'root': str(root), 'section': sec.name, 'status': '', 'files': 0, 'pages': 0,
            'src_MB': 0.0, 'out_MB': 0.0, 'ratio': '', 'blank_sampled': '',
-           'unrecoverable': '', 'pages_dropped': '',
+           'unrecoverable': '', 'pages_dropped': '', 'order': order,
+           'docid_missing': '', 'word_recall': '',
            'lost_other_files': '', 'deleted': 'no', 'seconds': 0, 'detail': ''}
     t0 = time.time()
     out = root / (sec.name + '.pdf')
@@ -163,6 +209,15 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool,
         if self_dup:
             notes.append('ignored already-combined copy inside the folder: '
                          + ', '.join(self_dup))
+        # ordering comes AFTER the self-copy check, which compares page counts and does not
+        # care about sequence, and after `collect`, so discovery and ordering stay separate
+        if order == 'docid':
+            files, missing = CM.order_by_docid(files)
+            row['docid_missing'] = missing
+            if missing:
+                row['order'] = 'natural'
+                notes.append(f'{missing} part(s) carry no publisher doc id, so doc-id '
+                             f'order was NOT applied to this section')
         row['files'] = len(files)
         # anything in the folder that is NOT a page we are carrying over would be lost
         # with the folder; name it in the report rather than deleting it silently
@@ -271,10 +326,17 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool,
         # `out.exists()` path — which deliberately does NOT re-check the ratio, since that
         # path is for files another tool made — and quietly accepts what this run refused.
         if ratio < MIN_SIZE_RATIO:
-            row['status'] = 'FAILED'
-            out.unlink(missing_ok=True)
-            return detail(f'combined is only {ratio:.3f} of the merged inputs\' bytes '
-                          f'(floor {MIN_SIZE_RATIO}) — content may be missing')
+            # The proxy tripped; check the thing it stands in for before condemning a file.
+            recall = word_recall(files, out)
+            row['word_recall'] = round(recall, 4)
+            if recall < MIN_WORD_RECALL:
+                row['status'] = 'FAILED'
+                out.unlink(missing_ok=True)
+                return detail(f'combined is only {ratio:.3f} of the merged inputs\' bytes '
+                              f'AND word recall is {recall:.4f} '
+                              f'(floor {MIN_WORD_RECALL}) — content is missing')
+            notes.append(f'smaller than expected ({ratio:.3f} of input bytes) but word '
+                         f'recall {recall:.4f} — a more compact rewrite, nothing lost')
         k, blanks = blank_sampled(out)
         row['blank_sampled'] = f'{blanks}/{k}'
         if blanks:
@@ -305,6 +367,15 @@ def main():
     ap.add_argument('--delete', action='store_true',
                     help='DELETE each section folder after its combined PDF passes every '
                          'check (default: keep everything)')
+    ap.add_argument('--order', choices=('natural', 'docid'), default='natural',
+                    help="page order within each section. 'natural' (default) sorts by "
+                         "filename, right when the parts are numbered. 'docid' reads the "
+                         "publisher document id from each PDF's page-1 browser print header "
+                         '— for a manual captured by printing an online one, whose parts are '
+                         'named by topic so a filename sort is arbitrary. Per section it is '
+                         'all-or-nothing: unless EVERY part has a doc id that section keeps '
+                         'natural order, and the `order` / `docid_missing` columns say which '
+                         'was used')
     ap.add_argument('--skip-unrecoverable', action='store_true',
                     help='combine a section even if some parts are damaged beyond repair, '
                          'leaving those parts OUT of the PDF instead of refusing the whole '
@@ -336,8 +407,8 @@ def main():
     new = not args.progress.exists()
     fh = args.progress.open('a', newline='', encoding='utf-8')
     cols = ['root', 'section', 'status', 'files', 'pages', 'src_MB', 'out_MB', 'ratio',
-            'blank_sampled', 'unrecoverable', 'pages_dropped', 'lost_other_files',
-            'deleted', 'seconds', 'detail']
+            'blank_sampled', 'word_recall', 'order', 'docid_missing', 'unrecoverable',
+            'pages_dropped', 'lost_other_files', 'deleted', 'seconds', 'detail']
     w = csv.DictWriter(fh, fieldnames=cols)
     if new:
         w.writeheader()
@@ -354,7 +425,7 @@ def main():
         print(f'\n[{i}/{len(roots)}] {root}   ({len(secs)} sections)', flush=True)
         for sec in secs:
             row = process_section(sec, root, args.delete, args.dry_run,
-                                  skip_broken=args.skip_unrecoverable)
+                                  skip_broken=args.skip_unrecoverable, order=args.order)
             w.writerow(row)
             fh.flush()
             tally[row['status']] = tally.get(row['status'], 0) + 1

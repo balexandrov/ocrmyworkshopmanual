@@ -5,6 +5,58 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (`--order docid`: publisher page order for a manual printed from the web)
+
+Consolidating the Mitsubishi Outlander 2022 repair manual (9 sections, 109 parts) hit a case
+the Subaru manuals never did. Those parts were named `1. Foreword.pdf`, `2. How to Use…` —
+the filename sort *was* the page order. These are named by TOPIC (`CONSULT Function.pdf`,
+`DTC Index.pdf`, `Reference Value.pdf`), so sorting by name is arbitrary: it put the
+diagnostics tooling ahead of the DTC index and split `System Description` from
+`Shift system description`.
+
+Every part is a browser print-to-PDF capture, and its page-1 print header still carries the
+source URL with the publisher's document id (`…/2022/06/HTML/N5060302G0000900USA.htm`).
+Sorting on that restores the manual's own sequence — measured 100% coverage (109/109), and
+the shipped `AT.pdf` now runs Component Description → Component Parts Location → DTC Index →
+the three System Descriptions together → TCM → the Electric Shift components → CONSULT
+Function → Reference Value.
+
+- `combine_manual.py`: `docid_key()` / `order_by_docid()`, and `--order {natural,docid}`
+  (default `natural`, so existing behaviour is untouched). Discovery stays in `collect()`;
+  ordering is a separate step.
+- **All-or-nothing per section.** Unless *every* part has a doc id, the section keeps natural
+  order. A half-publisher, half-alphabetical sequence cannot be reviewed and nothing in the
+  result would reveal which half you are looking at. This also makes the flag safe to leave
+  on for a numbered-parts manual: coverage is zero, so nothing is reordered.
+- `helpers/combine_sections.py` forwards `--order` and records `order` / `docid_missing` per
+  row, because "did this section get publisher order or fall back?" is exactly the question
+  to ask of a combined manual.
+
+### Fixed (the size gate condemned three perfect merges)
+
+Three of those nine sections failed on `combined bytes >= 0.90x the inputs` (0.829, 0.854,
+0.844) with their page counts verifying exactly. Measured before changing anything: word
+recall **1.0000** (3663 of 3663 words), 0 blank pages, all 60 images and all 13 embedded font
+programs present. Nothing was missing — a print-captured manual arrives as many small browser
+PDFs that each carry their own catalogue, metadata and xref, and pypdf writes the merge more
+compactly. The 0.90 floor was calibrated on scanned sections (0.996–1.007) and does not
+describe this class of file.
+
+The size ratio was only ever a cheap **proxy** for "did we lose content", so when it trips it
+now defers to the thing it stands in for: word recall against the inputs (reusing the main
+tool's `_words`). Below `MIN_WORD_RECALL` (0.98) the section still fails and its folder
+survives; above it, the file ships with both the ratio and the recall recorded in the new
+`word_recall` column.
+
+That change exposed a second gap. A test asserting "a broken part keeps its folder" had been
+passing only because of this false positive: its fixture is
+`b'%PDF-1.4 but truncated garbage'`, which **Ghostscript repairs into a one-page PDF**. With
+no `/Type /Page` objects in the bytes and no object streams to hide them in, a count of 0 is
+trustworthy — nothing survives to recover, and accepting that salvage appends an *invented*
+page to the manual. `raw_pages()` now reports whether its count can be trusted (`/ObjStm`
+present means "cannot tell", and keeps the lenient path), and an unreadable file with a
+trustworthy 0 is reported unrecoverable instead of repaired.
+
 ### Added (consolidate a manual published as thousands of small PDFs)
 
 Some manuals ship as one small PDF per topic — `USDM Forester FSM 2006\BODY SECTION\AIRBAG

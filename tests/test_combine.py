@@ -130,7 +130,176 @@ def test_combine_detects_page_loss(tmp_path, monkeypatch):
     assert not (tmp_path / 'out.pdf').exists()
 
 
+# ── publisher order for a printed-from-the-web manual ─────────────────────────
+
+def _printed(path: Path, group: str, docid: str, title: str = 'Topic') -> Path:
+    """A part that looks like a browser print-to-PDF capture: the page-1 header carries
+    the source URL, which is the only surviving record of the publisher's order."""
+    return U.make_born_digital_pdf(
+        path, npages=2, lines_per_page=3,
+        header=f'1/6/23, 10:57 PM {title}\n'
+               f'https://example.com/data/DG/2022/{group}/HTML/{docid}.htm 1/2')
+
+
+def test_docid_key_reads_the_print_header(tmp_path):
+    p = _printed(tmp_path / 'DTC Index.pdf', '06', 'N5060302G0000900USA')
+    assert CM.docid_key(p) == ('0006', 'N5060302G0000900USA')
+    assert CM.docid_key(_pdf(tmp_path / 'plain.pdf')) is None
+
+
+def test_docid_order_beats_alphabetical(tmp_path):
+    """The real case: parts named by topic, so a filename sort puts the diagnostics tooling
+    ahead of the DTC index. The doc ids restore the publisher's sequence."""
+    d = tmp_path / 'AT'
+    d.mkdir()
+    _printed(d / 'CONSULT Function.pdf', '04', 'N5040208L0000500USA')
+    _printed(d / 'Component Description.pdf', '04', 'N5040200P0000300USA')
+    _printed(d / 'DTC Index.pdf', '04', 'N5040201F0000500USA')
+    _printed(d / 'Reference Value.pdf', '04', 'N5040208N0000500USA')
+
+    alpha = [p.name for p in CM.collect(d)]
+    assert alpha == ['Component Description.pdf', 'CONSULT Function.pdf',
+                     'DTC Index.pdf', 'Reference Value.pdf'], alpha
+
+    ordered, missing = CM.order_by_docid(CM.collect(d))
+    assert missing == 0
+    assert [p.name for p in ordered] == ['Component Description.pdf', 'DTC Index.pdf',
+                                         'CONSULT Function.pdf', 'Reference Value.pdf']
+
+
+def test_docid_order_is_all_or_nothing(tmp_path):
+    """One part without a doc id must NOT be shuffled to the end — the whole section keeps
+    natural order instead. A half-publisher, half-alphabetical sequence cannot be reviewed,
+    and nothing in the result would say which half you are looking at."""
+    d = tmp_path / 'S'
+    d.mkdir()
+    _printed(d / 'b.pdf', '04', 'N5040201F0000500USA')
+    _printed(d / 'a.pdf', '04', 'N5040208N0000500USA')   # doc id would sort it AFTER b
+    _pdf(d / 'c.pdf')                                    # no doc id at all
+
+    natural = CM.collect(d)
+    ordered, missing = CM.order_by_docid(natural)
+    assert missing == 1
+    assert ordered == natural, 'a partial doc-id set must leave the order untouched'
+
+
+def test_section_records_which_order_it_used(tmp_path):
+    """The row has to say whether publisher order was applied, or a reviewer cannot tell a
+    correctly-ordered manual from a fallback."""
+    root = tmp_path / 'M'
+    sec = root / 'AT'
+    sec.mkdir(parents=True)
+    _printed(sec / 'z_later.pdf', '04', 'N5040200P0000300USA')   # doc id puts it FIRST
+    _printed(sec / 'a_first.pdf', '04', 'N5040208N0000500USA')
+
+    row = CS.process_section(sec, root, delete=False, dry=False, order='docid')
+    assert row['status'] == 'OK', row
+    assert row['order'] == 'docid' and row['docid_missing'] == 0
+    # the pages really came out in doc-id order, not filename order: each part carries its
+    # own URL on its first page, so the combined page 1 identifies which part led
+    out = PdfReader(str(root / 'AT.pdf'))
+    assert len(out.pages) == 4
+    first = out.pages[0].extract_text() or ''
+    assert 'N5040200P0000300USA' in first, (
+        f'expected z_later.pdf (lowest doc id) first, got: {first[:200]!r}')
+
+    # a section with a bare part falls back, and says so
+    sec2 = root / 'BR'
+    sec2.mkdir()
+    _printed(sec2 / 'a.pdf', '04', 'N5040200P0000300USA')
+    _pdf(sec2 / 'b.pdf')
+    row2 = CS.process_section(sec2, root, delete=False, dry=False, order='docid')
+    assert row2['status'] == 'OK', row2
+    assert row2['order'] == 'natural' and row2['docid_missing'] == 1
+    assert 'doc-id order was NOT applied' in row2['detail']
+
+
+def test_default_order_is_unchanged(tmp_path):
+    """`--order natural` (the default) must behave exactly as before."""
+    d = tmp_path / 'S'
+    d.mkdir()
+    for n in (1, 2, 10):
+        _printed(d / f'{n}. Part.pdf', '04', f'N504020{n}F0000500USA')
+    root = d.parent
+    row = CS.process_section(d, root, delete=False, dry=False)      # no order= given
+    assert row['order'] == 'natural' and row['docid_missing'] == ''
+    assert [p.name for p in CM.collect(d)] == ['1. Part.pdf', '2. Part.pdf', '10. Part.pdf']
+
+
+# ── the size ratio is a proxy; word recall is the real check ──────────────────
+
+def test_word_recall_is_one_for_a_faithful_merge(tmp_path):
+    d = tmp_path / 's'
+    d.mkdir()
+    a, b = _pdf(d / '1.pdf', npages=2), _pdf(d / '2.pdf', npages=3)
+    out = tmp_path / 'out.pdf'
+    CM.combine(CM.collect(d), out)
+    assert CS.word_recall([a, b], out) == pytest.approx(1.0)
+
+
+def test_a_small_merge_ships_when_every_word_survives(tmp_path, monkeypatch):
+    """A manual captured by PRINTING an online one merges to ~0.83 of its input bytes with
+    nothing missing — each part carries its own catalogue/metadata/xref and pypdf writes the
+    merge compactly. Measured on a real Outlander section: ratio 0.829, word recall 1.0000,
+    all 60 images and 13 font programs intact. Refusing that on size alone threw away three
+    perfect merges, so the size proxy must defer to the content check."""
+    root = tmp_path / 'M'
+    sec = root / 'ABS'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1.pdf', npages=2)
+    _pdf(sec / '2.pdf', npages=2)
+    # force the proxy to trip, exactly as the real print-captures do
+    monkeypatch.setattr(CS, 'MIN_SIZE_RATIO', 1.5)
+
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'OK', row
+    assert row['word_recall'] == pytest.approx(1.0)
+    assert 'nothing lost' in row['detail']
+    assert row['deleted'] == 'yes' and not sec.exists()
+
+
+def test_a_small_merge_with_missing_words_still_fails(tmp_path, monkeypatch):
+    """The other direction: when the bytes are short AND the words are gone, it is real loss
+    and the folder must survive."""
+    root = tmp_path / 'M'
+    sec = root / 'S'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1.pdf', npages=2)
+    _pdf(sec / '2.pdf', npages=2)
+    monkeypatch.setattr(CS, 'MIN_SIZE_RATIO', 1.5)
+    monkeypatch.setattr(CS, 'word_recall', lambda inputs, out: 0.40)
+
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'FAILED', row
+    assert 'content is missing' in row['detail']
+    assert sec.exists() and row['deleted'] == 'no'
+    assert not (root / 'S.pdf').exists(), 'a refused merge leaves no output'
+
+
 # ── a repair must not be taken at face value ──────────────────────────────────
+
+def test_garbage_is_not_repaired_into_an_invented_page(tmp_path):
+    """Ghostscript emits a one-page PDF from `%PDF-1.4 but truncated garbage`. There are no
+    `/Type /Page` objects in those bytes and no object streams to hide them in, so the count
+    of 0 is trustworthy: nothing survives to recover, and accepting the salvage would append
+    an INVENTED page to the manual. Must be reported unrecoverable instead."""
+    p = tmp_path / 'junk.pdf'
+    p.write_bytes(b'%PDF-1.4 but truncated garbage')
+    assert CM.page_count(p) < 0
+    assert CM.raw_pages(p) == (0, True), 'a 0 count with no /ObjStm is trustworthy'
+
+    _files, reps = CM.repair_inputs([p], tmp_path / 'w', base=tmp_path)
+    assert [r.status for r in reps] == ['failed'], reps
+
+
+def test_objstm_pdf_keeps_the_lenient_path(tmp_path):
+    """A PDF that stores its page dicts in compressed object streams shows none in the
+    clear, so a 0 count there means 'cannot tell' — it must NOT be treated as 'no pages',
+    or a repairable file would be refused."""
+    p = tmp_path / 'objstm.pdf'
+    p.write_bytes(b'%PDF-1.5\n5 0 obj << /Type /ObjStm /N 3 >> stream\n...\nendstream\n')
+    assert CM.raw_pages(p) == (0, False), 'a 0 count with /ObjStm is not trustworthy'
+
 
 def test_pages_in_raw_bytes_counts_page_objects_not_the_tree(tmp_path):
     """`/Type /Pages` is the tree node, not a page — counting it would inflate the

@@ -203,10 +203,15 @@ def make_scan_pdf(path: Path, npages: int = 3, dpi: int = 300) -> Path:
     return path
 
 
-def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25) -> Path:
+def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25,
+                          header: str = None) -> Path:
     """Hand-build a valid born-digital PDF: vector Helvetica text, NO raster images.
     Used to test the born-digital safety check (looks_born_digital / copy-through).
-    Kept dependency-free (no reportlab) by writing objects + a correct xref by hand."""
+    Kept dependency-free (no reportlab) by writing objects + a correct xref by hand.
+
+    `header` prepends its lines to page 1's text, which is how a browser print-to-PDF
+    capture records the source URL it came from — the signal `docid_key` reads to recover a
+    printed-from-the-web manual's real page order."""
     objs, font_id, nid = {}, 3, 4
     content_ids, page_ids = [], []
     for _ in range(npages):
@@ -220,6 +225,12 @@ def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25)
     for i in range(npages):
         parts = [f'BT /F1 18 Tf 72 740 Td (Born-digital vector page {i + 1}) Tj ET']
         y = 700
+        if header and i == 0:
+            for line in header.splitlines():
+                # escape the PDF string delimiters so a URL with () or \\ stays valid
+                esc = line.replace('\\', r'\\').replace('(', r'\(').replace(')', r'\)')
+                parts.append(f'BT /F1 8 Tf 72 {y} Td ({esc}) Tj ET')
+                y -= 12
         for j in range(lines_per_page):
             parts.append(f'BT /F1 11 Tf 72 {y} Td (Line {j + 1}: selectable vector text, '
                          f'no raster images at all.) Tj ET')

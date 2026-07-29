@@ -341,7 +341,25 @@ Then feed the `SPLIT` roots in, one path per line:
 python helpers/combine_sections.py roots.txt --dry-run     # report only, writes nothing
 python helpers/combine_sections.py roots.txt --delete      # combine, verify, remove folders
 python helpers/combine_sections.py roots.txt --delete --skip-unrecoverable
+python helpers/combine_sections.py roots.txt --delete --order docid
 ```
+
+**`--order docid` is for a manual captured by printing an online one.** Those parts are
+named by *topic* (`CONSULT Function.pdf`, `DTC Index.pdf`), so a filename sort is arbitrary
+and would put the diagnostics tooling ahead of the DTC index. Every page keeps the browser's
+print header, and its URL carries the publisher's document id:
+
+```
+1/6/23, 10:57 PM DTC Index
+https://…/data/DG/2022/06/HTML/N5060302G0000900USA.htm 1/15
+```
+
+Sorting on that restores the manual's own sequence. It is **all-or-nothing per section**:
+unless every part has a doc id, that section keeps natural order rather than emitting a
+half-publisher, half-alphabetical mix that nothing in the result would let you detect. The
+`order` and `docid_missing` columns record which was actually used, so leaving the flag on
+for a manual with numbered parts is safe — none of those carry doc ids, so nothing is
+reordered.
 
 **The root is never deleted — only the section folders that were successfully combined.**
 So a root ends up holding one PDF per section, and loose files already sitting at the root
@@ -354,8 +372,16 @@ PDF looks no different from a complete one:
 |---|---|
 | every input readable; the result reopens | an unreadable part would otherwise be skipped |
 | page count == **exact** sum of inputs | the primary check |
-| combined bytes ≥ 0.90× the merged inputs | measured 0.996–1.007 on real sections, so this only fires on gross loss |
+| combined bytes ≥ 0.90× the merged inputs | a cheap *proxy*; if it trips, **word recall** against the inputs decides — see below |
 | none of 8 sampled pages blank | a page can merge as an *empty* page without changing the count |
+
+The size gate is only a proxy for "did we lose content", calibrated on scanned manuals
+where merging copies page streams through (0.996–1.007). A manual captured by **printing an
+online one** merges to ~0.83 of its input bytes with nothing missing at all — each part
+carries its own catalogue, metadata and xref, and pypdf writes the merge more compactly
+(measured: 0.829 with word recall 1.0000, all 60 images and 13 embedded fonts intact). So
+when the proxy trips, the words are compared: recall below 0.98 fails the section, otherwise
+it ships with the ratio and recall both recorded in the row.
 
 Anything that fails leaves the folder **and** its PDF untouched, and is reported. An
 existing `<SECTION>.pdf` is not blindly skipped either — it is verified against the folder,

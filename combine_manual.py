@@ -129,6 +129,46 @@ def page_count(pdf: Path) -> int:
         return -1
 
 
+# A browser print-to-PDF header, which is where a printed HTML manual records where the
+# page came from:
+#     1/6/23, 10:57 PM DTC Index
+#     https://mitsubishitechinfo.com/data/DG/2022/06/HTML/N5060302G0000900USA.htm 1/15
+# The `06` is the publisher's group and `N5060302G0000900USA` its document id; sorting on
+# them reproduces the manual's own order.
+_DOCID_URL = re.compile(r'https?://\S*?/(\d{4})/(\d+)/HTML/([A-Za-z0-9]+)\.htm',
+                        re.IGNORECASE)
+
+
+def docid_key(pdf: Path):
+    """(group, docid) from a PDF's page-1 print header, or None if it has none.
+
+    Some manuals are captured by printing an online manual page by page. The parts are then
+    named by TOPIC (`CONSULT Function.pdf`, `DTC Index.pdf`), so a filename sort is
+    alphabetical — i.e. arbitrary — and would put the diagnostics tooling before the DTC
+    index. The print header is the only surviving record of the publisher's own order."""
+    try:
+        text = PdfReader(win_long(pdf)).pages[0].extract_text() or ''
+    except Exception:
+        return None
+    m = _DOCID_URL.search(text)
+    return (m.group(2).zfill(4), m.group(3)) if m else None
+
+
+def order_by_docid(files) -> tuple:
+    """(files in publisher order, how many had no doc id).
+
+    ALL-OR-NOTHING by design: if any file lacks a doc id the ORIGINAL order is returned
+    untouched. A consistent order can be reviewed; a half-publisher, half-alphabetical one
+    cannot, and there is no way to tell from the result which half you are looking at. It
+    also makes the option safe to leave on for a manual whose parts are numbered instead —
+    none of those carry a doc id, so coverage is zero and nothing is reordered."""
+    keys = [(docid_key(p), p) for p in files if is_pdf(p)]
+    missing = sum(1 for k, _p in keys if k is None) + sum(1 for p in files if not is_pdf(p))
+    if missing or not keys:
+        return list(files), missing
+    return [p for _k, p in sorted(keys, key=lambda kp: (kp[0], natkey(kp[1].name)))], 0
+
+
 def expected_pages(files) -> tuple:
     """(total pages the combined PDF must have, list of unreadable inputs).
 
@@ -151,18 +191,29 @@ def expected_pages(files) -> tuple:
 _PAGE_OBJ = re.compile(rb'/Type\s*/Page(?![s/\w])')
 
 
-def pages_in_raw_bytes(pdf: Path) -> int:
-    """Lower bound on a PDF's page count, read from its RAW BYTES — usable when the file
-    is too broken for a parser to open at all.
+def raw_pages(pdf: Path) -> tuple:
+    """(page count read from the RAW BYTES, whether that count can be trusted).
 
-    Counts `/Type /Page` object dictionaries (never `/Type /Pages`, the tree node). This
-    UNDER-counts a PDF that keeps its page dicts in compressed object streams, which is
-    the safe direction: it can only ever make the partial-salvage check below more
-    lenient, never make it reject a sound repair."""
+    Usable when the file is too broken for a parser to open at all. Counts `/Type /Page`
+    object dictionaries — never `/Type /Pages`, the tree node.
+
+    A PDF that keeps its page dicts inside compressed object streams shows none of them in
+    the clear, so a zero count there means "cannot tell", not "no pages". The presence of
+    `/ObjStm` is what separates the two, and the distinction matters: a count of 0 that is
+    TRUSTWORTHY means the file has no page structure left at all, and a "repair" of it —
+    Ghostscript will happily emit one page out of `%PDF-1.4 but truncated garbage` — is
+    inventing content, not recovering it."""
     try:
-        return len(_PAGE_OBJ.findall(pdf.read_bytes()))
+        raw = pdf.read_bytes()
     except OSError:
-        return 0
+        return 0, False
+    n = len(_PAGE_OBJ.findall(raw))
+    return n, (n > 0 or b'/ObjStm' not in raw)
+
+
+def pages_in_raw_bytes(pdf: Path) -> int:
+    """Page count from the raw bytes, 0 when unknown. See `raw_pages` for the caveat."""
+    return raw_pages(pdf)[0]
 
 
 Repair = namedtuple('Repair', 'src rel status recovered expected')
@@ -200,7 +251,14 @@ def repair_inputs(files, work: Path, base: Path = None) -> tuple:
             out.append(p)
             continue
         rel = p.relative_to(base) if base else Path(p.name)
-        want = pages_in_raw_bytes(p)
+        want, trusted = raw_pages(p)
+        if trusted and want == 0:
+            # No page structure survives in the bytes, so there is nothing to recover and no
+            # way to verify a salvage. Ghostscript still produces a one-page PDF from pure
+            # garbage; accepting that would append an invented page to the manual.
+            results.append(Repair(p, rel, 'failed', 0, 0))
+            out.append(p)
+            continue
         sub = work / f'rep{i:05d}'
         sub.mkdir(parents=True, exist_ok=True)
         # STRICT first — exactly what the main tool does, but told how many pages to expect
@@ -289,6 +347,14 @@ def main():
                     help='also walk subfolders (for a manual split into per-topic '
                          'subfolders); files and subfolders are ordered together by the '
                          'same natural key at every level')
+    ap.add_argument('--order', choices=('natural', 'docid'), default='natural',
+                    help="page order. 'natural' (default) sorts by filename, which is right "
+                         "when the parts are numbered. 'docid' reads the publisher document "
+                         "id out of each PDF's page-1 browser print header and sorts on "
+                         'that — for a manual captured by printing an online one, whose '
+                         'parts are named by topic so a filename sort is arbitrary. Falls '
+                         'back to natural order for the whole folder unless EVERY part has '
+                         'a doc id')
     ap.add_argument('--dry-run', action='store_true',
                     help='print the page order and output path, then stop (write nothing)')
     ap.add_argument('--no-compress', action='store_true',
@@ -311,10 +377,17 @@ def main():
                  f'{folder}' + ('' if args.recursive else
                                 ' (its files may be in subfolders — try --recursive)'))
 
+    order_note = ''
+    if args.order == 'docid':
+        files, missing = order_by_docid(files)
+        order_note = (f'  [order: natural — {missing} part(s) carry no publisher doc id, '
+                      f'so doc-id order was NOT applied]' if missing else
+                      '  [order: publisher doc id]')
+
     out_pdf = folder.parent / (folder.name + '.pdf')
     n_img = sum(1 for p in files if not is_pdf(p))
     n_pdf = len(files) - n_img
-    print(f'{len(files)} files ({n_img} image, {n_pdf} pdf) -> {out_pdf}\n')
+    print(f'{len(files)} files ({n_img} image, {n_pdf} pdf) -> {out_pdf}{order_note}\n')
     print('Page order:')
     for i, p in enumerate(files, 1):
         # under --recursive the bare name is ambiguous (every subfolder has a
