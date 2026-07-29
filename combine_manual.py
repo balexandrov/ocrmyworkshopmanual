@@ -147,30 +147,57 @@ def expected_pages(files) -> tuple:
     return total, bad
 
 
+_PAGE_OBJ = re.compile(rb'/Type\s*/Page(?![s/\w])')
+
+
+def pages_in_raw_bytes(pdf: Path) -> int:
+    """Lower bound on a PDF's page count, read from its RAW BYTES — usable when the file
+    is too broken for a parser to open at all.
+
+    Counts `/Type /Page` object dictionaries (never `/Type /Pages`, the tree node). This
+    UNDER-counts a PDF that keeps its page dicts in compressed object streams, which is
+    the safe direction: it can only ever make the partial-salvage check below more
+    lenient, never make it reject a sound repair."""
+    try:
+        return len(_PAGE_OBJ.findall(pdf.read_bytes()))
+    except OSError:
+        return 0
+
+
 def repair_inputs(files, work: Path) -> tuple:
     """Repair the unreadable PDFs among `files`, reusing ocrmyworkshopmanual's qpdf-then-
     Ghostscript repair. Returns (files with repaired copies substituted, [(orig, note)]).
 
-    Refusing a whole section over one malformed part would leave the manual split forever;
-    and these are trivially recoverable — measured across this archive, 5 of 6 bad inputs
-    were an intact PDF with stray newlines before `%PDF`, the sixth a missing EOF marker.
-    A part that cannot be repaired is left in place, so `expected_pages` still reports it
-    and the section is still refused rather than silently shortened."""
+    Refusing a whole section over one malformed part would leave the manual split forever,
+    so a recoverable part is recovered. But a repair is NOT taken at face value: the page
+    count that guards the merge is computed from the files handed to it, so a repair that
+    salvaged 1 page of 9 would agree with itself and pass, and the section's source folder
+    would then be deleted. Measured on a real Baja transmission section — three truncated
+    parts holding 3, 9 and 6 page objects, from each of which qpdf salvaged exactly one
+    page: ~15 pages would have been lost silently.
+
+    So each repair must recover at least as many pages as the raw bytes say the original
+    had (`_repair_pdf` rejects a partial salvage itself, given the expectation). A part
+    that cannot be recovered in full is left unreadable on purpose, so `expected_pages`
+    still reports it, `combine` still refuses, and the folder is still kept."""
     import ocrmyworkshopmanual as owm
     out, fixed = [], []
     for i, p in enumerate(files):
         if not is_pdf(p) or page_count(p) >= 0:
             out.append(p)
             continue
+        want = pages_in_raw_bytes(p)
         sub = work / f'rep{i:05d}'
         sub.mkdir(parents=True, exist_ok=True)
-        rep = owm._repair_pdf(p, sub)
-        if rep and page_count(rep) >= 0:
+        rep = owm._repair_pdf(p, sub, expect_pages=want)
+        got = page_count(Path(rep)) if rep else -1
+        if rep and got >= 0 and (not want or got >= want):
             out.append(Path(rep))
-            fixed.append((p, f'repaired ({page_count(rep)} pages)'))
+            fixed.append((p, f'repaired ({got} pages)'))
         else:
             out.append(p)                       # unrepairable — let the count refuse it
-            fixed.append((p, 'REPAIR FAILED'))
+            fixed.append((p, f'REPAIR INCOMPLETE (recovered {got} of ~{want} pages)'
+                            if got >= 0 else 'REPAIR FAILED'))
     return out, fixed
 
 

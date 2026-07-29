@@ -130,6 +130,76 @@ def test_combine_detects_page_loss(tmp_path, monkeypatch):
     assert not (tmp_path / 'out.pdf').exists()
 
 
+# ── a repair must not be taken at face value ──────────────────────────────────
+
+def test_pages_in_raw_bytes_counts_page_objects_not_the_tree(tmp_path):
+    """`/Type /Pages` is the tree node, not a page — counting it would inflate the
+    expectation and make the partial-salvage check reject sound repairs."""
+    p = tmp_path / 'x.pdf'
+    p.write_bytes(b'%PDF-1.4\n/Type /Pages /Count 3\n/Type /Page\n/Type/Page\n'
+                  b'/Type /Page\n')
+    assert CM.pages_in_raw_bytes(p) == 3
+
+
+def test_partial_salvage_is_refused_not_silently_accepted(tmp_path, monkeypatch):
+    """The hole this closes: `expected_pages` runs on the files handed to the merge, so a
+    repair that salvaged 1 page of 9 agrees with itself and passes — and the source folder
+    is then deleted. Measured on a real Baja section: three truncated parts holding 3, 9
+    and 6 page objects, one page salvaged from each, ~15 pages lost silently.
+
+    A repair that cannot recover the raw-byte page count must leave the part unreadable so
+    the merge refuses the whole section."""
+    root = tmp_path / 'M'
+    sec = root / 'Transmission Section'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1. Good.pdf', npages=2)
+    # a part that looks like it holds 9 pages but cannot be parsed
+    (sec / '2. Truncated.pdf').write_bytes(
+        b'%PDF-1.4\n' + b'/Type /Page\n' * 9 + b'\x00\x01truncated mid-stream')
+    assert CM.page_count(sec / '2. Truncated.pdf') < 0
+    assert CM.pages_in_raw_bytes(sec / '2. Truncated.pdf') == 9
+
+    # a repair tool that salvages only ONE page must not be believed
+    import ocrmyworkshopmanual as owm
+
+    def fake_repair(src, work, expect_pages=0, timeout=0, stats=None):
+        out = Path(work) / 'salvaged.pdf'
+        _pdf(out, npages=1)
+        if expect_pages and 1 < expect_pages:
+            return None          # this is what the real _repair_pdf does
+        return out
+
+    monkeypatch.setattr(owm, '_repair_pdf', fake_repair)
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'FAILED', row
+    assert sec.exists() and (sec / '1. Good.pdf').exists(), 'folder must be kept'
+    assert not (root / 'Transmission Section.pdf').exists()
+
+
+def test_full_recovery_is_accepted(tmp_path, monkeypatch):
+    """The other direction: a repair that recovers every page lets the section through, so
+    one malformed part does not strand a manual as un-combinable forever."""
+    root = tmp_path / 'M'
+    sec = root / 'S'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1. Good.pdf', npages=2)
+    (sec / '2. Broken.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 broken')
+    assert CM.pages_in_raw_bytes(sec / '2. Broken.pdf') == 1
+
+    import ocrmyworkshopmanual as owm
+
+    def fake_repair(src, work, expect_pages=0, timeout=0, stats=None):
+        out = Path(work) / 'salvaged.pdf'
+        _pdf(out, npages=1)
+        return out
+
+    monkeypatch.setattr(owm, '_repair_pdf', fake_repair)
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'OK', row
+    assert row['pages'] == 3 and not sec.exists()
+    assert 'repaired' in row['detail']
+
+
 # ── a folder that contains a merge of itself ──────────────────────────────────
 
 def test_self_combined_copy_is_ignored(tmp_path):
