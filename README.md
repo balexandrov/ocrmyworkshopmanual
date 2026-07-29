@@ -161,6 +161,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--photo-dpi N` | `150` | Downsample photo pages to this dpi (`0` = keep render dpi) |
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
+| `--min-compress-mb N` | `5` | Don't compress files smaller than this. The absolute win on a small file is a few hundred KB, against a lossy re-encode of every page — so they're passed through untouched and reported `kept original` / `small size`. **OCR is still checked and added** if the file has no text layer: too small to be worth compressing is not too small to be worth making searchable. `0` = compress everything |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `600` | **Stall** timeout, not a time budget: max seconds a step may make **no progress** (no new page rendered, no bytes written) before it's treated as hung, killed, and the file marked FAILED. A slow-but-working file is never killed for being big, however long it takes. OCR is deliberately *not* bounded by it (ocrmypdf emits no usable progress signal, so any bound just killed healthy work). Transient crashes are retried automatically. (`0` = disable) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
@@ -184,6 +185,31 @@ photo pages are always paper-whitened/edge-trimmed, and duplicate files are alwa
 flagged (hashing every file is cheap next to actually compressing it). None of these
 have a legitimate reason to be turned off — see [Born-digital safety](#born-digital-safety)
 and [Resilience & preview](#resilience--preview-for-large-collections) below.
+
+### Where to set `--min-compress-mb` (it is a real trade-off)
+
+The default `5` is a **CPU-for-size** choice, not a free win, and it is worth knowing what it
+costs before leaving it alone. Measured across 14 run reports (1,031 scanned file-rows) against
+a 375k-file archive (40,041 scanned PDFs, 51.4 GB):
+
+| band (MB) | median result | archive files | archive GB | GB saveable |
+|---|---|---|---|---|
+| 0 – 0.25 | **99% of original** | 26,094 | 2.4 | 0.02 |
+| 0.25 – 5 | 45–57% of original | 11,938 | 14.0 | 3.62 |
+| 5 + | 32% of original | 2,009 | 35.1 | 19.87 |
+
+- **`5`** skips 95% of scanned files (31.7% of scanned *bytes*) and forfeits **~3.6 GB**. Cheapest
+  to run. It also means those files get no visual clean-up, because the cleaned image *is* the
+  compressed image here — skip the compression and you skip the background-flatten, the Sauvola
+  threshold, the paper-whitening and the descreen with it.
+- **`0.25`** skips only the band where compression provably does nothing (median 99% of original)
+  — still the bulk of the file count, so most of the CPU saving, for ~0.02 GB forfeited.
+- **`0`** compresses everything and relies on `--min-savings` to judge each file on its real
+  result. Nothing forfeited; ~26k files get a full render+encode pass that is then discarded.
+
+Whichever you pick, each run's summary prints the MB behind every reason
+(`kept because: 67 small size (12.7 MB), …`), so the floor's cost on *your* tree is visible in
+the report rather than something to estimate.
 
 ---
 
@@ -303,17 +329,29 @@ damage; failing to compress something only costs savings. Concretely:
 
 After each folder run a report log is written (to the dest root by default, or `--log
 PATH`; disable with `--no-log`). It records the settings used, then **per file** what
-happened (`compressed` / `kept original` / `OCR-only` / `born-digital (copied untouched)`
-/ `FAILED`) with sizes and the born-digital scan signals, and a final **summary tally +
-total bytes saved** — so a big batch is reviewable at a glance. Two machine-readable
-**`.csv` siblings** are written alongside it and **flushed per file** (so you can open
-them while a run is still going):
-- the main `.csv` — one row per file: `file, action, orig size (MB), new size (MB), %,
-  duplicate of, page types, note, warnings, error` (sizes in MB; filter `error` non-blank to
-  feed `--retry-failed`). `page types` is a machine-readable tally of how the pages were
-  classified (`line=12 vector=3`), so a collection can be grouped by content type without
-  parsing the prose `note`. `warnings` carries whatever the PDF libraries said about *that*
-  file — see below.
+happened, **why**, and **what became of its text layer**, with sizes and the born-digital
+scan signals, and a final **summary tally + total bytes saved** — so a big batch is
+reviewable at a glance. Two machine-readable **`.csv` siblings** are written alongside it
+and **flushed per file** (so you can open them while a run is still going):
+- the main `.csv` — one row per file: `file, action, reason, ocr, language, orig size (MB),
+  new size (MB), %, duplicate of, page types, note, warnings, error` (sizes in MB; filter
+  `error` non-blank to feed `--retry-failed`).
+
+  The **four decision columns** each take values from a fixed vocabulary, so a run over
+  thousands of files sorts, filters and pivots without reading the prose `note`:
+
+  | column | values | answers |
+  |---|---|---|
+  | `action` | `compressed` · `kept original` · `FAILED` | What was done to the file |
+  | `reason` | `compressible` · `born digital` · `already compressed` · `small size` · `error` | Why that happened |
+  | `ocr` | `new ocr` · `re-ocr` · `kept existing` · `not requested` · `failed` | What became of the searchable text layer |
+  | `language` | e.g. `eng`, `rus+eng` | Which packs OCR actually used (blank when no OCR ran, since until then the value is still the unresolved `auto`) |
+
+  `re-ocr` vs `new ocr` is the difference between *replacing* a manual's existing text
+  layer and giving it its first one — and `kept existing` means ocrmypdf never ran on it.
+  `page types` is a machine-readable tally of how the pages were classified
+  (`line=12 vector=3`), so a collection can be grouped by content type. `warnings` carries
+  whatever the PDF libraries said about *that* file — see below.
 - a `…_by_folder.csv` — one summary row per source subfolder (`folder, files, orig size
   (MB), new size (MB), %, saved (MB)`) plus a `(TOTAL)` row, so you can see which
   manual-series compress well. The same rollup is printed in the `.log`.

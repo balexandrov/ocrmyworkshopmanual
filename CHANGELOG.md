@@ -5,6 +5,80 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (the report says what happened AND why; small files are no longer re-imaged)
+
+The report had one `action` column, so `kept original` covered three unrelated situations and
+whether a manual had been re-OCR'd was not in the CSV at all — you had to read the prose `note`
+of every row. Measured on a real 78-file review folder: 60 rows said `kept original`, 4 of them
+had been re-OCR'd, and nothing but the note distinguished them.
+
+- **`action` is split into four columns**: `action` (`compressed` / `kept original` / `FAILED`),
+  `reason` (`compressible` / `born digital` / `already compressed` / `small size` / `error`),
+  `ocr` (`new ocr` / `re-ocr` / `kept existing` / `not requested` / `failed`) and `language`
+  (the packs OCR actually used). Each takes values from a fixed vocabulary, so a run over
+  thousands of files sorts, filters and pivots instead of being grepped. `born-digital (copied
+  untouched)` is gone as an *action* — it was a reason wearing an action's clothes; it is now
+  `kept original` + `born digital`. The `.log` per-file lines and the summary tally carry the
+  same breakdown, and the console prints
+  `kept because: 67 small size (12.7 MB), 8 born digital (216.0 MB), …`. The **MB, not just the
+  count**, because a count hides what a decision costs: `67 small size` does not say whether the
+  size floor left 12 MB uncompressed or 12 GB, and that is the number that tells you whether
+  `--min-compress-mb` is set right for an archive.
+- **`re-ocr` vs `new ocr` is read from the SOURCE, not from the ocrmypdf mode.** The note used
+  to say `re-ocr` whenever `--redo-ocr` ran — but that mode is chosen to protect the images and
+  runs on files with no text layer to redo, so it labelled first-time OCR as a redo. The note now
+  names the mode (`mode --redo-ocr`) and the column reports the outcome.
+- **New `--min-compress-mb N` (default 5): files under it are not compressed at all**, only
+  checked for OCR. **OCR is not skipped**: too small to be worth compressing is not too small to
+  be worth making searchable, and that is the half that cannot be redone later once the original
+  is gone. `--dry-run` applies the same floor (so a preview of a folder of small files is nearly
+  free), and `0` compresses everything.
+
+  **This is a deliberate CPU-for-size trade-off, not a free win — the numbers, so it can be
+  revisited without re-deriving them.** Measured across 14 past run reports (1,031 scanned
+  file-rows) joined to a 375,241-file archive scan (40,041 scanned PDFs, 51.4 GB):
+
+  | band (MB) | median % of orig | archive files | archive GB | est. GB saveable |
+  |---|---|---|---|---|
+  | 0 – 0.25 | **99%** | 26,094 | 2.4 | 0.02 |
+  | 0.25 – 0.5 | 56% | 3,342 | 1.1 | 0.34 |
+  | 0.5 – 1 | 57% | 3,465 | 2.3 | 0.52 |
+  | 1 – 2 | 48% | 2,917 | 3.9 | 1.25 |
+  | 2 – 5 | 45% | 2,214 | 6.7 | 1.51 |
+  | 5 + | 32% | 2,009 | 35.1 | 19.87 |
+
+  So a 5 MB floor skips 38,032 files — 95% by count, **31.7% of scanned bytes** — and forfeits
+  **~3.6 GB**, because files from 0.25 to 5 MB do compress (median 45–57% of original). Only the
+  sub-0.25 MB band is genuinely worthless (median 99% of original: 26,094 files, 0.02 GB), and it
+  is most of the wasted CPU. `0.25` would therefore recover almost all the savings while still
+  skipping the bulk of the work; **5 was chosen knowingly.** Note the floor also means those files
+  get no visual clean-up (`_flatten_bg`, Sauvola, paper-whitening, descreen), since in this
+  pipeline the cleaned image *is* the compressed image.
+
+  Where the floor **is** free, measured serially with `ocr=False` on a raw Nissan Primera folder
+  whose sources are already CCITT 1-bit: `floor=5` vs `floor=0` produced **byte-identical output
+  on all 20 files** (0.000 MB difference) while cutting per-file time **82.1s → 0.3s**,
+  **68.0s → 0.3s** and **60.0s → 0.3s**. An earlier draft of this entry justified the floor with
+  "0.9% forfeited" from `_compress_sample_review/3000GT`; that folder is an *output* tree whose
+  page images are already `/JBIG2Decode`, so the figure did not generalise and has been replaced
+  by the archive-wide table above.
+
+### Fixed (the audit blamed us for defects the source already had)
+
+Found by running the floor over a real folder: **18 of 20 files were reported FAILED** with
+`page 1 has broken font metrics: /dgp0 256!=224`. Measured before diagnosing: the *source* files
+already carry that font. Nothing was damaged — and nothing was OCR'd either.
+
+- **The font-`/Widths` and dangling-XObject checks are now DIFFERENTIAL**, like every other check
+  in `_audit_output` (page count, colour, text recall, links are all compared against the source).
+  A defect present in the source is reported as a warning and the file ships; one that appears
+  only in the output is still fatal, and a test asserts both directions. Font names are compared
+  on the metric signature (`256!=224`) rather than the name, since a rebuild may rename `/dgp0`
+  and a renamed pre-existing fault is still pre-existing.
+- Inherited defects are **tallied once per file** (`6 of 6 sampled pages have broken font metrics
+  … — already so in the source`) instead of once per sampled page, which buried the rest of the
+  note under six copies of itself.
+
 ### Changed (losing links is now refused, not warned about)
 
 Link preservation worked; noticing if it ever stopped did not.

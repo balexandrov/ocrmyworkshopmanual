@@ -1008,7 +1008,10 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                     mode, '--quiet', '--jobs', str(OCR_JOBS), str(src_p), str(out)],
         capture_output=True, text=True))
     note = f' (lang:{language}'
-    note += ', re-ocr' if mode == '--redo-ocr' else ''
+    # the MODE, not a claim about the outcome: --redo-ocr is chosen to protect the images,
+    # and it runs on files that have no text layer to redo at all. Whether this was a first
+    # OCR or a replacement is reported by the `ocr` column, which reads the source.
+    note += f', mode {mode}' if mode == '--redo-ocr' else ''
     note += f', retried x{tries - 1}' if tries > 1 else ''
     note += ')'
     if r is not None and r.returncode == 0 and out.exists() and out.stat().st_size > 0:
@@ -1278,6 +1281,18 @@ def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
         return with_text >= covered * len(idxs)
     except Exception:
         return False
+
+
+def has_any_text(pdf: Path) -> bool:
+    """True if ANY sampled page carries text — i.e. the file already has (at least a
+    partial or stale) text layer.
+
+    `has_text` answers a different question ("is it searchable everywhere, so OCR would
+    add nothing"). This one separates a file that has never been OCR'd from one whose
+    existing layer we are about to REPLACE, which is the distinction the report's `ocr`
+    column has to make: those are 'new ocr' and 're-ocr', and they are not the same
+    event to a reviewer deciding whether a manual was touched."""
+    return has_text(pdf, covered=0.01)
 
 
 def _largest_image_dpi(page, include_strips: bool = True) -> float:
@@ -1808,6 +1823,12 @@ def _bad_font_widths(page) -> list:
     return out
 
 
+def _width_signatures(bad_widths) -> set:
+    """The metric signatures ('256!=224') out of `_bad_font_widths` entries, dropping the
+    font NAME. A rebuild may rename /dgp0, and a renamed pre-existing fault is still one."""
+    return {s.split(' ', 1)[-1] for s in bad_widths}
+
+
 def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
                   colour_pages=None, sample: int = 6) -> tuple:
     """Self-check the result against the SOURCE before anything is overwritten.
@@ -1851,19 +1872,66 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
         except Exception:
             pass
     idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
-    # nothing still painted may have been dropped, and glyph metrics must be self-consistent
+    # nothing still painted may have been dropped, and glyph metrics must be self-consistent.
+    #
+    # DIFFERENTIAL, like every other check here: a defect the SOURCE already carries is not
+    # damage this run did, and refusing the result over it throws away a good output and
+    # leaves the file unsearchable for a fault we faithfully preserved. Measured on a Nissan
+    # Primera folder where every page-1 /dgp0 font ships 256 widths for a 224-slot range:
+    # 18 of 20 files were reported FAILED with the originals kept — correct in that nothing
+    # was damaged, useless in that nothing was OCR'd either. Unlike page count, colour, text
+    # and links, these two conditions can pre-exist, so they are the two that need it.
+    rsrc = None
+    if src_p is not None and src_p.exists():
+        try:
+            rsrc = PdfReader(str(src_p))
+        except Exception:
+            rsrc = None
+
+    def _src_page(i):
+        try:
+            return rsrc.pages[i] if rsrc is not None else None
+        except Exception:
+            return None
+
+    def _inherited(bad, source_bad) -> bool:
+        """Was this defect already in the source? Font names are compared on the METRIC
+        signature only ('256!=224'), not the name — a rebuild may legitimately rename
+        /dgp0, and a renamed pre-existing fault is still pre-existing."""
+        return bool(bad) and not (set(bad) - set(source_bad))
+
+    # An inherited defect is usually on EVERY page (it is the manual's own template font),
+    # so it is tallied and reported once per file — one line per defect class, not one per
+    # sampled page, which buried the rest of the note under six copies of itself.
+    inh_x, inh_w, n_x, n_w = set(), set(), 0, 0
     for i in idxs:
         try:
             page = r.pages[i]
         except Exception:
             continue
+        sp = _src_page(i)
         missing = _dangling_xobjects(page)
         if missing:
-            return (f'page {i + 1} still draws {", ".join(sorted(missing))} but the output '
-                    f'no longer defines it (content dropped)'), ''
+            if _inherited(missing, _dangling_xobjects(sp) if sp is not None else ()):
+                inh_x |= missing
+                n_x += 1
+            else:
+                return (f'page {i + 1} still draws {", ".join(sorted(missing))} but the output '
+                        f'no longer defines it (content dropped)'), ''
         bad_w = _bad_font_widths(page)
         if bad_w:
-            return f'page {i + 1} has broken font metrics: {", ".join(bad_w)}', ''
+            src_w = _bad_font_widths(sp) if sp is not None else []
+            if _inherited(_width_signatures(bad_w), _width_signatures(src_w)):
+                inh_w |= set(bad_w)
+                n_w += 1
+            else:
+                return f'page {i + 1} has broken font metrics: {", ".join(bad_w)}', ''
+    if n_x:
+        warn.append(f'{n_x} of {len(idxs)} sampled pages draw undefined '
+                    f'{", ".join(sorted(inh_x))} — already so in the source')
+    if n_w:
+        warn.append(f'{n_w} of {len(idxs)} sampled pages have broken font metrics '
+                    f'{", ".join(sorted(inh_w))} — already so in the source')
     if src_p is None or not src_p.exists():
         return None, ''
     # text must survive. Pages neither side could read are excluded from BOTH word sets, so
@@ -2054,22 +2122,70 @@ def _resolve_language(src_p: Path, work: Path, language: str, timeout: int = 0) 
     return language, note
 
 
+# ── Report vocabulary ─────────────────────────────────────────────────────────
+# Fixed, machine-groupable values for the report's `reason` and `ocr` columns. The note
+# says the same things in prose, but prose cannot be filtered or tallied without
+# regex-guessing — and "what was actually done to this file, and why" is the question a
+# reviewer asks of every row. Kept as constants so a value can never be spelled two ways.
+
+# WHY the file ended up compressed or kept (pairs with the `action` column).
+REASON_BORN = 'born digital'          # vector/text PDF — never rasterised, copied as-is
+REASON_SMALL = 'small size'           # under the compression floor — not worth the work
+REASON_ALREADY = 'already compressed' # re-encoding it would not (or did not) pay off
+REASON_COMPRESSIBLE = 'compressible'  # it did beat the min-savings bar, so we shipped it
+REASON_ERROR = 'error'                # the file failed; see the `error` column
+
+# What happened to the SEARCHABLE TEXT LAYER.
+OCR_NONE = 'not requested'   # --no-ocr
+OCR_KEPT = 'kept existing'   # already searchable on every page -> ocrmypdf not run
+OCR_NEW = 'new ocr'          # no text layer at all -> a fresh one was created
+OCR_REDO = 're-ocr'          # a partial/stale layer was replaced with a fresh one
+OCR_FAILED = 'failed'        # ocrmypdf ran and produced no usable layer
+OCR_NA = ''                  # never reached (born-digital copy, or the file failed)
+
+# The two states in which a text layer was actually (re)written.
+_OCR_ADDED = (OCR_NEW, OCR_REDO)
+# ...and the states in which a language was actually resolved and used.
+_OCR_RAN = (OCR_NEW, OCR_REDO, OCR_FAILED)
+
+
+def _ocr_layer_added(ocr_state: str) -> bool:
+    """Did this file get a (re)written text layer? Drives `already_ocred`, which decides
+    whether an in-place file must be written out at all."""
+    return ocr_state in _OCR_ADDED
+
+
+def _lang_for(ocr_state: str, language: str) -> str:
+    """The language to REPORT. Only meaningful once OCR has actually run: until then the
+    value is still the unresolved request ('auto'), and printing that as a detected
+    language is worse than printing nothing."""
+    return language if ocr_state in _OCR_RAN else ''
+
+
 def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
                    timeout: int = 0, in_place: bool = False, colour_pages=None,
-                   already_ocred: bool = False, was_repaired: bool = False) -> dict:
+                   already_ocred: bool = False, was_repaired: bool = False,
+                   ocr_state: str = OCR_NA) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the keep-original path. `timeout` (secs,
     0=off) bounds the OCR step. The OUTPUT is always re-opened and its page count
     checked BEFORE placing it. With `in_place` (dest_p == src_p): if the result is
     identical to the source (kept original + no OCR added) the file is left untouched;
-    and a failed verify keeps the original rather than overwriting it with a bad file."""
+    and a failed verify keeps the original rather than overwriting it with a bad file.
+
+    `ocr_state` is what the CALLER already did about the text layer (both callers OCR the
+    source themselves, before compressing). It is carried into every returned row — and
+    overridden if this function ends up running OCR itself — so that the reported OCR
+    outcome is set on exactly one path and cannot disagree with the note."""
     final = base
     ocr_added = False
     if ocr:
         if has_text(base):
             note += ' (had text, OCR skipped)'
+            ocr_state = OCR_KEPT
         else:
+            had_text = has_any_text(base)
             language, lnote = _resolve_language(base, work, language, timeout)
             # filter to installed packs so a missing pack degrades to eng/available
             # rather than erroring OCR out and leaving the file with no text at all.
@@ -2088,10 +2204,12 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             if r is not None and r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
                 final = ocr_pdf
                 ocr_added = True
+                ocr_state = OCR_REDO if had_text else OCR_NEW
                 if tries > 1:
                     note += f' (OCR retried x{tries - 1})'
             else:
                 note += ' (OCR FAILED)'
+                ocr_state = OCR_FAILED
     # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched.
     # `already_ocred` matters: OCR now runs on the SOURCE before this point, so `base` can
     # already carry a fresh text layer even though this function did not add one. Without
@@ -2100,16 +2218,19 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
     # `was_repaired` likewise: a corrupt source that we could repair must be WRITTEN even
     # when compression was not worthwhile — leaving the broken original in place discards
     # a readable version of a file that currently opens nowhere.
+    rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
     if in_place and kept and not ocr_added and not already_ocred and not was_repaired:
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
-                'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None}
+                'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None,
+                **rep}
     # SELF-AUDIT the result against the source BEFORE anything is overwritten. Damage and
     # success look identical on file size, so this compares content: page count, colour
     # pages not binarised, searchable text surviving, links/bookmarks not shrinking.
     fatal, warn = _audit_output(final, pages, src_p=src_p, colour_pages=colour_pages)
     if fatal:               # never ship a degraded file — keep the original, report why
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
-                'note': note, 'kept': True, 'err': f'self-check failed: {fatal} — original kept'}
+                'note': note, 'kept': True, **rep,
+                'err': f'self-check failed: {fatal} — original kept'}
     note += warn
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
@@ -2120,7 +2241,7 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
         tmp_out.unlink(missing_ok=True)   # don't leave a stray .part on a failed swap
         raise
     return {'src': src_p.name, 'orig': orig, 'new': dest_p.stat().st_size,
-            'pages': pages, 'note': note, 'kept': kept, 'err': None}
+            'pages': pages, 'note': note, 'kept': kept, 'err': None, **rep}
 
 
 def _reader_page(pdf: Path, page_no: int):
@@ -2198,11 +2319,21 @@ PRECHECK_SKIP_RATIO = 0.75
 # which is more accurate than an extrapolation anyway.
 PRECHECK_MIN_PAGES = 100
 
+# Files below this are not compressed at all — only checked for OCR (see the floor check
+# in `_compress_one`). Compression here is opportunistic and lossy: on a small file the
+# absolute win is a few hundred KB, against a full render + binarize + encode of every
+# page and a generation of image loss. The OCR half is NOT skipped, because a small scan
+# with no text layer is just as unsearchable as a big one — and that is the half that
+# cannot be redone later without the original.
+# `--min-compress-mb` overrides it; the module constant is the default so it can be
+# lowered for tests that need the compression path itself exercised on small fixtures.
+MIN_COMPRESS_MB = 5.0
+
 
 def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
                    src_pages: int, timeout: int = 0) -> tuple:
     """Prepare the ORIGINAL images for shipping: repair if unreadable, add a text layer if
-    the file has none. Returns (base, language, note, did_ocr, err).
+    the file has none. Returns (base, language, note, ocr_state, err).
 
     Two situations end here and they must behave identically — a big file the pre-check
     predicted would not compress, and any file whose compressed result failed the
@@ -2214,7 +2345,7 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
     unlike the compress path, these images are the output."""
     base = work / 'orig.pdf'
     shutil.copyfile(str(images_from), str(base))
-    note, did_ocr = '', False
+    note = ''
     # never pass a BROKEN file through: this path copies bytes, so a corrupt PDF would be
     # faithfully reproduced as a file that opens nowhere.
     if not _renders_ok(base, timeout):
@@ -2223,18 +2354,23 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
         if fixed and _renders_ok(fixed, timeout):
             base, note = fixed, note + _repair_note(rstats)
         else:
-            return None, language, note, False, ('unreadable PDF: renders no pages and '
-                                                 'repair failed — original kept')
-    if ocr and not has_text(base):
-        ocred, language, onote = _ocr_source(base, work, language,
-                                             has_vector=_has_vector_pages(base),
-                                             timeout=timeout, preserve_images=True)
-        note += onote
-        if ocred:
-            base, did_ocr = ocred, True
-    elif ocr:
-        note += ' (had text, OCR skipped)'
-    return base, language, note, did_ocr, None
+            return None, language, note, OCR_NA, ('unreadable PDF: renders no pages and '
+                                                  'repair failed — original kept')
+    if not ocr:
+        return base, language, note, OCR_NONE, None
+    if has_text(base):
+        return base, language, note + ' (had text, OCR skipped)', OCR_KEPT, None
+    # A partly-searchable file still lands here (has_text wants text on nearly every
+    # page), and --redo-ocr then REPLACES that stale layer instead of creating the first
+    # one. The report has to say which of the two happened.
+    had_text = has_any_text(base)
+    ocred, language, onote = _ocr_source(base, work, language,
+                                         has_vector=_has_vector_pages(base),
+                                         timeout=timeout, preserve_images=True)
+    note += onote
+    if not ocred:
+        return base, language, note, OCR_FAILED, None
+    return ocred, language, note, (OCR_REDO if had_text else OCR_NEW), None
 
 
 def compress_one(src: str, dest: str, *a, verbose: bool = False, **kw) -> dict:
@@ -2257,7 +2393,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                   photo_dpi: int = 150, jpeg_quality: int = 60,
                   min_savings: float = 0.25,
                   sauvola_k: float = 0.30, photo_descreen: float = 0.6,
-                  timeout: int = 0, in_place: bool = False) -> dict:
+                  timeout: int = 0, in_place: bool = False,
+                  min_compress_mb: float = None) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -2330,29 +2467,46 @@ def _compress_one(src: str, dest: str, dpi: int,
                     'new': orig if in_place else dest_p.stat().st_size,
                     'pages': bsig.get('sampled'), 'kept': True, 'err': None,
                     'action': 'born_digital', 'signals': bsig,
+                    'reason': REASON_BORN, 'lang': '',
+                    # Copied byte-for-byte, so whatever text layer it has is preserved
+                    # exactly — and one it never had is not created (this path runs no OCR).
+                    'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
                     'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})' + rnote}
         note0 = ''
-        skip_compression = False
+        skip_reason = ''
+        floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
+        # SIZE FLOOR: a small file is not worth re-imaging (see MIN_COMPRESS_MB). It still
+        # goes down the same ship-the-original path, which repairs it if broken and OCRs it
+        # if it has no text layer — so "too small to compress" never means "left
+        # unsearchable". Checked before the sample pre-check, which would otherwise pay to
+        # predict a compression we are not going to do.
+        if orig < floor:
+            skip_reason = REASON_SMALL
+            note0 = (f' (compression skipped: {mb(orig):.2f} MB is under the '
+                     f'{mb(floor):.0f} MB floor — OCR only)')
         # Cheap pre-check: sample-compress a few pages; if it won't beat the original,
         # skip full compression and just OCR the original (avoids wasted work + growth).
         # Only for big files (see PRECHECK_MIN_PAGES): on a small one it just compresses
         # the document twice.
-        if src_pages >= PRECHECK_MIN_PAGES:
+        elif src_pages >= PRECHECK_MIN_PAGES:
             proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                      photo_thresh, photo_dpi, jpeg_quality,
                                      sauvola_k, photo_descreen)
             if proj >= PRECHECK_SKIP_RATIO:
-                skip_compression = True
+                skip_reason = REASON_ALREADY
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
-        if skip_compression:
-            base, language, snote, did_ocr, err = _ship_original(
+        if skip_reason:
+            base, language, snote, ocr_state, err = _ship_original(
                 src_p, work, ocr, language, src_pages, timeout)
             if err:
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                                  src_pages or len(PdfReader(str(base)).pages), True,
-                                 note0 + snote, timeout, in_place, already_ocred=did_ocr)
+                                 note0 + snote, timeout, in_place,
+                                 already_ocred=_ocr_layer_added(ocr_state),
+                                 ocr_state=ocr_state)
             res['action'] = 'kept_original'
+            res['reason'] = skip_reason
             return res
         # 1) RENDER ONCE — in colour, at each page's own source resolution. Every check
         #    below reads this one render, so nothing is judged on a degraded image and no
@@ -2504,12 +2658,19 @@ def _compress_one(src: str, dest: str, dpi: int,
         # onto the compressed pages by the graft, decoupling text quality from image size.
         ocr_note = ''
         ocr_src = None
+        ocr_state = OCR_NONE if not ocr else OCR_FAILED
         if ocr and ocr_input is not None:
+            # Whether this is the file's FIRST text layer or a replacement is a fact about
+            # the SOURCE, not about our render (which never carries text), so it has to be
+            # read before we OCR.
+            src_had_text = has_any_text(src_p)
             # --skip-text is correct here precisely because the input is our render, which
             # carries no text: every page gets OCR'd, and ocrmypdf has nothing to
             # rasterise a second time.
             ocr_src, language, ocr_note = _ocr_source(
                 ocr_input, work, language, has_vector=True, timeout=timeout)
+            ocr_state = (OCR_FAILED if ocr_src is None
+                         else OCR_REDO if src_had_text else OCR_NEW)
 
         # Put the compressed pages back INTO the original document, so links, bookmarks,
         # named destinations, metadata AND the source-quality OCR layer are inherited
@@ -2534,10 +2695,11 @@ def _compress_one(src: str, dest: str, dpi: int,
             # Same situation as a pre-check skip: we ship the ORIGINAL images, so the
             # OCR'd copy made for the graft is unusable here (it was force-OCR'd, which
             # rasterises). One shared implementation handles repair + image-preserving OCR.
-            base, language, snote, kept_ocred, err = _ship_original(
+            base, language, snote, ocr_state, err = _ship_original(
                 render_src if did_repair else src_p, work, ocr, language, src_pages, timeout)
             if err:
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
+            kept_ocred = _ocr_layer_added(ocr_state)
             ocr_note = snote
             # Keep the page-type counts: on a KEPT file they are the only explanation of
             # WHY nothing was compressed (e.g. "every page is vector/real-text"), which is
@@ -2581,8 +2743,9 @@ def _compress_one(src: str, dest: str, dpi: int,
                              src_pages or len(pngs), kept_original, note, timeout, in_place,
                              colour_pages=None if kept_original else colour_pages,
                              already_ocred=(kept_ocred if kept_original else True),
-                             was_repaired=did_repair)
+                             was_repaired=did_repair, ocr_state=ocr_state)
         res['action'] = 'kept_original' if kept_original else 'compressed'
+        res['reason'] = REASON_ALREADY if kept_original else REASON_COMPRESSIBLE
         # Machine-readable page-type tally. The note says the same thing in English, but
         # prose is not something a downstream index can group on without regex-guessing.
         res['types'] = dict(Counter(c.type for c in classes))
@@ -2656,14 +2819,36 @@ def preview_one(src: str, *a, verbose: bool = False, **kw) -> dict:
     return res
 
 
+def _predict_ocr(src_p: Path, work: Path, ocr: bool, language: str) -> tuple:
+    """(ocr_state, language) the real run WOULD end up with. Same two questions the real
+    run asks — is it already searchable everywhere, and does it carry any layer at all —
+    plus the same language resolution, so a dry-run row can be compared against the row
+    the real run later writes instead of merely hinting at it. Detection is per-file, not
+    per-page, so this costs a handful of sample renders however long the manual is."""
+    if not ocr:
+        return OCR_NONE, ''
+    if has_text(src_p):
+        return OCR_KEPT, ''
+    state = OCR_REDO if has_any_text(src_p) else OCR_NEW
+    try:
+        language, _note = _resolve_language(src_p, work, language)
+        language = _available_ocr_lang(language)
+    except Exception:
+        pass
+    return state, language
+
+
 def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  photo_thresh: float, photo_dpi: int,
                  jpeg_quality: int, min_savings: float,
-                 sauvola_k: float, photo_descreen: float) -> dict:
+                 sauvola_k: float, photo_descreen: float,
+                 ocr: bool = True, language: str = 'auto',
+                 min_compress_mb: float = None) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
-    size?) before committing to a full run. Uses the same born-digital check and the
-    same sample pre-check the real run uses, so the prediction tracks reality."""
+    size?) before committing to a full run. Uses the same born-digital check, the same
+    size floor and the same sample pre-check the real run uses, so the prediction tracks
+    reality."""
     src_p = Path(src)
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jbprev_'))
@@ -2672,22 +2857,38 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
         if born:
             return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
                     'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
+                    'reason': REASON_BORN, 'lang': '',
+                    'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
                     'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
+        ocr_state, language = _predict_ocr(src_p, work, ocr, language)
+        rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
+        # The size floor, before the sample projection — same order as the real run, and
+        # the reason a dry run over a folder of small PDFs is now nearly free.
+        floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
+        if orig < floor:
+            return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': None,
+                    'kept': True, 'err': None, 'action': 'kept_original',
+                    'reason': REASON_SMALL, **rep,
+                    'note': f' (would skip compression: {mb(orig):.2f} MB is under the '
+                            f'{mb(floor):.0f} MB floor — OCR only)'}
         proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
                                  sauvola_k, photo_descreen)
         est_new = int(proj * orig)
         if proj >= PRECHECK_SKIP_RATIO:
-            action, note = 'kept_original', f' (would skip compression: projected {proj*100:.0f}% of original)'
+            action, reason = 'kept_original', REASON_ALREADY
+            note = f' (would skip compression: projected {proj*100:.0f}% of original)'
             est_new = orig
         elif proj >= (1 - min_savings):
-            action, note = 'kept_original', f' (projected {proj*100:.0f}% — likely keep original)'
+            action, reason = 'kept_original', REASON_ALREADY
+            note = f' (projected {proj*100:.0f}% — likely keep original)'
             est_new = orig
         else:
-            action, note = 'compressed', f' (projected {proj*100:.0f}% of original)'
+            action, reason = 'compressed', REASON_COMPRESSIBLE
+            note = f' (projected {proj*100:.0f}% of original)'
         return {'src': src_p.name, 'orig': orig, 'new': est_new, 'pages': None,
                 'kept': action != 'compressed', 'err': None, 'action': action, 'note': note,
-                'signals': {'scan_frac': round(proj, 3)}}
+                'reason': reason, **rep, 'signals': {'scan_frac': round(proj, 3)}}
     except Exception as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': repr(ex)}
     finally:
@@ -2697,15 +2898,51 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
 # ── Run log ──────────────────────────────────────────────────────────────────
 
 def _action_label(res: dict) -> str:
-    """Human label for what happened to one file (drives both the per-file line and
-    the summary tally in the run log)."""
+    """WHAT was done to one file — the outcome only, in three values you can group on.
+    WHY it happened is `_reason_label`, and what happened to its text layer is
+    `_ocr_label`; a single blended column (which this used to be) answered none of the
+    three questions cleanly — 'born-digital (copied untouched)' is a reason wearing an
+    action's clothes, and it hid whether the file had been re-OCR'd."""
     if res.get('err'):
         return 'FAILED'
     return {
-        'born_digital': 'born-digital (copied untouched)',
+        'born_digital': 'kept original',
         'kept_original': 'kept original',
         'compressed': 'compressed',
     }.get(res.get('action'), 'processed')
+
+
+def _reason_label(res: dict) -> str:
+    """WHY the file was compressed or kept — one of the REASON_* values."""
+    if res.get('err'):
+        return REASON_ERROR
+    return res.get('reason', '')
+
+
+def _ocr_label(res: dict) -> str:
+    """What happened to the text layer — one of the OCR_* values. A file that failed
+    reports nothing: it was left as it was, whatever OCR had got as far as."""
+    return '' if res.get('err') else res.get('ocr_state', '')
+
+
+def _reason_tally(results: list) -> dict:
+    """{action: {reason: [files, source_bytes]}} — the WHY breakdown, carrying the bytes
+    each reason accounts for, shared by the run log and the console so the two agree.
+
+    The count alone hides what a decision COSTS: '67 small size' does not say whether the
+    size floor left 12 MB uncompressed or 12 GB, and that is the number you need to decide
+    whether the floor is set right for a given archive. FAILED is excluded — its reason is
+    always 'error' and the per-file `error` column already says what went wrong."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    for r in results:
+        reason = _reason_label(r)
+        if not reason or r.get('err'):
+            continue
+        cell = agg[_action_label(r)][reason]
+        cell[0] += 1
+        cell[1] += r.get('orig') or 0
+    return agg
 
 
 def _flag_duplicates(results: list) -> int:
@@ -2751,7 +2988,14 @@ def _csv_row(fields: list) -> str:
 
 # Human-friendly report columns, shared by the live-flushed CSV and the final one
 # so the two can never drift. Sizes are MB (2 dp), not raw bytes.
-REPORT_COLUMNS = ['file', 'action', 'orig size (MB)', 'new size (MB)', '%',
+#
+# `action`/`reason`/`ocr`/`language` are four separate columns on purpose. One `action`
+# column could not answer "was this file re-OCR'd?" at all, and could not distinguish a
+# file kept because it was born-digital from one kept because it was already compressed
+# or too small — so a reviewer had to read the prose `note` of every row to find out.
+# Each of the four takes values from a fixed vocabulary, so they sort, filter and pivot.
+REPORT_COLUMNS = ['file', 'action', 'reason', 'ocr', 'language',
+                  'orig size (MB)', 'new size (MB)', '%',
                   'duplicate of', 'page types', 'note', 'warnings', 'error']
 
 
@@ -2765,7 +3009,8 @@ def _report_row(r: dict) -> list:
     err = r.get('err')
     o, n = r.get('orig') or 0, r.get('new') or 0
     pct = (n * 100 // o) if (not err and o) else ''
-    return [r.get('rel', ''), _action_label(r),
+    return [r.get('rel', ''), _action_label(r), _reason_label(r), _ocr_label(r),
+            r.get('lang', '') if not err else '',
             f'{o / 1048576:.2f}' if o else '0.00',
             f'{n / 1048576:.2f}' if (not err and n) else '',
             pct, r.get('duplicate_of', ''), _types_text(r.get('types')),
@@ -2815,6 +3060,8 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts = Counter(_action_label(r) for r in results)
+    reason_counts = _reason_tally(results)
+    ocr_counts = Counter(_ocr_label(r) for r in results if _ocr_label(r))
     tot_orig = sum(r['orig'] for r in results if not r.get('err'))
     tot_new = sum(r['new'] for r in results if not r.get('err'))
     title = 'ocrmyworkshopmanual — DRY-RUN preview (nothing written)' if dry_run \
@@ -2855,6 +3102,14 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
             continue
         pct = r['new'] * 100 // r['orig'] if r.get('orig') else 0
         L.append(f'[{_action_label(r)}]  {r["rel"]}')
+        # the same four facts the CSV columns carry, so the two reports agree
+        bits = [f'reason: {_reason_label(r)}'] if _reason_label(r) else []
+        if _ocr_label(r):
+            bits.append(f'OCR: {_ocr_label(r)}')
+        if r.get('lang'):
+            bits.append(f'language: {r["lang"]}')
+        if bits:
+            L.append('           ' + ' | '.join(bits))
         L.append(f'           {mb(r["orig"]):.2f} -> {mb(r["new"]):.2f} MB ({pct}%){r.get("note", "")}')
         if r.get('types'):
             L.append(f'           page types: {_types_text(r["types"])}')
@@ -2867,10 +3122,21 @@ def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, sett
         L += _warn_lines(r)
 
     L += ['', '-' * 78, 'Summary', '-' * 78]
-    for label in ('compressed', 'kept original', 'OCR-only (not compressed)',
-                  'born-digital (copied untouched)', 'FAILED'):
+    # action, then the reason breakdown under it, then what happened to the text layers.
+    # The reason tally is the one that answers "why is my archive still this big?", and a
+    # flat action count could not give it.
+    for label in ('compressed', 'kept original', 'FAILED'):
         L.append(f'  {label:33s}: {counts.get(label, 0)}')
+        for reason, (n, nbytes) in sorted(reason_counts[label].items()):
+            # the MB each reason accounts for (source size). On `small size` that IS the
+            # cost of --min-compress-mb: bytes deliberately left uncompressed.
+            L.append(f'    {("- " + reason):31s}: {n:<5} ({mb(nbytes):.1f} MB)')
     L.append(f'  {"skipped (dest already existed)":33s}: {skipped}')
+    if ocr_counts:
+        L.append('')
+        L.append('  OCR text layer:')
+        for state, n in sorted(ocr_counts.items()):
+            L.append(f'    {("- " + state):31s}: {n}')
     n_dup = sum(1 for r in results if r.get('duplicate_of'))
     if n_dup:
         L.append(f'  {"duplicate files (flagged, still processed)":33s}: {n_dup}')
@@ -3029,6 +3295,11 @@ def main():
     ap.add_argument('--min-savings', type=float, default=0.25,
                     help='keep the compressed file only if it is at least this fraction smaller than '
                          'the original; else keep the original and OCR only (default 0.25)')
+    ap.add_argument('--min-compress-mb', type=float, default=MIN_COMPRESS_MB,
+                    help=f'do not compress files smaller than this many MB — the win is not worth '
+                         f'a lossy re-encode of every page (default {MIN_COMPRESS_MB:g}). They are '
+                         f'still checked for OCR and made searchable if they have no text layer; '
+                         f'0 = compress everything')
     ap.add_argument('--log', type=Path, default=None,
                     help='path for the run report log (default: a timestamped file in the dest root)')
     ap.add_argument('--no-log', action='store_true', help='do not write a run report log')
@@ -3237,6 +3508,8 @@ def main():
                                   not args.no_despeckle, args.min_size,
                                   args.photo_threshold, args.photo_dpi, args.jpeg_quality,
                                   args.min_savings, args.sauvola_k, args.photo_descreen,
+                                  ocr=not args.no_ocr, language=args.language,
+                                  min_compress_mb=args.min_compress_mb,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             else:
@@ -3247,6 +3520,7 @@ def main():
                                   args.min_savings, args.sauvola_k,
                                   args.photo_descreen,
                                   args.timeout, args.in_place,
+                                  min_compress_mb=args.min_compress_mb,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             for i, fut in enumerate(cf.as_completed(futs), 1):
@@ -3318,12 +3592,23 @@ def main():
 
     dup_sets = _flag_duplicates(results) if dup_check else 0
     dt = time.time() - t0
-    n_born = sum(1 for r in results if r.get('action') == 'born_digital')
     verb = 'Previewed' if args.dry_run else 'processed'
     head = 'Interrupted after' if interrupted else 'Done in'
     _say(f'\n{head} {dt/60:.1f} min. {verb} {done} ({done - kept} '
          f'{"would compress" if args.dry_run else "compressed"}, '
-         f'{kept} kept-original/OCR-only incl. {n_born} born-digital), failed {fail}')
+         f'{kept} kept original), failed {fail}')
+    # WHY the kept ones were kept, and what happened to the text layers — the two
+    # questions the old one-line tally left you to open the report to answer.
+    # The MB matters as much as the count: on `small size` it is exactly what
+    # --min-compress-mb left uncompressed, which is how you tell if the floor is set right.
+    why = _reason_tally(results).get('kept original', {})
+    if why:
+        _say('  kept because: ' + ', '.join(
+            f'{n} {reason} ({mb(nbytes):.1f} MB)'
+            for reason, (n, nbytes) in sorted(why.items(), key=lambda kv: -kv[1][0])))
+    ocrs = Counter(_ocr_label(r) for r in results if _ocr_label(r) and not r.get('err'))
+    if ocrs:
+        _say('  OCR: ' + ', '.join(f'{n} {state}' for state, n in ocrs.most_common()))
     if tot_orig:
         word = 'Projected' if args.dry_run else 'Total'
         saved = 'would save' if args.dry_run else 'saved'
@@ -3349,6 +3634,7 @@ def main():
             'jpeg_quality': args.jpeg_quality,
             'photo_descreen': args.photo_descreen, 'ocr': ocr_desc,
             'min_savings': args.min_savings,
+            'min_compress_mb': args.min_compress_mb,
             'timeout': args.timeout,
             'retry_failed': str(args.retry_failed) if args.retry_failed else False,
             'dry_run': args.dry_run,
