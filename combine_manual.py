@@ -424,7 +424,7 @@ def main():
         env['TESSDATA_PREFIX'] = args.tessdata
     print(f'\nCompressing + OCR ({args.language}) in place via {TOOL.name} ...', flush=True)
     r = subprocess.run([sys.executable, str(TOOL), str(out_pdf),
-                        '--in-place', '--no-log', '--language', args.language], env=env)
+                        '--in-place', '--language', args.language], env=env)
     if r.returncode != 0:
         sys.exit(f'ERROR: compress/OCR step failed (exit {r.returncode}); '
                  f'the raw combined PDF is still at {out_pdf}')

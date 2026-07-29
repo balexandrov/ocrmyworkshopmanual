@@ -76,7 +76,8 @@ it's resumable.
 
 > ⚠️ For **scanned / image** PDFs only — but a built-in safety check protects
 > born-digital PDFs by copying them through untouched (see below), so it's safe to
-> point at a mixed tree. Every folder run also writes a **report log** of what happened.
+> point at a mixed tree. A run reports to the console; add `--log` to keep a **report file**
+> of what happened.
 
 ---
 
@@ -168,8 +169,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--from-list FILE` | — | Compress+OCR **in place** exactly the PDF paths listed in FILE (one per line), as one global pool. For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
-| `--log PATH` | timestamped file in dest | Where to write the run report log (a `.csv` sibling is written too) |
-| `--no-log` | off | Don't write a run report log |
+| `--log [PATH]` | off | Write a run report. **Omitted = no report file, console only.** Bare `--log` puts a timestamped report in the **current folder**; `--log DIR` puts it in `DIR`; `--log FILE.log` uses that exact path. A `.csv` sibling and a `_by_folder.csv` land next to it, and that `.csv` is what `--retry-failed` reads |
 | `--limit N` | `0` | Process only the first N files (testing) |
 | `--verbose` | off | Also echo each PDF-library warning to the console, prefixed with the file it came from. They always go to the report `.log`/`.csv` regardless; this is for debugging one file without opening the report |
 | `--version` | — | Print the version and exit |
@@ -316,10 +316,9 @@ right-click menu. Double-click to install and confirm the prompt — `HKEY_CURRE
 so no admin rights. Uninstall with `tools\compress-pdf-context-menu-uninstall.reg`.
 
 Default options, so **your original is never touched**: the result is written beside it as
-`<name> (COMPRESSED).pdf`. The one non-default flag is `--no-log`, so a single right-click
-doesn't drop three report files next to your PDF — the console window shows the same
-information and stays open until you close it. Remove `--no-log` from the `.reg` if you want
-them kept.
+`<name> (COMPRESSED).pdf`, and no report files are written next to it — a run reports to the
+console only unless you ask for a log, and the window stays open so you can read it. Add
+`--log` to the command in the `.reg` if you want a report kept.
 
 It installs under `SystemFileAssociations\.pdf`, not under a ProgID, so it shows up whatever
 program currently owns the `.pdf` association and survives changing your default viewer.
@@ -474,8 +473,10 @@ damage; failing to compress something only costs savings. Concretely:
 
 ## Run report log
 
-After each folder run a report log is written (to the dest root by default, or `--log
-PATH`; disable with `--no-log`). It records the settings used, then **per file** what
+A run reports to the console and writes nothing but its output. Pass **`--log`** to keep a
+report as well — in the current folder, or wherever `--log PATH` says. Reports are never
+placed relative to the work being done, so they cannot accumulate through an archive. The
+report records the settings used, then **per file** what
 happened, **why**, and **what became of its text layer**, with sizes and the born-digital
 scan signals, and a final **summary tally + total bytes saved** — so a big batch is
 reviewable at a glance. Two machine-readable **`.csv` siblings** are written alongside it

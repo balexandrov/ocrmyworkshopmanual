@@ -574,7 +574,7 @@ def test_single_file_cli(tmp_path):
     src = tmp_path / 'x.pdf'
     src.write_bytes(pdfs[0].read_bytes())
     r = sp.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
-                str(src), '--no-ocr', '--no-log'], capture_output=True, text=True, timeout=180)
+                str(src), '--no-ocr'], capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr[-500:]
     assert (tmp_path / 'x (COMPRESSED).pdf').exists(), f'no sibling output; stdout:\n{r.stdout}'
 

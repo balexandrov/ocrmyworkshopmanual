@@ -11,10 +11,10 @@ Windows Registry Editor Version 5.00
 ;  Runs with DEFAULT OPTIONS, which means your original file is NOT touched --
 ;  the result is written beside it as "<name> (COMPRESSED).pdf".
 ;
-;  The one non-default flag is --no-log, so a single right-click does not drop
-;  three report files (.log / .csv / _by_folder.csv) next to your PDF. The
-;  console window shows the same information and stays open until you close it.
-;  Delete "--no-log" from the command below if you want those files kept.
+;  No report files are written next to your PDF -- a run reports to the console
+;  only unless you ask for a log, and the window stays open so you can read it.
+;  Add --log to the command below if you want a report kept (it lands in the
+;  current folder), or --log "D:\some\dir" to place it.
 ;
 ;  It lives under SystemFileAssociations\.pdf rather than under a ProgID, so it
 ;  appears whatever program currently owns the .pdf association (Acrobat, Edge,
@@ -38,4 +38,4 @@ Windows Registry Editor Version 5.00
 "Icon"="shell32.dll,-16826"
 
 [HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.pdf\shell\CompressPDF\command]
-@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\compress_pdf_here.cmd\" \"%1\" --no-log"
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\compress_pdf_here.cmd\" \"%1\""

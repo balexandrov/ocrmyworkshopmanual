@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (BREAKING: no report file by default, and `--log` decides where one goes)
+
+Reports were placed relative to the WORK, which scattered
+`_ocrmyworkshopmanual_report_<ts>.log` / `.csv` / `_by_folder.csv` triplets through the
+archive wherever the tool had been pointed. Two of the three branches wrote into the source
+tree, and one of them made `--dry-run` leave three files behind **despite documenting that it
+writes nothing**. Right-clicking a single PDF dropped three reports next to it, which is what
+surfaced this.
+
+A run is now **console-only** and writes nothing but its output. `--log` is the single control:
+
+| invocation | result |
+|---|---|
+| *(omitted)* | no report file |
+| `--log` | timestamped report in the **current folder** |
+| `--log DIR` | timestamped report in `DIR` |
+| `--log FILE.log` | exactly that file |
+
+A value is a folder when it is an existing directory or has no suffix, otherwise it is the
+exact file path — so `_report_path` is that one decision, and the `report_dir` variable with
+both of its archive-writing branches is gone. Where a report lands is the caller's business,
+never derived from the work.
+
+**`--no-log` is removed, not deprecated.** Once "no log" is the default the flag says nothing,
+and a no-op kept for compatibility is a thing to explain forever. The four places that passed
+it (`combine_manual.py`, `helpers/batch_compress.py`, the single-file CLI test, and the PDF
+context-menu `.reg`) no longer do. An external script still passing it now fails with
+argparse's "unrecognized arguments" — loud and a one-line fix, rather than silently doing
+something else.
+
+Also: when files FAILED and no report was written, one line now says so and points at
+`--log`, since that is exactly when the report matters and `--retry-failed` can only read a
+report `.csv`.
+
 ### Added (Explorer right-click "Compress + OCR" on a PDF)
 
 `tools\compress-pdf-context-menu.reg` adds **Compress + OCR (searchable)** to a `.pdf` file's
@@ -16,11 +50,10 @@ Installed under `SystemFileAssociations\.pdf` rather than under a ProgID, so it 
 whatever program owns the `.pdf` association and does not need reinstalling when the default
 viewer changes.
 
-Two judgement calls, both stated in the `.reg` so they can be undone: `--no-log` is passed, so
-one right-click does not leave three report files (`.log`, `.csv`, `_by_folder.csv`) beside the
-PDF — measured on a test run, which is what prompted it — and the console window `pause`s
-instead, showing the same summary. The wrapper also refuses a non-`.pdf`, a missing file or a
-missing argument with a readable message rather than handing them to the tool.
+No report files are left beside the PDF: a run is console-only unless you pass `--log` (see
+the logging change below, which this menu is what prompted), and the console window `pause`s so
+the summary survives long enough to read. The wrapper also refuses a non-`.pdf`, a missing file
+or a missing argument with a readable message rather than handing them to the tool.
 
 ### Added (Explorer right-click "Combine PDF")
 

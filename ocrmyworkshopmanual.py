@@ -20,8 +20,9 @@ Skip-if-exists, so it is resumable. Typical result on clean B&W scans: ~8-12% of
 original, crisp, and full-text searchable.
 NOTE: for SCANNED/image PDFs only. A SAFETY CHECK (looks_born_digital) detects
 born-digital/vector/text PDFs and copies them to dest byte-for-byte, untouched
-(never rasterised) — always on, no flag to disable it. Every folder run also
-writes a report log (which file, what was done, final stats); disable with --no-log.
+(never rasterised) — always on, no flag to disable it. A run reports to the console
+and writes NO files but its output; pass --log to keep a report (which file, what
+was done, final stats) in the current folder, or --log PATH to place it.
 
 Usage:
   python ocrmyworkshopmanual.py "M:\\path\\to\\folder"           # compress + OCR a tree
@@ -2978,14 +2979,24 @@ def _flag_duplicates(results: list) -> int:
     return sets
 
 
-def _report_path(log_path, dest_root: Path, report_dir, t0: float, dry_run: bool) -> Path:
-    """The report .log path: an explicit --log if given, else a timestamped file in
-    `report_dir` (dry-run: beside the source) or the dest root."""
-    if log_path:
-        return Path(log_path)
-    ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
-    suffix = '_DRYRUN' if dry_run else ''
-    return (report_dir or dest_root) / f'_ocrmyworkshopmanual_report_{ts}{suffix}.log'
+def _report_path(log_target, t0: float, dry_run: bool) -> Path:
+    """Where the report .log goes, from the single `--log` value.
+
+    A FOLDER (an existing directory, or a path with no suffix) gets a timestamped report
+    written inside it; anything else is taken as the exact file path. `--log` with no value
+    arrives here as the current working directory.
+
+    Reports used to be placed relative to the WORK — the dest root, or beside the source on
+    a dry run — which scattered `_ocrmyworkshopmanual_report_*.log/.csv/_by_folder.csv`
+    triplets through the archive wherever the tool had been pointed, and made `--dry-run`
+    write three files despite promising to write nothing. Where a report lands is the
+    caller's business, not the archive's, so it is now only ever what --log says."""
+    p = Path(log_target)
+    if p.is_dir() or not p.suffix:
+        ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
+        suffix = '_DRYRUN' if dry_run else ''
+        return p / f'_ocrmyworkshopmanual_report_{ts}{suffix}.log'
+    return p
 
 
 def _csv_row(fields: list) -> str:
@@ -3059,14 +3070,17 @@ def _folder_rows(results: list) -> list:
 def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
                   t0: float, dt: float, n_found: int, skipped: int, limit: int,
                   fail: int, done: int, kept: int, dry_run: bool = False,
-                  report_dir: Path = None, prescan_warns: list = None) -> Path:
+                  prescan_warns: list = None) -> Path:
     """Write a human-readable report of the folder run: which file, what was done
     (with the born-digital scan signals), and the final work stats. Also writes a
     machine-readable CSV sibling (same path, .csv) for filtering/sorting at scale.
-    Returns the .log path. In dry_run mode sizes are projections, not actuals."""
+    Returns the .log path. In dry_run mode sizes are projections, not actuals.
+
+    `log_path` is a folder (timestamped report inside it) or an exact file — see
+    `_report_path`. Callers pass what --log resolved to; nothing is derived from the work."""
     from collections import Counter
     import csv as _csv
-    log_path = _report_path(log_path, dest_root, report_dir, t0, dry_run)
+    log_path = _report_path(log_path, t0, dry_run)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts = Counter(_action_label(r) for r in results)
@@ -3310,9 +3324,13 @@ def main():
                          f'a lossy re-encode of every page (default {MIN_COMPRESS_MB:g}). They are '
                          f'still checked for OCR and made searchable if they have no text layer; '
                          f'0 = compress everything')
-    ap.add_argument('--log', type=Path, default=None,
-                    help='path for the run report log (default: a timestamped file in the dest root)')
-    ap.add_argument('--no-log', action='store_true', help='do not write a run report log')
+    ap.add_argument('--log', type=Path, nargs='?', const=Path.cwd(), default=None,
+                    metavar='PATH',
+                    help='write a run report. Omitted (the default) = NO report file, console '
+                         'only. Bare --log = a timestamped report in the CURRENT folder. '
+                         '--log DIR = a timestamped report in DIR. --log FILE.log = exactly '
+                         'that file. A .csv sibling (and a _by_folder.csv) is written next to '
+                         'it, and only that .csv can feed --retry-failed')
     ap.add_argument('--dry-run', action='store_true',
                     help='preview only: classify each pdf (born-digital? scanned?) and project its '
                          'compressed size, report what WOULD happen + projected savings, write NOTHING')
@@ -3482,11 +3500,9 @@ def main():
 
     # open the report CSV up front and flush a row per file, so progress is visible
     # live (the full .log + a final complete .csv are (re)written at the end).
-    report_dir = (SCRIPT_DIR / 'reports') if args.in_place else \
-        (src_root.parent if args.dry_run else None)
-    report_log_path = _report_path(args.log, dest_root, report_dir, t0, args.dry_run)
+    report_log_path = _report_path(args.log, t0, args.dry_run) if args.log else None
     csv_live = None
-    if not args.no_log:
+    if report_log_path:
         try:
             report_log_path.parent.mkdir(parents=True, exist_ok=True)
             csv_live = open(report_log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8')
@@ -3634,7 +3650,7 @@ def main():
     _say('Output: (dry-run — nothing written)' if args.dry_run else
          ('Output: IN-PLACE (source PDFs overwritten)' if args.in_place else f'Output: {dest_root}'))
 
-    if not args.no_log:
+    if report_log_path:
         settings = {
             'in_place': args.in_place,
             'dpi': args.dpi, 'workers': args.workers, 'mode': 'generic',
@@ -3650,15 +3666,19 @@ def main():
             'dry_run': args.dry_run,
         }
         try:
-            # reuse the same path the live CSV was written to (report_dir/report_log_path
-            # were computed before the run); write_run_log (re)writes the full .log + .csv
+            # reuse the exact path the live CSV was written to (resolved before the run);
+            # write_run_log (re)writes the full .log + a complete .csv
             log_path = write_run_log(report_log_path, dest_root, src_root, results, settings,
                                      t0, dt, len(pdfs), skipped, args.limit, fail, done, kept,
-                                     dry_run=args.dry_run, report_dir=report_dir,
-                                     prescan_warns=prescan_warns)
+                                     dry_run=args.dry_run, prescan_warns=prescan_warns)
             _say(f'Log: {log_path}  (+ .csv)')
         except Exception as ex:
             _say(f'(could not write run log: {ex})')
+    elif fail:
+        # A failed run is exactly when the report is wanted, and --retry-failed can only
+        # consume a report .csv. Say so once, here, rather than leaving it to be discovered.
+        _say('(no report file was written — re-run with --log to keep one, which is also '
+             'what --retry-failed reads)')
     if interrupted:
         sys.exit(130)   # conventional exit code for Ctrl-C
 

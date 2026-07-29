@@ -305,6 +305,62 @@ def test_report_csv_header_and_rows_line_up(tmp_path):
     assert '- small size' in text, 'summary must break the kept files down by reason'
 
 
+# ── where a report goes (and whether one is written at all) ───────────────────
+
+def test_report_path_folder_vs_exact_file(tmp_path):
+    """One rule: a FOLDER gets a timestamped report inside it, anything else is used
+    verbatim. `--log` with no value arrives as the current directory."""
+    t = time.time()
+    d = tmp_path / 'logs'
+    d.mkdir()
+    got = owm._report_path(d, t, False)
+    assert got.parent == d and got.name.startswith('_ocrmyworkshopmanual_report_')
+    assert got.suffix == '.log'
+
+    # a path that does not exist yet but has no suffix is still a folder
+    got = owm._report_path(tmp_path / 'not_yet', t, False)
+    assert got.parent == tmp_path / 'not_yet'
+
+    # anything with a suffix is the exact file
+    exact = tmp_path / 'my run.log'
+    assert owm._report_path(exact, t, False) == exact
+
+    # a dry run is marked in the generated name, so it cannot be mistaken for a real one
+    assert owm._report_path(d, t, True).stem.endswith('_DRYRUN')
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_cli_writes_no_report_next_to_the_pdf_by_default(tmp_path):
+    """The regression this guards: a plain run used to drop
+    `_ocrmyworkshopmanual_report_*.log/.csv/_by_folder.csv` beside the work — three files
+    into the archive for every folder the tool was pointed at. Default is now console-only."""
+    import subprocess
+    src = U.make_scan_pdf(tmp_path / 'manual.pdf', npages=2)
+    r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
+                        str(src), '--no-ocr'],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / 'manual (COMPRESSED).pdf').is_file(), 'the output itself must exist'
+    strays = sorted(p.name for p in tmp_path.rglob('_ocrmyworkshopmanual_report_*'))
+    assert strays == [], f'default run left report files behind: {strays}'
+    assert 'Log:' not in r.stdout
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_cli_log_dir_puts_the_report_there_not_beside_the_work(tmp_path):
+    import subprocess
+    src = U.make_scan_pdf(tmp_path / 'manual.pdf', npages=2)
+    logs = tmp_path / 'logs'
+    r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
+                        str(src), '--no-ocr', '--log', str(logs)],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    written = sorted(p.name for p in logs.glob('_ocrmyworkshopmanual_report_*'))
+    assert len(written) == 3, f'expected .log + .csv + _by_folder.csv, got {written}'
+    beside = sorted(p.name for p in tmp_path.glob('_ocrmyworkshopmanual_report_*'))
+    assert beside == [], f'nothing may land beside the work: {beside}'
+
+
 def test_summary_reports_the_bytes_each_reason_accounts_for(tmp_path):
     """A count alone hides what a decision COSTS: '2 small size' does not say whether the
     floor left 4 MB uncompressed or 4 GB. The MB is the number that tells you whether
