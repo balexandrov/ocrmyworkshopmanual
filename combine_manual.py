@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 import img2pdf
@@ -164,9 +165,20 @@ def pages_in_raw_bytes(pdf: Path) -> int:
         return 0
 
 
-def repair_inputs(files, work: Path) -> tuple:
+Repair = namedtuple('Repair', 'src rel status recovered expected')
+"""One input's repair outcome. `status` is:
+     'repaired'   - fully recovered, safe to merge
+     'incomplete' - a repair worked but salvaged FEWER pages than the original held
+     'failed'     - nothing could be read out of it at all
+`rel` is the path relative to the section, because a bare filename is ambiguous: one real
+section holds `Clutch System\\General Description.pdf` AND
+`Control Systems\\General Description.pdf`, and a report naming only 'General
+Description.pdf' twice cannot tell you which one is broken."""
+
+
+def repair_inputs(files, work: Path, base: Path = None) -> tuple:
     """Repair the unreadable PDFs among `files`, reusing ocrmyworkshopmanual's qpdf-then-
-    Ghostscript repair. Returns (files with repaired copies substituted, [(orig, note)]).
+    Ghostscript repair. Returns (files with repaired copies substituted, [Repair, ...]).
 
     Refusing a whole section over one malformed part would leave the manual split forever,
     so a recoverable part is recovered. But a repair is NOT taken at face value: the page
@@ -176,29 +188,40 @@ def repair_inputs(files, work: Path) -> tuple:
     parts holding 3, 9 and 6 page objects, from each of which qpdf salvaged exactly one
     page: ~15 pages would have been lost silently.
 
-    So each repair must recover at least as many pages as the raw bytes say the original
-    had (`_repair_pdf` rejects a partial salvage itself, given the expectation). A part
-    that cannot be recovered in full is left unreadable on purpose, so `expected_pages`
-    still reports it, `combine` still refuses, and the folder is still kept."""
+    So a repair must recover at least as many pages as the raw bytes say the original had.
+    When it cannot, the part is left unreadable on purpose — `expected_pages` still reports
+    it and `combine` still refuses — but HOW SHORT the salvage was is measured and returned,
+    because 'recovered 1 of ~9 pages' is what tells you whether the file is worth chasing,
+    and it is what --skip-unrecoverable needs in order to say what a section is missing."""
     import ocrmyworkshopmanual as owm
-    out, fixed = [], []
+    out, results = [], []
     for i, p in enumerate(files):
         if not is_pdf(p) or page_count(p) >= 0:
             out.append(p)
             continue
+        rel = p.relative_to(base) if base else Path(p.name)
         want = pages_in_raw_bytes(p)
         sub = work / f'rep{i:05d}'
         sub.mkdir(parents=True, exist_ok=True)
+        # STRICT first — exactly what the main tool does, but told how many pages to expect
+        # so it rejects a partial salvage instead of quietly returning a shortened file.
         rep = owm._repair_pdf(p, sub, expect_pages=want)
         got = page_count(Path(rep)) if rep else -1
         if rep and got >= 0 and (not want or got >= want):
             out.append(Path(rep))
-            fixed.append((p, f'repaired ({got} pages)'))
-        else:
-            out.append(p)                       # unrepairable — let the count refuse it
-            fixed.append((p, f'REPAIR INCOMPLETE (recovered {got} of ~{want} pages)'
-                            if got >= 0 else 'REPAIR FAILED'))
-    return out, fixed
+            results.append(Repair(p, rel, 'repaired', got, want))
+            continue
+        # It failed the strict bar. Repeat WITHOUT the expectation — the main tool's own
+        # leniency — purely to measure what is actually recoverable, so the report can say
+        # how much of the file is left rather than just 'failed'.
+        sub2 = work / f'sal{i:05d}'
+        sub2.mkdir(parents=True, exist_ok=True)
+        sal = owm._repair_pdf(p, sub2)
+        sgot = page_count(Path(sal)) if sal else -1
+        out.append(p)                           # unusable — let the count refuse it
+        results.append(Repair(p, rel, 'incomplete' if sgot > 0 else 'failed',
+                             max(sgot, 0), want))
+    return out, results
 
 
 def _image_to_pdf_bytes(path: Path) -> bytes:

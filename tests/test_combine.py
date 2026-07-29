@@ -200,6 +200,117 @@ def test_full_recovery_is_accepted(tmp_path, monkeypatch):
     assert 'repaired' in row['detail']
 
 
+def test_broken_parts_are_named_by_path_not_filename(tmp_path, monkeypatch):
+    """A bare filename cannot identify the culprit: one real section holds
+    `Clutch System\\General Description.pdf` AND `Control Systems\\General
+    Description.pdf`, and a report saying 'General Description.pdf' twice tells you
+    nothing about which is broken."""
+    root = tmp_path / 'M'
+    sec = root / 'Transmission Section'
+    for subname in ('Clutch System', 'Control Systems'):
+        (sec / subname).mkdir(parents=True)
+        (sec / subname / 'General Description.pdf').write_bytes(
+            b'%PDF-1.4\n' + b'/Type /Page\n' * 4 + b'\x00 truncated')
+    _pdf(sec / 'ok.pdf', npages=2)
+
+    import ocrmyworkshopmanual as owm
+    monkeypatch.setattr(owm, '_repair_pdf',
+                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
+    row = CS.process_section(sec, root, delete=False, dry=False)
+    assert row['status'] == 'FAILED', row
+    unrec = row['unrecoverable']
+    assert str(Path('Clutch System') / 'General Description.pdf') in unrec, unrec
+    assert str(Path('Control Systems') / 'General Description.pdf') in unrec, unrec
+    assert unrec.count('General Description.pdf') == 2
+
+
+def test_skip_unrecoverable_combines_the_rest_and_keeps_the_broken_parts(tmp_path,
+                                                                        monkeypatch):
+    """--skip-unrecoverable must not mean --lose-unrecoverable: the section is combined
+    from what is readable, and the damaged originals are MOVED out of the folder before it
+    is deleted, so a better tool can still be tried on them."""
+    root = tmp_path / 'M'
+    sec = root / 'Transmission Section'
+    (sec / 'Clutch System').mkdir(parents=True)
+    _pdf(sec / 'Clutch System' / 'Good.pdf', npages=3)
+    (sec / 'Clutch System' / 'Broken.pdf').write_bytes(
+        b'%PDF-1.4\n' + b'/Type /Page\n' * 9 + b'\x00 truncated')
+    _pdf(sec / '1. Intro.pdf', npages=2)
+
+    import ocrmyworkshopmanual as owm
+    monkeypatch.setattr(owm, '_repair_pdf',
+                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
+    row = CS.process_section(sec, root, delete=True, dry=False, skip_broken=True)
+
+    assert row['status'] == 'OK-PARTIAL', row
+    assert row['pages'] == 5, 'only the readable pages are in the PDF'
+    assert row['pages_dropped'] == 9
+    assert str(Path('Clutch System') / 'Broken.pdf') in row['unrecoverable']
+    assert row['deleted'] == 'yes' and not sec.exists()
+    # the broken original survives, with its subfolder path intact
+    kept = root / 'Transmission Section (UNRECOVERABLE)' / 'Clutch System' / 'Broken.pdf'
+    assert kept.is_file(), 'a skipped part must never be destroyed'
+    assert (root / 'Transmission Section.pdf').is_file()
+    assert len(PdfReader(str(root / 'Transmission Section.pdf')).pages) == 5
+
+
+def test_skip_unrecoverable_still_fails_when_nothing_is_readable(tmp_path, monkeypatch):
+    """Skipping every input would produce an empty PDF and delete the folder — refuse."""
+    root = tmp_path / 'M'
+    sec = root / 'S'
+    sec.mkdir(parents=True)
+    for i in (1, 2):
+        (sec / f'{i}.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 truncated')
+    import ocrmyworkshopmanual as owm
+    monkeypatch.setattr(owm, '_repair_pdf',
+                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
+    row = CS.process_section(sec, root, delete=True, dry=False, skip_broken=True)
+    assert row['status'] == 'FAILED', row
+    assert sec.exists() and row['deleted'] == 'no'
+    assert not (root / 'S.pdf').exists()
+
+
+def test_without_the_flag_a_broken_part_still_refuses_the_section(tmp_path, monkeypatch):
+    """The default stays safe: skipping is opt-in, so an unattended run never silently
+    ships a section with pages missing."""
+    root = tmp_path / 'M'
+    sec = root / 'S'
+    sec.mkdir(parents=True)
+    _pdf(sec / 'good.pdf', npages=2)
+    (sec / 'bad.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 truncated')
+    import ocrmyworkshopmanual as owm
+    monkeypatch.setattr(owm, '_repair_pdf',
+                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
+    row = CS.process_section(sec, root, delete=True, dry=False)   # skip_broken defaults off
+    assert row['status'] == 'FAILED' and sec.exists()
+    assert not (root / 'S (UNRECOVERABLE)').exists(), 'nothing moved without the flag'
+
+
+def test_repair_reports_how_much_is_salvageable(tmp_path, monkeypatch):
+    """'recovered 1 of ~9 pages' is what tells you whether a file is worth chasing, so a
+    failed strict repair is retried leniently purely to measure that."""
+    d = tmp_path / 's'
+    d.mkdir()
+    (d / 'broken.pdf').write_bytes(b'%PDF-1.4\n' + b'/Type /Page\n' * 9 + b'\x00 trunc')
+
+    import ocrmyworkshopmanual as owm
+
+    def fake_repair(src, work, expect_pages=0, timeout=0, stats=None):
+        if expect_pages and expect_pages > 1:
+            return None                      # strict attempt fails
+        out = Path(work) / 's.pdf'           # lenient attempt salvages one page
+        _pdf(out, npages=1)
+        return out
+
+    monkeypatch.setattr(owm, '_repair_pdf', fake_repair)
+    _files, reps = CM.repair_inputs(CM.collect(d), tmp_path / 'w', base=d)
+    assert len(reps) == 1
+    r = reps[0]
+    assert r.status == 'incomplete'
+    assert (r.recovered, r.expected) == (1, 9)
+    assert str(r.rel) == 'broken.pdf'
+
+
 # ── a folder that contains a merge of itself ──────────────────────────────────
 
 def test_self_combined_copy_is_ignored(tmp_path):

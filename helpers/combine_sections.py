@@ -16,8 +16,18 @@ the root (standalone guides, index.htm) are left exactly where they are.
 
   python helpers/combine_sections.py ROOTS.txt --dry-run
   python helpers/combine_sections.py ROOTS.txt --delete
+  python helpers/combine_sections.py ROOTS.txt --delete --skip-unrecoverable
 
 ROOTS.txt is one root folder per line (blank lines and #comments ignored).
+
+A damaged part is REPAIRED first (qpdf, then Ghostscript — the same path the main tool
+uses), and the repair must recover the page count the file's raw bytes say it had, so a
+partial salvage cannot pass itself off as complete. If a part stays broken the section is
+refused, unless --skip-unrecoverable is given: then it is combined without that part, the
+part is moved to "<SECTION> (UNRECOVERABLE)\" so it is never destroyed, and the row says
+which files and how many pages were left out. Every unrecoverable file is named by its
+path RELATIVE TO THE SECTION, because one real section holds two different
+`General Description.pdf` files and a bare filename cannot tell them apart.
 
 DELETION IS GATED on all of these passing, because a merge is where pages vanish
 silently and a short PDF looks no different from a complete one:
@@ -128,11 +138,13 @@ def sections_of(root: Path) -> list:
                   key=lambda p: CM.natkey(p.name))
 
 
-def process_section(sec: Path, root: Path, delete: bool, dry: bool) -> dict:
+def process_section(sec: Path, root: Path, delete: bool, dry: bool,
+                    skip_broken: bool = False) -> dict:
     """Combine one section folder -> <root>\\<section>.pdf, verify, optionally delete
     the folder. Returns a row for the progress CSV; never raises."""
     row = {'root': str(root), 'section': sec.name, 'status': '', 'files': 0, 'pages': 0,
            'src_MB': 0.0, 'out_MB': 0.0, 'ratio': '', 'blank_sampled': '',
+           'unrecoverable': '', 'pages_dropped': '',
            'lost_other_files': '', 'deleted': 'no', 'seconds': 0, 'detail': ''}
     t0 = time.time()
     out = root / (sec.name + '.pdf')
@@ -204,16 +216,43 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool) -> dict:
             want, bad = CM.expected_pages(files)
             row['pages'] = want
             row['status'] = 'WOULD-COMBINE' if not bad else 'WOULD-REPAIR'
+            row['unrecoverable'] = '; '.join(str(b.relative_to(sec)) for b in bad)
             return detail('' if not bad else
-                          f'{len(bad)} unreadable input(s) — would try qpdf/Ghostscript repair')
+                          f'{len(bad)} unreadable input(s) — would try qpdf/Ghostscript '
+                          f'repair' + (', then skip any that stay broken'
+                                       if skip_broken else ''))
 
         # repair any unreadable part first, in a scratch dir, so one malformed page does
         # not strand a whole section as un-combinable
         work = Path(tempfile.mkdtemp(prefix='combsec_'))
         try:
-            files, fixed = CM.repair_inputs(files, work)
-            if fixed:
-                notes.append('; '.join(f'{p.name}: {n}' for p, n in fixed)[:300])
+            files, reps = CM.repair_inputs(files, work, base=sec)
+            for r in reps:
+                notes.append(f'{r.rel}: ' + (
+                    f'repaired ({r.recovered} pages)' if r.status == 'repaired'
+                    else f'UNRECOVERABLE — only {r.recovered} of ~{r.expected} pages '
+                         f'can be salvaged' if r.status == 'incomplete'
+                    else 'UNRECOVERABLE — nothing could be read out of it'))
+            broken = [r for r in reps if r.status != 'repaired']
+            row['unrecoverable'] = '; '.join(str(r.rel) for r in broken)
+            row['pages_dropped'] = sum(r.expected or 0 for r in broken) if broken else ''
+            if broken and skip_broken:
+                # Combine what IS readable rather than leaving the manual split forever —
+                # but the damaged originals are moved out BEFORE the folder is deleted, so
+                # skipping a page never destroys the only copy of it. A better tool, or a
+                # cleaner download, can still be tried on them later.
+                bad_set = {r.src for r in broken}
+                files = [p for p in files if p not in bad_set]
+                if not files:
+                    row['status'] = 'FAILED'
+                    return detail('every input is unrecoverable — nothing to combine')
+                keep_dir = root / (sec.name + ' (UNRECOVERABLE)')
+                for r in broken:
+                    dest = keep_dir / r.rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(r.src), str(dest))
+                notes.append(f'{len(broken)} unrecoverable part(s) moved to '
+                             f'{keep_dir.name}\\ and left out of the PDF')
             # The size ratio must be measured against what was ACTUALLY merged. qpdf and
             # Ghostscript rewrite a repaired part smaller, so charging the merge for the
             # original bytes made a sound section look like content loss (measured: a Baja
@@ -242,7 +281,7 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool) -> dict:
             row['status'] = 'FAILED'
             out.unlink(missing_ok=True)
             return detail(f'{blanks} of {k} sampled pages are blank')
-        row['status'] = 'OK'
+        row['status'] = 'OK-PARTIAL' if row['unrecoverable'] else 'OK'
         detail()
         if delete:
             shutil.rmtree(sec)
@@ -266,6 +305,13 @@ def main():
     ap.add_argument('--delete', action='store_true',
                     help='DELETE each section folder after its combined PDF passes every '
                          'check (default: keep everything)')
+    ap.add_argument('--skip-unrecoverable', action='store_true',
+                    help='combine a section even if some parts are damaged beyond repair, '
+                         'leaving those parts OUT of the PDF instead of refusing the whole '
+                         'section. The damaged originals are MOVED to '
+                         '"<SECTION> (UNRECOVERABLE)\\" beside the PDF first, so nothing is '
+                         'destroyed and a better tool can be tried on them later; the row '
+                         'is reported as OK-PARTIAL with the files and page count dropped')
     ap.add_argument('--dry-run', action='store_true',
                     help='report what would happen; write and delete nothing')
     ap.add_argument('--progress', type=Path,
@@ -290,7 +336,8 @@ def main():
     new = not args.progress.exists()
     fh = args.progress.open('a', newline='', encoding='utf-8')
     cols = ['root', 'section', 'status', 'files', 'pages', 'src_MB', 'out_MB', 'ratio',
-            'blank_sampled', 'lost_other_files', 'deleted', 'seconds', 'detail']
+            'blank_sampled', 'unrecoverable', 'pages_dropped', 'lost_other_files',
+            'deleted', 'seconds', 'detail']
     w = csv.DictWriter(fh, fieldnames=cols)
     if new:
         w.writeheader()
@@ -306,13 +353,14 @@ def main():
         secs = sections_of(root)
         print(f'\n[{i}/{len(roots)}] {root}   ({len(secs)} sections)', flush=True)
         for sec in secs:
-            row = process_section(sec, root, args.delete, args.dry_run)
+            row = process_section(sec, root, args.delete, args.dry_run,
+                                  skip_broken=args.skip_unrecoverable)
             w.writerow(row)
             fh.flush()
             tally[row['status']] = tally.get(row['status'], 0) + 1
-            if row['status'] in ('OK', 'ALREADY'):
+            if row['status'] in ('OK', 'OK-PARTIAL', 'ALREADY'):
                 made.append(root / (sec.name + '.pdf'))
-            mark = {'OK': 'ok', 'ALREADY': 'have', 'SKIP': '--',
+            mark = {'OK': 'ok', 'OK-PARTIAL': 'part', 'ALREADY': 'have', 'SKIP': '--',
                     'FAILED': 'FAIL', 'CONFLICT': 'CONF'}.get(row['status'], '??')
             extra = f"  del={row['deleted']}" if not args.dry_run else ''
             print(f"   {mark:4} {row['files']:>4}f -> {row['pages']:>5}p "

@@ -1479,6 +1479,10 @@ def _run_stalled(cmd, progress, stall: int, poll: float = 2.0, **kw):
     if stall <= 0:
         return subprocess.run(cmd, **kw)
     kw.pop('timeout', None)
+    # `capture_output` is a subprocess.run convenience that Popen does not accept; the
+    # watchdog path pipes both streams anyway, so translate rather than reject it — a
+    # caller should not have to know which path its timeout value will take.
+    kw.pop('capture_output', None)
     p = subprocess.Popen(cmd, stdout=kw.pop('stdout', subprocess.PIPE),
                          stderr=kw.pop('stderr', subprocess.PIPE), **kw)
     last, last_t = progress(), time.time()
@@ -1731,11 +1735,17 @@ def _gs_repair(src_p: Path, work: Path, timeout: int = 0):
     file is given up on — one bad download shouldn't just be lost in a big batch."""
     out = work / 'repaired.pdf'
     try:
-        # progress = the rewritten PDF growing; killed only if it stalls, not if it's slow
+        # progress = the rewritten PDF growing; killed only if it stalls, not if it's slow.
+        # capture_output so Ghostscript's complaints ('Catalog dictionary not located in
+        # file', 'No pages will be processed') never reach a shared console UNATTRIBUTED.
+        # _run_stalled pipes them only when a stall watchdog is active; a caller passing
+        # timeout=0 otherwise inherits stderr, and the messages carry no filename, so in a
+        # batch there is no way to tell which PDF produced them.
         r = _run_stalled(
             [GS, '-o', str(out), '-sDEVICE=pdfwrite', '-dQUIET', '-dNOPAUSE', '-dBATCH',
              win_long(src_p)],
-            lambda: out.stat().st_size if out.exists() else 0, timeout, text=True)
+            lambda: out.stat().st_size if out.exists() else 0, timeout, text=True,
+            capture_output=True)
     except Exception:
         return None
     return out if (r.returncode == 0 and out.exists() and out.stat().st_size > 0) else None
