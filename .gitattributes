@@ -1,0 +1,4 @@
+# Windows-only artifacts: cmd.exe can mis-parse goto/labels in an LF-only .cmd,
+# and regedit expects CRLF. Everything else in this repo stays LF.
+*.cmd text eol=crlf
+*.reg text eol=crlf

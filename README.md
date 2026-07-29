@@ -309,6 +309,29 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
   must recover the page count the file's raw bytes say it had, so a partial salvage can't
   pass itself off as complete.
 
+### Right-click "Combine PDF" in Explorer (Windows)
+
+`tools\combine-pdf-context-menu.reg` adds a **Combine PDF** submenu to any folder's
+right-click menu. Double-click it to install and confirm the prompt — it writes only under
+`HKEY_CURRENT_USER`, so **no admin rights** are needed and it applies to your account only.
+On Windows 11 look under *Show more options* (or press Shift+F10 to open that menu directly).
+
+| menu item | runs |
+|---|---|
+| Preview page order (writes nothing) | `--dry-run` |
+| Combine into one PDF | `--no-compress` |
+| Combine including subfolders | `--recursive --no-compress` |
+| Combine, then compress + OCR | the full default pipeline (slow) |
+
+Each opens a console window that stays open, so you can read the page order and any error
+before it disappears. `tools\combine-pdf-context-menu-uninstall.reg` removes the menu.
+
+The registry holds one path only — `tools\combine_pdf_here.cmd`. That wrapper locates the
+script and the repo's virtualenv relative to its own folder, so **if you move the checkout,
+edit that single path in the `.reg` and re-import**; nothing else changes. It also prefers
+`.venv\Scripts\python.exe`, because a bare system Python will not have `pypdf`, `img2pdf`
+and Pillow.
+
 ## Consolidating a split manual (`helpers/combine_sections.py`)
 
 Some manuals are published as **one small PDF per topic**, thousands of them, arranged as

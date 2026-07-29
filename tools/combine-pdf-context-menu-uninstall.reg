@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Removes the "Combine PDF" folder context menu installed by
+;  combine-pdf-context-menu.reg.
+;
+;  The leading "-" on a key name means DELETE THAT KEY AND EVERYTHING UNDER IT,
+;  so this one line clears the parent entry and all four submenu items. Nothing
+;  outside this key is touched, and no files are affected.
+; ============================================================================
+
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF]

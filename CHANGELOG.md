@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (Explorer right-click "Combine PDF")
+
+`tools\combine-pdf-context-menu.reg` puts a **Combine PDF** submenu on every folder's
+right-click menu, with an uninstall `.reg` beside it. Installs under `HKEY_CURRENT_USER`, so
+no admin rights and no machine-wide change. Four entries: preview the page order (writes
+nothing), combine, combine including subfolders, and combine then compress + OCR.
+
+The registry holds a single path — `tools\combine_pdf_here.cmd` — and that wrapper carries
+everything awkward: it finds the repo and `combine_manual.py` relative to its own location
+(`%~dp0..`), prefers `.venv\Scripts\python.exe` since a bare system Python lacks pypdf /
+img2pdf / Pillow, quotes a folder name containing spaces, rejects a missing or non-folder
+argument with a readable message, and `pause`s so the page order and any traceback survive
+long enough to read. Keeping that logic in a `.cmd` rather than an escaped registry string is
+the point: it can be read and fixed.
+
+Both files are ASCII with CRLF, pinned by a new `.gitattributes` (`*.cmd`/`*.reg` →
+`eol=crlf`, everything else untouched): cmd.exe can mis-parse `goto`/labels in an LF-only
+`.cmd`, so a clone with `core.autocrlf=input` would otherwise ship a broken script.
+
 ### Added (`--order docid`: publisher page order for a manual printed from the web)
 
 Consolidating the Mitsubishi Outlander 2022 repair manual (9 sections, 109 parts) hit a case

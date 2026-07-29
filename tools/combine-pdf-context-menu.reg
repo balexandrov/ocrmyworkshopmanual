@@ -1,0 +1,55 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Explorer right-click menu: "Combine PDF" on a folder.
+;
+;  Double-click this file to install, then confirm the prompt. No admin rights
+;  are needed: everything goes under HKEY_CURRENT_USER, which Explorer merges
+;  into HKEY_CLASSES_ROOT for your account only. Log out/in or restart Explorer
+;  if the entry does not appear immediately.
+;
+;  On Windows 11 the entry lives under "Show more options" (Shift+F10 opens
+;  that menu directly).
+;
+;  IF YOU MOVE THE REPO: every "command" line below points at
+;      S:\Projects\Home\ocrmyworkshopmanual\tools\combine_pdf_here.cmd
+;  Replace that one path (keeping the doubled backslashes) and re-import. The
+;  .cmd itself finds the script and the virtualenv relative to its own location,
+;  so nothing else needs changing.
+;
+;  To remove: run combine-pdf-context-menu-uninstall.reg.
+; ============================================================================
+
+; ---- the parent entry, shown on any folder ----------------------------------
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF]
+"MUIVerb"="Combine PDF"
+"Icon"="shell32.dll,-133"
+"ExtendedSubCommandsKey"="Directory\\shell\\CombinePDF\\ContextMenu"
+
+; ---- 1. look before you leap: prints the page order, writes nothing ---------
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\1preview]
+"MUIVerb"="Preview page order (writes nothing)"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\1preview\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\combine_pdf_here.cmd\" \"%V\" --dry-run"
+
+; ---- 2. the everyday one: merge this folder's files into <folder>.pdf -------
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\2combine]
+"MUIVerb"="Combine into one PDF"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\2combine\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\combine_pdf_here.cmd\" \"%V\" --no-compress"
+
+; ---- 3. same, but walk subfolders too (a manual split per topic) ------------
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\3recursive]
+"MUIVerb"="Combine including subfolders"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\3recursive\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\combine_pdf_here.cmd\" \"%V\" --recursive --no-compress"
+
+; ---- 4. merge, then compress + add a searchable text layer (slow) ----------
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\4compress]
+"MUIVerb"="Combine, then compress + OCR"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CombinePDF\ContextMenu\shell\4compress\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\combine_pdf_here.cmd\" \"%V\""
