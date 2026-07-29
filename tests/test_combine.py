@@ -1,0 +1,248 @@
+"""Tests for combining a split manual into one PDF per section.
+
+These guard an IRREVERSIBLE step: helpers/combine_sections.py deletes the source folder
+once the combined PDF passes verification, so a bug here loses pages permanently. Every
+check below corresponds to something that actually went wrong on the real archive.
+"""
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+from pypdf import PdfReader, PdfWriter
+
+import _util as U
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'helpers'))
+import combine_manual as CM          # noqa: E402
+import combine_sections as CS        # noqa: E402
+
+
+def _pdf(path: Path, npages: int = 1) -> Path:
+    """A tiny valid PDF with `npages` pages, each carrying text."""
+    return U.make_born_digital_pdf(path, npages=npages, lines_per_page=3)
+
+
+# ── ordering ──────────────────────────────────────────────────────────────────
+
+def test_recursive_order_interleaves_files_and_subfolders(tmp_path):
+    """At every level, files and subfolders are ordered by ONE natural key — so a
+    subfolder takes its pages' place in the sequence instead of being appended last.
+    This is the real shape of GENERAL INFORMATION SECTION: numbered intro pages, then a
+    PERIODIC MAINTENANCE subfolder that continues them."""
+    sec = tmp_path / 'GENERAL INFORMATION SECTION'
+    sec.mkdir()
+    for n in (1, 2, 10):                       # 10 must sort after 2, not after 1
+        _pdf(sec / f'{n}. Intro.pdf')
+    sub = sec / 'PERIODIC MAINTENANCE SERVICES PM'
+    sub.mkdir()
+    for n in (1, 2, 9, 10):
+        _pdf(sub / f'{n}. Topic.pdf')
+    _pdf(sec / '0. Cover.pdf')
+
+    rel = [str(p.relative_to(sec)) for p in CM.collect(sec, recursive=True)]
+    assert rel == ['0. Cover.pdf', '1. Intro.pdf', '2. Intro.pdf', '10. Intro.pdf',
+                   str(Path('PERIODIC MAINTENANCE SERVICES PM') / '1. Topic.pdf'),
+                   str(Path('PERIODIC MAINTENANCE SERVICES PM') / '2. Topic.pdf'),
+                   str(Path('PERIODIC MAINTENANCE SERVICES PM') / '9. Topic.pdf'),
+                   str(Path('PERIODIC MAINTENANCE SERVICES PM') / '10. Topic.pdf')], rel
+
+
+def test_non_recursive_still_ignores_subfolders(tmp_path):
+    """The default must not change: only direct files, so an existing caller that points
+    at a folder with a `*_files` HTML asset dir keeps behaving the same."""
+    d = tmp_path / 'f'
+    d.mkdir()
+    _pdf(d / 'a.pdf')
+    (d / 'a_files').mkdir()
+    _pdf(d / 'a_files' / 'junk.pdf')
+    assert [p.name for p in CM.collect(d)] == ['a.pdf']
+    assert len(CM.collect(d, recursive=True)) == 2
+
+
+# ── a PDF is a PDF whatever it is called ──────────────────────────────────────
+
+def test_extensionless_pdf_is_collected(tmp_path):
+    """A real page in this archive is a 1-page PDF stored as a file named `null`, with
+    stray newlines before %PDF. Keying off the extension dropped it from its section —
+    and the folder then gets deleted, so the page would have been gone for good."""
+    d = tmp_path / 'Wiring Diagram Section'
+    d.mkdir()
+    real = _pdf(tmp_path / 'src.pdf')
+    (d / 'null').write_bytes(b'\n\n\n\n\n' + real.read_bytes())
+    _pdf(d / '1. Page.pdf')
+
+    assert CM.looks_like_pdf(d / 'null')
+    assert CM.is_pdf(d / 'null')
+    names = [p.name for p in CM.collect(d, recursive=True)]
+    assert 'null' in names, names
+    # and it is counted as a PDF's worth of pages, not as one image page
+    want, bad = CM.expected_pages(CM.collect(d, recursive=True))
+    assert not bad and want == 2 * CM.page_count(real)
+
+
+def test_text_mentioning_pdf_is_not_collected(tmp_path):
+    """The sniff must be a HEADER check, not a substring search — an FTP log or readme
+    that merely contains '%PDF' is not a page."""
+    d = tmp_path / 's'
+    d.mkdir()
+    (d / 'WS_FTP.LOG').write_bytes(b'transferred %PDF-1.4 files ok\n')
+    assert not CM.looks_like_pdf(d / 'WS_FTP.LOG')
+    assert CM.collect(d, recursive=True) == []
+
+
+# ── verification is what makes deleting the source safe ───────────────────────
+
+def test_combine_verifies_page_count(tmp_path):
+    d = tmp_path / 's'
+    d.mkdir()
+    a, b = _pdf(d / '1.pdf', npages=3), _pdf(d / '2.pdf', npages=2)
+    out = tmp_path / 'out.pdf'
+    pages = CM.combine(CM.collect(d), out)
+    assert pages == 5 == len(PdfReader(str(out)).pages)
+    assert CM.page_count(a) + CM.page_count(b) == 5
+
+
+def test_combine_refuses_unreadable_input_and_leaves_no_output(tmp_path):
+    """An unreadable part must abort the merge, not be skipped: a short PDF looks exactly
+    like a complete one, and the source folder would then be deleted on its strength."""
+    d = tmp_path / 's'
+    d.mkdir()
+    _pdf(d / '1.pdf', npages=2)
+    (d / '2.pdf').write_bytes(b'this is not a pdf at all')
+    out = tmp_path / 'out.pdf'
+    with pytest.raises(CM.CombineFailed):
+        CM.combine(CM.collect(d), out)
+    assert not out.exists(), 'a refused merge must leave no output behind'
+    assert not list(tmp_path.glob('*.part')), 'no half-written staging file either'
+
+
+def test_combine_detects_page_loss(tmp_path, monkeypatch):
+    """If the merge itself silently drops a page, the count check catches it. Simulated by
+    lying about the expected total — the same arithmetic that catches a real short merge."""
+    d = tmp_path / 's'
+    d.mkdir()
+    _pdf(d / '1.pdf', npages=2)
+    files = CM.collect(d)
+    monkeypatch.setattr(CM, 'expected_pages', lambda fs: (99, []))
+    with pytest.raises(CM.CombineFailed, match='page loss'):
+        CM.combine(files, tmp_path / 'out.pdf')
+    assert not (tmp_path / 'out.pdf').exists()
+
+
+# ── a folder that contains a merge of itself ──────────────────────────────────
+
+def test_self_combined_copy_is_ignored(tmp_path):
+    """WIRING DIAGRAM SECTION holds nine parts in subfolders AND a Wiring_diagram.pdf that
+    is those same pages already merged. Combining everything would emit every page twice.
+    Detected by EXACT page-count identity with the subfolders' total."""
+    sec = tmp_path / 'WIRING DIAGRAM SECTION'
+    sub = sec / 'WIRING DIAGRAM'
+    sub.mkdir(parents=True)
+    p1 = _pdf(sub / '1.pdf', npages=2)
+    p2 = _pdf(sub / '2.pdf', npages=3)
+    merged = sec / 'Wiring_diagram.pdf'         # 5 pages == 2 + 3 in the subfolder
+    w = PdfWriter()
+    w.append(str(p1))
+    w.append(str(p2))
+    with open(merged, 'wb') as f:
+        w.write(f)
+    assert CM.page_count(merged) == 5
+
+    files = CM.collect(sec, recursive=True)
+    assert len(files) == 3
+    kept, dropped = CS.drop_self_combined(sec, files)
+    assert dropped == ['Wiring_diagram.pdf'], dropped
+    assert CM.expected_pages(kept)[0] == 5, 'pages must not be double-counted'
+
+
+def test_a_genuine_chapter_is_not_mistaken_for_a_self_copy(tmp_path):
+    """The ratio heuristic tried first (>=40% of the subfolders' pages) flagged 31 real
+    chapters — a 19-page `Pre-delivery Inspection.pdf` beside 43 pages of subfolder. Only
+    exact identity may drop a file, or genuine pages vanish."""
+    sec = tmp_path / 'GENERAL INFORMATION SECTION'
+    sub = sec / 'PERIODIC MAINTENANCE'
+    sub.mkdir(parents=True)
+    _pdf(sub / '1.pdf', npages=6)                    # subfolders hold 6 pages
+    _pdf(sec / '8. Pre-delivery Inspection.pdf', npages=4)   # 4/6 = 0.67, but genuine
+    files = CM.collect(sec, recursive=True)
+    kept, dropped = CS.drop_self_combined(sec, files)
+    assert dropped == [], 'a real chapter must never be dropped'
+    assert len(kept) == 2
+
+
+# ── the driver's delete gate ──────────────────────────────────────────────────
+
+def test_section_is_deleted_only_after_verification(tmp_path):
+    root = tmp_path / 'USDM Manual FSM 2006'
+    sec = root / 'BODY SECTION'
+    sub = sec / 'AIRBAG SYSTEM AB'
+    sub.mkdir(parents=True)
+    _pdf(sub / '1. General Description.pdf', npages=2)
+    _pdf(sub / '2. Airbag Connector.pdf', npages=3)
+    _pdf(sec / '1. Intro.pdf', npages=1)
+
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'OK', row
+    assert row['pages'] == 6 and row['deleted'] == 'yes'
+    assert (root / 'BODY SECTION.pdf').is_file()
+    assert not sec.exists(), 'a verified section folder should be gone'
+    assert len(PdfReader(str(root / 'BODY SECTION.pdf')).pages) == 6
+
+
+def test_failed_section_keeps_its_folder(tmp_path):
+    """The whole safety property: nothing is deleted when verification fails."""
+    root = tmp_path / 'M'
+    sec = root / 'BAD SECTION'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1.pdf', npages=2)
+    (sec / '2.pdf').write_bytes(b'%PDF-1.4 but truncated garbage')
+
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'FAILED', row
+    assert row['deleted'] == 'no'
+    assert sec.exists() and (sec / '1.pdf').exists()
+    assert not (root / 'BAD SECTION.pdf').exists()
+
+
+def test_existing_pdf_is_verified_not_blindly_skipped(tmp_path):
+    """46 sections were combined by another tool in 2019. An existing output is checked
+    against the folder: a faithful one means the folder is redundant (ALREADY, safe to
+    delete); a mismatched one is a CONFLICT and nothing is touched."""
+    root = tmp_path / 'M'
+    sec = root / 'BODY SECTION'
+    sec.mkdir(parents=True)
+    p1 = _pdf(sec / '1.pdf', npages=2)
+    p2 = _pdf(sec / '2.pdf', npages=3)
+
+    good = root / 'BODY SECTION.pdf'
+    w = PdfWriter()
+    w.append(str(p1))
+    w.append(str(p2))
+    with open(good, 'wb') as f:
+        w.write(f)
+    row = CS.process_section(sec, root, delete=True, dry=False)
+    assert row['status'] == 'ALREADY', row
+    assert row['deleted'] == 'yes' and not sec.exists()
+
+    # now the mismatched case — an existing PDF that is short
+    sec2 = root / 'OTHER SECTION'
+    sec2.mkdir()
+    _pdf(sec2 / '1.pdf', npages=2)
+    _pdf(sec2 / '2.pdf', npages=3)
+    shutil.copyfile(str(_pdf(tmp_path / 'short.pdf', npages=1)),
+                    str(root / 'OTHER SECTION.pdf'))
+    row = CS.process_section(sec2, root, delete=True, dry=False)
+    assert row['status'] == 'CONFLICT', row
+    assert row['deleted'] == 'no' and sec2.exists(), 'a conflict must touch nothing'
+
+
+def test_dry_run_writes_and_deletes_nothing(tmp_path):
+    root = tmp_path / 'M'
+    sec = root / 'S'
+    sec.mkdir(parents=True)
+    _pdf(sec / '1.pdf', npages=2)
+    before = set(p.relative_to(tmp_path) for p in tmp_path.rglob('*'))
+    row = CS.process_section(sec, root, delete=False, dry=True)
+    assert row['status'] == 'WOULD-COMBINE' and row['pages'] == 2
+    assert set(p.relative_to(tmp_path) for p in tmp_path.rglob('*')) == before
