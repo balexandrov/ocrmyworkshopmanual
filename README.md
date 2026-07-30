@@ -169,9 +169,9 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--from-list FILE` | — | Compress+OCR **in place** exactly the PDF paths listed in FILE (one per line), as one global pool. For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
-| `--log [PATH]` | off | Write a run report. **Omitted = no report file, console only.** Bare `--log` puts a timestamped report in the **current folder**; `--log DIR` puts it in `DIR`; `--log FILE.log` uses that exact path. A `.csv` sibling and a `_by_folder.csv` land next to it, and that `.csv` is what `--retry-failed` reads |
+| `--log [PATH]` | off | Write a run report `.csv` — **one file, and it's what `--retry-failed` reads**. **Omitted = no report file, console only.** Bare `--log` puts a timestamped report in the **current folder**; `--log DIR` puts it in `DIR`; `--log FILE` uses that exact path as `.csv` |
 | `--limit N` | `0` | Process only the first N files (testing) |
-| `--verbose` | off | Also echo each PDF-library warning to the console, prefixed with the file it came from. They always go to the report `.log`/`.csv` regardless; this is for debugging one file without opening the report |
+| `--verbose` | off | Also echo each PDF-library warning to the console, prefixed with the file it came from. They always land in the report's `warnings` column regardless; this is for debugging one file without opening the report |
 | `--version` | — | Print the version and exit |
 
 A few things are **not** configurable on purpose, to keep the tool's guarantees simple
@@ -224,8 +224,8 @@ What it does and doesn't touch:
 - **PDFs that compress** → overwritten with the smaller, searchable version.
 - **Born-digital, already-optimal, or unchanged** PDFs → **left exactly as-is** (never rewritten).
 - **Non-PDF files and the folder structure** → untouched.
-- The run **report** is written to the **tool folder** (`reports/` next to the script),
-  not among your manuals.
+- The run **report** is only ever written where `--log` says (nothing without it), never
+  among your manuals.
 
 Safety mechanics:
 - Each file is compressed to scratch, **verified** (opens + correct page count), and only
@@ -471,18 +471,18 @@ damage; failing to compress something only costs savings. Concretely:
 - Always on — there's no flag to force-rasterize a file this check calls born-digital,
   because doing so would defeat the one thing this safety check exists for.
 
-## Run report log
+## Run report
 
 A run reports to the console and writes nothing but its output. Pass **`--log`** to keep a
 report as well — in the current folder, or wherever `--log PATH` says. Reports are never
-placed relative to the work being done, so they cannot accumulate through an archive. The
-report records the settings used, then **per file** what
-happened, **why**, and **what became of its text layer**, with sizes and the born-digital
-scan signals, and a final **summary tally + total bytes saved** — so a big batch is
-reviewable at a glance. Two machine-readable **`.csv` siblings** are written alongside it
-and **flushed per file** (so you can open them while a run is still going):
-- the main `.csv` — one row per file: `file, action, reason, ocr, language, orig size (MB),
-  new size (MB), %, duplicate of, page types, note, warnings, error` (sizes in MB; filter
+placed relative to the work being done, so they cannot accumulate through an archive.
+
+The report is **one `.csv`**, **flushed per file** (so you can open it while a run is still
+going, and a killed run still has one), rewritten complete and sorted at the end. The
+console carries the run's settings and the closing summary tally; the `.csv` carries the
+per-file record — what happened, **why**, and **what became of its text layer**:
+- one row per file: `file, action, reason, ocr, language, orig size (MB), new size (MB), %,
+  duplicate of, page types, scan signals, note, warnings, error` (sizes in MB; filter
   `error` non-blank to feed `--retry-failed`).
 
   The **four decision columns** each take values from a fixed vocabulary, so a run over
@@ -498,17 +498,22 @@ and **flushed per file** (so you can open them while a run is still going):
   `re-ocr` vs `new ocr` is the difference between *replacing* a manual's existing text
   layer and giving it its first one — and `kept existing` means ocrmypdf never ran on it.
   `page types` is a machine-readable tally of how the pages were classified
-  (`line=12 vector=3`), so a collection can be grouped by content type. `warnings` carries
-  whatever the PDF libraries said about *that* file — see below.
-- a `…_by_folder.csv` — one summary row per source subfolder (`folder, files, orig size
-  (MB), new size (MB), %, saved (MB)`) plus a `(TOTAL)` row, so you can see which
-  manual-series compress well. The same rollup is printed in the `.log`.
+  (`line=12 vector=3`), so a collection can be grouped by content type. `scan signals`
+  carries the born-digital scan's own evidence (`scan_frac=0.033 scan_pages=1/30
+  text_pages=29 chars=8412`) — the answer to *why did you refuse to compress this?* —
+  and is blank for a file the scan never had to judge. `warnings` carries whatever the PDF
+  libraries said about *that* file — see below.
+
+Anything a folder-level rollup used to give you (`_by_folder.csv`, once a third file) is a
+pivot over these rows; group by the folder part of `file` and sum the size columns.
 
 **Malformed-PDF warnings are attributed, not dumped.** The PDF libraries have plenty to say
 about a damaged source (`invalid pdf header`, `incorrect startxref pointer`, …). Those messages
 carry no filename, and with several worker processes writing to one console they interleave
-across files — so they are captured per file instead, tallied with counts, and written into the
-`.log` as `pdf warning:` lines under that file plus the `warnings` CSV column. The console shows
+across files — so they are captured per file instead, tallied with counts, and written into
+that file's `warnings` column (`4x pypdf: incorrect startxref pointer`). Warnings raised while
+*scanning* the source belong to no single file and get one labelled `(pre-scan)` row, whose
+`error` column is blank so `--retry-failed` never mistakes it for work. The console shows
 only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed with its file.
 
 ## Resilience & preview (for large collections)
@@ -516,8 +521,9 @@ only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed w
 - **`--dry-run`** — preview a whole tree without writing anything: it classifies each
   file (born-digital? scanned?), projects the compressed size via the same sample
   pre-check the real run uses, and reports the per-file plan **plus projected total
-  savings**. The report/CSV are written next to the source (never inside a created dest
-  tree). Run this first on a big archive to see what you're in for.
+  savings**. With `--log` its report goes where `--log` says, marked `_DRYRUN` in the
+  generated name; without it a dry run writes nothing at all. Run this first on a big
+  archive to see what you're in for.
 - **`--timeout SECS`** (default 600 = 10 min) — a **stall** timeout, not a time budget: the
   most seconds a step may go without making progress (no new page rendered, no bytes
   written) before it's treated as hung. A pathological PDF that would otherwise hang a
@@ -535,7 +541,8 @@ only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed w
   pages rather than character count (a legitimate re-OCR differs in character count); and
   that links and bookmarks did not shrink (a file that has none is unaffected — the count
   cannot drop below zero — so a plain scan still compresses). Any of these failing keeps the
-  original rather than shipping the bad file, and is reported loudly in the log/CSV. For an
+  original rather than shipping the bad file, and is reported loudly on the console and in
+  the report CSV. For an
   independent second opinion
   after a run, `helpers/verify_run.py` re-audits a `before/`+`after/` pair from first
   principles — it deliberately shares no code with the tool it audits.

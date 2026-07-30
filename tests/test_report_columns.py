@@ -290,19 +290,64 @@ def test_report_csv_header_and_rows_line_up(tmp_path):
          'ocr_state': owm.OCR_KEPT, 'lang': '', 'kept': True},
         {'rel': 'c.pdf', 'orig': 1048576, 'new': 0, 'err': 'boom', 'kept': True},
     ]
-    log = owm.write_run_log(tmp_path / 'r.log', tmp_path, tmp_path, results,
-                            {'dpi': 200}, time.time(), 1.0, 3, 0, 0, 1, 3, 2)
-    with open(log.with_suffix('.csv'), newline='', encoding='utf-8') as f:
+    got = owm.write_run_csv(tmp_path / 'r.csv', results)
+    with open(got, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
     assert [r['file'] for r in rows] == ['a.pdf', 'b.pdf', 'c.pdf']
     assert rows[0]['ocr'] == 'new ocr' and rows[0]['language'] == 'eng'
     assert rows[1]['reason'] == 'small size' and rows[1]['action'] == 'kept original'
     assert rows[2]['action'] == 'FAILED' and rows[2]['reason'] == 'error'
-    # the .log tells the same story in prose
-    text = log.read_text(encoding='utf-8')
-    assert 'reason: small size' in text
-    assert 'OCR: new ocr' in text and 'language: eng' in text
-    assert '- small size' in text, 'summary must break the kept files down by reason'
+
+
+def test_report_csv_is_the_only_file_written(tmp_path):
+    """One report, not three. The prose .log and the _by_folder.csv rollup are gone:
+    the console already carries the run header and summary, the rollup is a pivot over
+    these rows, and only this .csv can feed --retry-failed."""
+    results = [{'rel': 'a.pdf', 'orig': 1048576, 'new': 524288, 'err': None,
+                'action': 'compressed', 'reason': owm.REASON_COMPRESSIBLE,
+                'ocr_state': owm.OCR_NEW, 'lang': 'eng'}]
+    out = tmp_path / 'only' / 'r.csv'
+    owm.write_run_csv(out, results)
+    assert sorted(p.name for p in out.parent.iterdir()) == ['r.csv']
+
+
+def test_prescan_warnings_survive_in_the_csv(tmp_path):
+    """Warnings raised while scanning the source belong to no single file. They used to
+    live in the .log only; they must not be dropped with it — and the row that carries
+    them must not read as a failed file, or --retry-failed would try to redo it."""
+    results = [{'rel': 'a.pdf', 'orig': 1048576, 'new': 524288, 'err': None,
+                'action': 'compressed', 'reason': owm.REASON_COMPRESSIBLE,
+                'ocr_state': owm.OCR_NEW, 'lang': 'eng'}]
+    got = owm.write_run_csv(tmp_path / 'r.csv', results,
+                            prescan_warns=[('pypdf', 'incorrect startxref pointer', 4)])
+    with open(got, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    pre = rows[0]
+    assert pre['file'] == '(pre-scan)'
+    assert '4x pypdf: incorrect startxref pointer' in pre['warnings']
+    assert pre['error'] == '' and pre['action'] == '', 'must not look like a file to retry'
+    assert owm._read_failed_rels(got) == []
+
+
+def test_scan_signals_are_a_column_now_that_the_log_is_gone(tmp_path):
+    """The born-digital evidence — the answer to "why did you refuse to compress this?" —
+    was prose in the .log. It is a column, so the one report file is still the whole
+    record of the decision."""
+    results = [{'rel': 'born.pdf', 'orig': 1048576, 'new': 1048576, 'err': None,
+                'action': 'born_digital', 'reason': owm.REASON_BORN,
+                'ocr_state': owm.OCR_KEPT,
+                'signals': {'sampled': 30, 'scan_pages': 1, 'text_pages': 29,
+                            'scan_frac': 0.033, 'chars': 8412}}]
+    got = owm.write_run_csv(tmp_path / 'r.csv', results)
+    with open(got, newline='', encoding='utf-8') as f:
+        row = next(csv.DictReader(f))
+    assert row['reason'] == 'born digital'
+    sig = row['scan signals']
+    assert 'scan_frac=0.033' in sig and 'scan_pages=1/30' in sig
+    assert 'text_pages=29' in sig and 'chars=8412' in sig
+    # a file the scan never had to judge leaves the cell empty, not '0'
+    plain = owm._report_row({'rel': 'x.pdf', 'orig': 1, 'new': 1, 'err': None})
+    assert plain[owm.REPORT_COLUMNS.index('scan signals')] == ''
 
 
 # ── where a report goes (and whether one is written at all) ───────────────────
@@ -315,14 +360,16 @@ def test_report_path_folder_vs_exact_file(tmp_path):
     d.mkdir()
     got = owm._report_path(d, t, False)
     assert got.parent == d and got.name.startswith('_ocrmyworkshopmanual_report_')
-    assert got.suffix == '.log'
+    assert got.suffix == '.csv'
 
     # a path that does not exist yet but has no suffix is still a folder
     got = owm._report_path(tmp_path / 'not_yet', t, False)
     assert got.parent == tmp_path / 'not_yet'
 
-    # anything with a suffix is the exact file
-    exact = tmp_path / 'my run.log'
+    # anything with a suffix is the exact file, as .csv — the report IS the csv, so
+    # `--log run.log` must not produce a .log the tool no longer writes
+    assert owm._report_path(tmp_path / 'my run.log', t, False) == tmp_path / 'my run.csv'
+    exact = tmp_path / 'my run.csv'
     assert owm._report_path(exact, t, False) == exact
 
     # a dry run is marked in the generated name, so it cannot be mistaken for a real one
@@ -331,9 +378,9 @@ def test_report_path_folder_vs_exact_file(tmp_path):
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_cli_writes_no_report_next_to_the_pdf_by_default(tmp_path):
-    """The regression this guards: a plain run used to drop
-    `_ocrmyworkshopmanual_report_*.log/.csv/_by_folder.csv` beside the work — three files
-    into the archive for every folder the tool was pointed at. Default is now console-only."""
+    """The regression this guards: a plain run used to drop a report beside the work —
+    three files into the archive for every folder the tool was pointed at. Default is now
+    console-only (and even with --log it is one file, in the folder --log names)."""
     import subprocess
     src = U.make_scan_pdf(tmp_path / 'manual.pdf', npages=2)
     r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
@@ -356,7 +403,8 @@ def test_cli_log_dir_puts_the_report_there_not_beside_the_work(tmp_path):
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     written = sorted(p.name for p in logs.glob('_ocrmyworkshopmanual_report_*'))
-    assert len(written) == 3, f'expected .log + .csv + _by_folder.csv, got {written}'
+    assert len(written) == 1, f'expected exactly one report .csv, got {written}'
+    assert written[0].endswith('.csv'), written
     beside = sorted(p.name for p in tmp_path.glob('_ocrmyworkshopmanual_report_*'))
     assert beside == [], f'nothing may land beside the work: {beside}'
 
@@ -377,17 +425,20 @@ def test_summary_reports_the_bytes_each_reason_accounts_for(tmp_path):
          'ocr_state': owm.OCR_NEW, 'lang': 'rus+eng', 'kept': True},
         {'rel': 'd.pdf', 'orig': 1048576, 'new': 0, 'err': 'boom', 'kept': True},
     ]
-    # the shared tally the console and the log both read, so the two cannot disagree
+    # the tally the end-of-run console summary reads — the only consumer now that the
+    # prose .log is gone; the per-file CSV carries the rows this aggregates
     tally = owm._reason_tally(results)
     assert tally['kept original'][owm.REASON_SMALL] == [2, 4 * 1048576]
     assert tally['compressed'][owm.REASON_COMPRESSIBLE] == [1, 8 * 1048576]
     assert 'FAILED' not in tally, 'a failed file has no reason but its error'
 
-    log = owm.write_run_log(tmp_path / 'r.log', tmp_path, tmp_path, results,
-                            {'min_compress_mb': 5}, time.time(), 1.0, 4, 0, 0, 1, 4, 3)
-    text = log.read_text(encoding='utf-8')
-    assert '- small size' in text and '(4.0 MB)' in text, text
-    assert '(8.0 MB)' in text, 'the compressed bytes belong in the tally too'
+    # and it is reachable from the CSV alone: same reason, same source bytes
+    with open(owm.write_run_csv(tmp_path / 'r.csv', results), newline='',
+              encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    small = [r for r in rows if r['reason'] == 'small size']
+    assert len(small) == 2
+    assert sum(float(r['orig size (MB)']) for r in small) == 4.0
 
 
 def test_live_csv_row_matches_the_final_one():

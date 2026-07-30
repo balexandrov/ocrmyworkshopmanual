@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (BREAKING: the report is one `.csv` — the prose `.log` and `_by_folder.csv` are gone)
+
+`--log` wrote three files: a prose `_ocrmyworkshopmanual_report_<ts>.log`, the per-file
+`.csv`, and a `_by_folder.csv` rollup. Only the `.csv` was worth keeping, and only the `.csv`
+can feed `--retry-failed`; the other two were files to delete after every run.
+
+- the **`.log`** duplicated in prose what the console already prints — the same header, the
+  same per-file lines, the same closing tally. Nothing consumed it.
+- the **`_by_folder.csv`** was a group-by over rows the main `.csv` already has. A pivot, kept
+  as a file.
+
+So `--log` now writes exactly one file, and a path with a suffix is used as `.csv`
+(`--log run.log` → `run.csv`) rather than producing a `.log` the tool no longer writes.
+
+Two things lived **only** in the prose report; neither was dropped with it:
+
+- the born-digital scan's evidence is now a **`scan signals` column**
+  (`scan_frac=0.033 scan_pages=1/30 text_pages=29 chars=8412`). This is the answer to *why
+  did you refuse to compress this?*, and under the never-damage rule that is the one decision
+  most worth being able to audit — it does not belong in a file nobody keeps.
+- warnings raised while **scanning** the source (attached to no single file) now get one
+  labelled `(pre-scan)` row. Its decision columns are blank, `error` included, so
+  `--retry-failed` cannot mistake it for a file to redo.
+
+The run's thresholds (`--min-savings`, `--min-compress-mb`, `--jpeg-quality`,
+`--photo-descreen`, `--min-size`, `--timeout`) used to be recorded only in the `.log` header
+and are now printed at startup with the rest of the settings, so a per-file table is not asked
+to carry run-level facts.
+
+`write_run_log` is now `write_run_csv(csv_path, results, prescan_warns)` — no `dest_root`,
+`src_root`, `settings`, timings or counters, because a table of files needs none of them. It
+still rewrites the live-flushed CSV at the end, which is what makes it sorted by path and
+duplicate-aware (dedup only knows the full picture once the run is over).
+
 ### Changed (BREAKING: no report file by default, and `--log` decides where one goes)
 
 Reports were placed relative to the WORK, which scattered
@@ -21,7 +55,7 @@ A run is now **console-only** and writes nothing but its output. `--log` is the 
 | *(omitted)* | no report file |
 | `--log` | timestamped report in the **current folder** |
 | `--log DIR` | timestamped report in `DIR` |
-| `--log FILE.log` | exactly that file |
+| `--log FILE` | exactly that file (as `.csv` — see the entry above) |
 
 A value is a folder when it is an existing directory or has no suffix, otherwise it is the
 exact file path — so `_report_path` is that one decision, and the `report_dir` variable with

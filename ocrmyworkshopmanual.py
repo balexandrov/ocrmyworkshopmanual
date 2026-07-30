@@ -2980,23 +2980,29 @@ def _flag_duplicates(results: list) -> int:
 
 
 def _report_path(log_target, t0: float, dry_run: bool) -> Path:
-    """Where the report .log goes, from the single `--log` value.
+    """Where the report .csv goes, from the single `--log` value.
 
     A FOLDER (an existing directory, or a path with no suffix) gets a timestamped report
-    written inside it; anything else is taken as the exact file path. `--log` with no value
-    arrives here as the current working directory.
+    written inside it; anything else is taken as the exact file path, with the suffix forced
+    to .csv (so `--log run.log` writes run.csv). `--log` with no value arrives here as the
+    current working directory.
+
+    ONE file, not three. A run used to also write a prose `.log` and a `_by_folder.csv`
+    rollup; the console already says everything the .log's header and summary said, the
+    rollup is one pivot away from these rows, and only the .csv can feed --retry-failed —
+    so the other two were just files to delete after every run.
 
     Reports used to be placed relative to the WORK — the dest root, or beside the source on
-    a dry run — which scattered `_ocrmyworkshopmanual_report_*.log/.csv/_by_folder.csv`
-    triplets through the archive wherever the tool had been pointed, and made `--dry-run`
-    write three files despite promising to write nothing. Where a report lands is the
-    caller's business, not the archive's, so it is now only ever what --log says."""
+    a dry run — which scattered report files through the archive wherever the tool had been
+    pointed, and made `--dry-run` write despite promising to write nothing. Where a report
+    lands is the caller's business, not the archive's, so it is now only ever what --log
+    says."""
     p = Path(log_target)
     if p.is_dir() or not p.suffix:
         ts = time.strftime('%Y%m%d_%H%M%S', time.localtime(t0))
         suffix = '_DRYRUN' if dry_run else ''
-        return p / f'_ocrmyworkshopmanual_report_{ts}{suffix}.log'
-    return p
+        return p / f'_ocrmyworkshopmanual_report_{ts}{suffix}.csv'
+    return p.with_suffix('.csv')
 
 
 def _csv_row(fields: list) -> str:
@@ -3017,12 +3023,35 @@ def _csv_row(fields: list) -> str:
 # Each of the four takes values from a fixed vocabulary, so they sort, filter and pivot.
 REPORT_COLUMNS = ['file', 'action', 'reason', 'ocr', 'language',
                   'orig size (MB)', 'new size (MB)', '%',
-                  'duplicate of', 'page types', 'note', 'warnings', 'error']
+                  'duplicate of', 'page types', 'scan signals',
+                  'note', 'warnings', 'error']
 
 
 def _types_text(types) -> str:
     """`line=12 vector=3` — the page-type tally in a form a downstream index can parse."""
     return ' '.join(f'{k}={v}' for k, v in sorted((types or {}).items()))
+
+
+def _signals_text(sg) -> str:
+    """`scan_frac=0.97 scan_pages=1/30 text_pages=29 chars=8412` — the born-digital scan's
+    own evidence, blank for a file it never had to judge.
+
+    This is a column and not prose because it is the answer to "why did you refuse to
+    compress this?", and the prose .log that used to carry it is gone. Same fields the log
+    printed, so an old report and a new one say the same thing."""
+    if not sg:
+        return ''
+    out = []
+    if sg.get('scan_frac') is not None:
+        out.append(f'scan_frac={sg["scan_frac"]}')
+    if sg.get('sampled') is not None:
+        out.append(f'scan_pages={sg.get("scan_pages")}/{sg["sampled"]}')
+    for k in ('text_pages', 'chars'):
+        if sg.get(k) is not None:
+            out.append(f'{k}={sg[k]}')
+    if sg.get('error'):
+        out.append(f'[{sg["error"]}]')
+    return ' '.join(out)
 
 
 def _report_row(r: dict) -> list:
@@ -3035,167 +3064,46 @@ def _report_row(r: dict) -> list:
             f'{o / 1048576:.2f}' if o else '0.00',
             f'{n / 1048576:.2f}' if (not err and n) else '',
             pct, r.get('duplicate_of', ''), _types_text(r.get('types')),
+            _signals_text(r.get('signals')),
             (r.get('note') or '').strip(), _warns_text(r.get('warns')), err or '']
 
 
-# Per-folder rollup: one summary row per source subfolder (+ a grand total).
-FOLDER_COLUMNS = ['folder', 'files', 'orig size (MB)', 'new size (MB)', '%', 'saved (MB)']
+def write_run_csv(csv_path: Path, results: list, prescan_warns: list = None) -> Path:
+    """(Re)write the complete run report CSV: one row per file processed this run, sorted
+    by path. Returns the path written.
 
+    The live per-file flush has already written these rows as the run went — in completion
+    order, and before duplicate detection had seen the whole run — so this final pass is
+    what makes the file sorted and complete. Both go through `_report_row`, so the two can
+    never drift.
 
-def _folder_rows(results: list) -> list:
-    """Aggregate results by their source subfolder → one summary row each (files,
-    orig MB, new MB, %, saved MB), sorted by folder, with a final TOTAL row."""
-    from collections import defaultdict
-    agg = defaultdict(lambda: {'n': 0, 'orig': 0, 'new': 0})
-    tot = {'n': 0, 'orig': 0, 'new': 0}
-    for r in results:
-        folder = os.path.dirname(r.get('rel', '')) or '(root)'
-        for bucket in (agg[folder], tot):
-            bucket['n'] += 1
-            if not r.get('err'):
-                bucket['orig'] += r.get('orig') or 0
-                bucket['new'] += r.get('new') or 0
+    `csv_path` is the resolved path the live CSV was opened on (see `_report_path`);
+    nothing here is derived from the work being done.
 
-    def row(name, a):
-        pct = (a['new'] * 100 // a['orig']) if a['orig'] else ''
-        return [name, a['n'], f"{a['orig'] / 1048576:.2f}", f"{a['new'] / 1048576:.2f}",
-                pct, f"{(a['orig'] - a['new']) / 1048576:.2f}"]
+    This is the ONLY file a run writes besides its output. It used to be one of three: a
+    prose `.log` whose header and summary the console already prints, and a `_by_folder.csv`
+    rollup that is one pivot over these rows — neither could feed `--retry-failed`, and both
+    had to be cleaned up after every run.
 
-    rows = [row(folder, agg[folder]) for folder in sorted(agg)]
-    if len(agg) > 1:
-        rows.append(row('(TOTAL)', tot))
-    return rows
-
-
-def write_run_log(log_path, dest_root: Path, src_root: Path, results: list, settings: dict,
-                  t0: float, dt: float, n_found: int, skipped: int, limit: int,
-                  fail: int, done: int, kept: int, dry_run: bool = False,
-                  prescan_warns: list = None) -> Path:
-    """Write a human-readable report of the folder run: which file, what was done
-    (with the born-digital scan signals), and the final work stats. Also writes a
-    machine-readable CSV sibling (same path, .csv) for filtering/sorting at scale.
-    Returns the .log path. In dry_run mode sizes are projections, not actuals.
-
-    `log_path` is a folder (timestamped report inside it) or an exact file — see
-    `_report_path`. Callers pass what --log resolved to; nothing is derived from the work."""
-    from collections import Counter
+    Warnings raised while SCANNING the source belong to no single file, so they get one
+    labelled `(pre-scan)` row instead of being dropped with the .log. Its decision columns
+    are blank — including `error`, so `--retry-failed` never mistakes it for a file to redo.
+    """
     import csv as _csv
-    log_path = _report_path(log_path, t0, dry_run)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    counts = Counter(_action_label(r) for r in results)
-    reason_counts = _reason_tally(results)
-    ocr_counts = Counter(_ocr_label(r) for r in results if _ocr_label(r))
-    tot_orig = sum(r['orig'] for r in results if not r.get('err'))
-    tot_new = sum(r['new'] for r in results if not r.get('err'))
-    title = 'ocrmyworkshopmanual — DRY-RUN preview (nothing written)' if dry_run \
-        else 'ocrmyworkshopmanual — run report'
-
-    L = ['=' * 78, title, '=' * 78,
-         f'Started : {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0))}',
-         f'Finished: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0 + dt))}',
-         f'Elapsed : {dt/60:.1f} min',
-         f'Source  : {src_root}',
-         f'Dest    : {dest_root}',
-         f'Tools   : GS={GS} | jbig2={JBIG}',
-         'Settings: ' + ', '.join(f'{k}={v}' for k, v in settings.items()),
-         '',
-         f'PDFs found: {n_found} | already done (skipped, dest existed): {skipped}'
-         + (f' | --limit {limit}' if limit else '')
-         + f' | processed this run: {len(results)}',
-         '', '-' * 78, 'Per-file (this run):', '-' * 78]
-
-    if prescan_warns:
-        L.append('[(pre-scan)]  warnings raised while scanning the source, not tied to one file')
-        for name, msg, n in prescan_warns:
-            L.append(f'           pdf warning: {n}x {name}: {msg}')
-
-    def _warn_lines(r):
-        """What pypdf/pikepdf/PIL said about THIS file — the durable record. Console-only
-        was not one: these used to reach stderr from six processes at once, unprefixed."""
-        out = []
-        for name, msg, n in r.get('warns') or []:
-            out.append(f'           pdf warning: {n}x {name}: {msg}')
-        return out
-
-    for r in sorted(results, key=lambda x: x['rel'].lower()):
-        if r.get('err'):
-            L.append(f'[FAILED]  {r["rel"]}')
-            L.append(f'           error: {r["err"]}')
-            L += _warn_lines(r)
-            continue
-        pct = r['new'] * 100 // r['orig'] if r.get('orig') else 0
-        L.append(f'[{_action_label(r)}]  {r["rel"]}')
-        # the same four facts the CSV columns carry, so the two reports agree
-        bits = [f'reason: {_reason_label(r)}'] if _reason_label(r) else []
-        if _ocr_label(r):
-            bits.append(f'OCR: {_ocr_label(r)}')
-        if r.get('lang'):
-            bits.append(f'language: {r["lang"]}')
-        if bits:
-            L.append('           ' + ' | '.join(bits))
-        L.append(f'           {mb(r["orig"]):.2f} -> {mb(r["new"]):.2f} MB ({pct}%){r.get("note", "")}')
-        if r.get('types'):
-            L.append(f'           page types: {_types_text(r["types"])}')
-        sg = r.get('signals')
-        if sg:
-            L.append(f'           scan signals: scan_frac={sg.get("scan_frac")} '
-                     f'scan_pages={sg.get("scan_pages")}/{sg.get("sampled")} '
-                     f'text_pages={sg.get("text_pages")} chars={sg.get("chars")}'
-                     + (f' [{sg["error"]}]' if sg.get('error') else ''))
-        L += _warn_lines(r)
-
-    L += ['', '-' * 78, 'Summary', '-' * 78]
-    # action, then the reason breakdown under it, then what happened to the text layers.
-    # The reason tally is the one that answers "why is my archive still this big?", and a
-    # flat action count could not give it.
-    for label in ('compressed', 'kept original', 'FAILED'):
-        L.append(f'  {label:33s}: {counts.get(label, 0)}')
-        for reason, (n, nbytes) in sorted(reason_counts[label].items()):
-            # the MB each reason accounts for (source size). On `small size` that IS the
-            # cost of --min-compress-mb: bytes deliberately left uncompressed.
-            L.append(f'    {("- " + reason):31s}: {n:<5} ({mb(nbytes):.1f} MB)')
-    L.append(f'  {"skipped (dest already existed)":33s}: {skipped}')
-    if ocr_counts:
-        L.append('')
-        L.append('  OCR text layer:')
-        for state, n in sorted(ocr_counts.items()):
-            L.append(f'    {("- " + state):31s}: {n}')
-    n_dup = sum(1 for r in results if r.get('duplicate_of'))
-    if n_dup:
-        L.append(f'  {"duplicate files (flagged, still processed)":33s}: {n_dup}')
-    L.append('')
-    if tot_orig:
-        word = 'Projected total' if dry_run else 'Total size'
-        saved = 'would save' if dry_run else 'saved'
-        L.append(f'  {word}: {mb(tot_orig):.1f} MB -> {mb(tot_new):.1f} MB '
-                 f'({tot_new*100//tot_orig}% ; {saved} {mb(tot_orig-tot_new):.1f} MB)')
-    L.append('')
-
-    # per-folder rollup section
-    frows = _folder_rows(results)
-    if frows:
-        L += ['-' * 78, 'Per-folder summary  (files | orig MB -> new MB | % | saved MB)', '-' * 78]
-        for folder, n, omb, nmb, pct, smb in frows:
-            L.append(f'  {folder}')
-            L.append(f'      {n} files | {omb} -> {nmb} MB | {pct}% | saved {smb} MB')
-        L.append('')
-
-    log_path.write_text('\n'.join(L), encoding='utf-8')
-
-    # machine-readable siblings for filtering/sorting a large collection
-    with open(log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8') as f:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.writer(f)
         w.writerow(REPORT_COLUMNS)
+        if prescan_warns:
+            row = [''] * len(REPORT_COLUMNS)
+            row[0] = '(pre-scan)'
+            row[REPORT_COLUMNS.index('note')] = ('warnings raised while scanning the '
+                                                 'source, not tied to one file')
+            row[REPORT_COLUMNS.index('warnings')] = _warns_text(prescan_warns)
+            w.writerow(row)
         for r in sorted(results, key=lambda x: x['rel'].lower()):
             w.writerow(_report_row(r))
-    # per-folder summary: one row per folder (folder + aggregate numbers only)
-    with open(log_path.parent / (log_path.stem + '_by_folder.csv'), 'w', newline='',
-              encoding='utf-8') as f:
-        w = _csv.writer(f)
-        w.writerow(FOLDER_COLUMNS)
-        w.writerows(frows)
-    return log_path
+    return csv_path
 
 
 # ── Config file / dedup / retry helpers ──────────────────────────────────────
@@ -3283,8 +3191,9 @@ def main():
                     help='OVERWRITE each PDF with its compressed/OCR result IN PLACE (no output '
                          'tree). Non-PDF files, folder structure, born-digital PDFs and '
                          'already-optimal files are left untouched; unchanged files are not '
-                         'rewritten. DESTRUCTIVE — back up first. The report is written to the '
-                         'tool folder, not among the manuals. Cannot be combined with --dest.')
+                         'rewritten. DESTRUCTIVE — back up first. A report is written only '
+                         'where --log says, never among the manuals. Cannot be combined '
+                         'with --dest.')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
     ap.add_argument('--workers', type=int, default=_default_workers(),
                     help='parallel worker processes (default: one per PHYSICAL core — the '
@@ -3303,8 +3212,8 @@ def main():
     ap.add_argument('--no-ocr', action='store_true', help='skip the searchable OCR text layer')
     ap.add_argument('--verbose', action='store_true',
                     help='also echo each PDF-library warning to the console, prefixed with the '
-                         'file it came from. They always go to the report .log/.csv; this is for '
-                         'debugging one file without reading the report')
+                         'file it came from. They always go to the report .csv `warnings` '
+                         'column; this is for debugging one file without reading the report')
     ap.add_argument('--language', default='auto',
                     help="Tesseract OCR language(s); default 'auto' detects each file's script "
                          '(Latin->eng, Cyrillic->rus+eng, CJK->jpn+eng) via Tesseract OSD. Pass an '
@@ -3326,11 +3235,11 @@ def main():
                          f'0 = compress everything')
     ap.add_argument('--log', type=Path, nargs='?', const=Path.cwd(), default=None,
                     metavar='PATH',
-                    help='write a run report. Omitted (the default) = NO report file, console '
-                         'only. Bare --log = a timestamped report in the CURRENT folder. '
-                         '--log DIR = a timestamped report in DIR. --log FILE.log = exactly '
-                         'that file. A .csv sibling (and a _by_folder.csv) is written next to '
-                         'it, and only that .csv can feed --retry-failed')
+                    help='write a run report .csv (one row per file, flushed as the run goes). '
+                         'Omitted (the default) = NO report file, console only. Bare --log = a '
+                         'timestamped report in the CURRENT folder. --log DIR = a timestamped '
+                         'report in DIR. --log FILE = exactly that file, as .csv. This one '
+                         'file is the whole report, and it is what --retry-failed reads')
     ap.add_argument('--dry-run', action='store_true',
                     help='preview only: classify each pdf (born-digital? scanned?) and project its '
                          'compressed size, report what WOULD happen + projected savings, write NOTHING')
@@ -3481,7 +3390,14 @@ def main():
     print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
           f'@ {args.dpi} dpi, {args.workers} workers, generic mode, {bin_desc}, '
           f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
-          f'{photo_desc}, {ocr_desc}, {bd_desc}\n')
+          f'{photo_desc}, {ocr_desc}, {bd_desc}')
+    # The thresholds that decide compress-vs-keep. They used to be recorded only in the
+    # report .log header; with the report being a per-file table, the console is where the
+    # run's settings live, so print all of them rather than most of them.
+    print(f'Thresholds  : min-savings={args.min_savings:g}, '
+          f'min-compress={args.min_compress_mb:g} MB, jpeg-q={args.jpeg_quality}, '
+          f'descreen={args.photo_descreen:g}, min-size={args.min_size}px, '
+          f'stall-timeout={args.timeout}s\n')
     if not jobs:
         print('Nothing to do.'); return
     if args.dry_run:
@@ -3499,13 +3415,13 @@ def main():
     results = []  # accumulated for the run log
 
     # open the report CSV up front and flush a row per file, so progress is visible
-    # live (the full .log + a final complete .csv are (re)written at the end).
-    report_log_path = _report_path(args.log, t0, args.dry_run) if args.log else None
+    # live (the same file is rewritten complete and sorted at the end).
+    report_csv_path = _report_path(args.log, t0, args.dry_run) if args.log else None
     csv_live = None
-    if report_log_path:
+    if report_csv_path:
         try:
-            report_log_path.parent.mkdir(parents=True, exist_ok=True)
-            csv_live = open(report_log_path.with_suffix('.csv'), 'w', newline='', encoding='utf-8')
+            report_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_live = open(report_csv_path, 'w', newline='', encoding='utf-8')
             csv_live.write(_csv_row(REPORT_COLUMNS))
             csv_live.flush()
         except Exception as ex:
@@ -3517,7 +3433,8 @@ def main():
     prescan_warns = _drain_lib_logs('(pre-scan)', args.verbose)
     if prescan_warns:
         n = sum(c for _l, _m, c in prescan_warns)
-        _say(f'  ({n} pdf warning(s) while scanning — see the report)')
+        _say(f'  ({n} pdf warning(s) while scanning — see the report\'s (pre-scan) row, '
+             f'or --verbose)')
     # duplicate check is skipped in dry-run (a preview shouldn't hash every byte)
     dup_check = not args.dry_run
     seen_hash = {}   # content-hash -> first rel seen (for a live console marker)
@@ -3650,30 +3567,14 @@ def main():
     _say('Output: (dry-run — nothing written)' if args.dry_run else
          ('Output: IN-PLACE (source PDFs overwritten)' if args.in_place else f'Output: {dest_root}'))
 
-    if report_log_path:
-        settings = {
-            'in_place': args.in_place,
-            'dpi': args.dpi, 'workers': args.workers, 'mode': 'generic',
-            'binarization': f'adaptive sauvola-k={args.sauvola_k:g}',
-            'despeckle': not args.no_despeckle, 'min_size': args.min_size,
-            'photo_threshold': args.photo_threshold, 'photo_dpi': args.photo_dpi,
-            'jpeg_quality': args.jpeg_quality,
-            'photo_descreen': args.photo_descreen, 'ocr': ocr_desc,
-            'min_savings': args.min_savings,
-            'min_compress_mb': args.min_compress_mb,
-            'timeout': args.timeout,
-            'retry_failed': str(args.retry_failed) if args.retry_failed else False,
-            'dry_run': args.dry_run,
-        }
+    if report_csv_path:
         try:
-            # reuse the exact path the live CSV was written to (resolved before the run);
-            # write_run_log (re)writes the full .log + a complete .csv
-            log_path = write_run_log(report_log_path, dest_root, src_root, results, settings,
-                                     t0, dt, len(pdfs), skipped, args.limit, fail, done, kept,
-                                     dry_run=args.dry_run, prescan_warns=prescan_warns)
-            _say(f'Log: {log_path}  (+ .csv)')
+            # the exact path the live CSV was flushed to (resolved before the run); this
+            # rewrites it complete and sorted, with duplicates now known
+            csv_path = write_run_csv(report_csv_path, results, prescan_warns=prescan_warns)
+            _say(f'Report: {csv_path}')
         except Exception as ex:
-            _say(f'(could not write run log: {ex})')
+            _say(f'(could not write run report: {ex})')
     elif fail:
         # A failed run is exactly when the report is wanted, and --retry-failed can only
         # consume a report .csv. Say so once, here, rather than leaving it to be discovered.
