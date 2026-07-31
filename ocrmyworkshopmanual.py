@@ -1227,7 +1227,8 @@ def _page_count(p: Path) -> int:
 
 
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
-                timeout: int = 0, preserve_images: bool = False, pages: int = 0) -> tuple:
+                timeout: int = 0, preserve_images: bool = False, pages: int = 0,
+                lang_src: Path = None) -> tuple:
     """Run OCR on the SOURCE at full resolution and return (ocr'd_pdf, language, note).
 
     OCR must read the ORIGINAL, never our own output: every compression we apply is
@@ -1241,7 +1242,14 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     fully decoupled. Mode matters: --redo-ocr upgrades a stale OCR layer, but on a
     VECTOR page it stacks OCR text on top of real text (measured: 1467 -> 2937 chars),
     so it is only used when the file has no vector pages."""
-    language, _lnote = _resolve_language(src_p, work, language, timeout)
+    # Resolve the language from `lang_src` when given: on the compress path `src_p` is OUR OWN
+    # render, which `_ocr_render_pdf` builds text-free BY CONSTRUCTION, so the text-layer script
+    # guard in `_resolve_language` has nothing to read and silently adds nothing. Measured on a
+    # 173-page Japanese owner's manual: the source samples 1653 CJK letters of 1718, `jpn` is
+    # installed, and it still OCR'd as `eng` — word recall 0.01 against its own source, and the
+    # audit threw the whole file away. The language must be decided from the file that actually
+    # carries the text.
+    language, _lnote = _resolve_language(lang_src or src_p, work, language, timeout)
     language = _available_ocr_lang(language)
     # Mode matters, and the harvestable place for the text is the /OCR-* Form XObject:
     #  --skip-text  skips any page carrying ANY text, so a page holding just a page number
@@ -3196,7 +3204,7 @@ def _compress_one(src: str, dest: str, dpi: int,
             # rasterise a second time.
             ocr_src, language, ocr_note = _ocr_source(
                 ocr_input, work, language, has_vector=True, timeout=timeout,
-                pages=src_pages)
+                pages=src_pages, lang_src=render_src)
             ocr_state = (OCR_FAILED if ocr_src is None
                          else OCR_REDO if src_had_text else OCR_NEW)
 

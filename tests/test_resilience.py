@@ -1206,3 +1206,37 @@ def test_every_dpi_band_renders_even_when_sharding_is_off(tmp_path):
     assert len(got) == pages, f'rendered {len(got)} of {pages} pages: {got}'
     # and the page numbering must be the global 1..N, with no gap
     assert got == [f'p{i:04d}.png' for i in range(1, pages + 1)], got
+
+
+def test_language_is_resolved_from_the_source_not_our_render(tmp_path, monkeypatch):
+    """On the compress path `_ocr_source` is handed OUR OWN render, which is text-free by
+    construction — so the text-layer script guard in `_resolve_language` must be pointed at the
+    real source instead, or it reads nothing and adds nothing.
+
+    Measured cost of getting this wrong: a 173-page Japanese owner's manual (1653 CJK letters of
+    1718 sampled, `jpn` installed) OCR'd as `eng`, scored word recall 0.01 against its own
+    source, and was thrown away by the audit."""
+    seen = {}
+
+    def fake_resolve(p, work, language, timeout=0):
+        seen['path'] = Path(p)
+        return language, ''
+
+    monkeypatch.setattr(U.owm, '_resolve_language', fake_resolve)
+    monkeypatch.setattr(U.owm, '_available_ocr_lang', lambda l: l)
+    # make the ocrmypdf call a no-op failure: we are only asserting WHICH file was inspected
+    monkeypatch.setattr(U.owm, '_run_retry', lambda fn, **kw: (None, 1))
+
+    source = tmp_path / 'the_real_source.pdf'
+    source.write_bytes(b'%PDF-1.4\n')
+    render = tmp_path / 'our_render.pdf'
+    render.write_bytes(b'%PDF-1.4\n')
+    work = tmp_path / 'w'; work.mkdir()
+
+    U.owm._ocr_source(render, work, 'auto', has_vector=True, lang_src=source)
+    assert seen['path'] == source, f'language read from {seen["path"].name}, not the source'
+
+    # and with no lang_src (the ship-original path) it still uses the file it was given
+    seen.clear()
+    U.owm._ocr_source(source, work, 'auto', has_vector=False, preserve_images=True)
+    assert seen['path'] == source
