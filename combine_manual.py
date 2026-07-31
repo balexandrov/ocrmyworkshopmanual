@@ -41,18 +41,31 @@ file itself is left on disk; a page count that shrinks has to be checkable.
 Under --recursive each section folder gets a BOOKMARK at its first page, so a
 combined manual of a thousand pages can be navigated.
 
+An unreadable input is REPAIRED first (qpdf, then Ghostscript), so one malformed part
+out of hundreds does not strand a whole manual. A repair is not taken on trust: the
+repaired copy is used only if it recovered at least as many pages as the original's
+raw bytes say it held, otherwise the part stays unreadable and the merge is refused.
+The originals on disk are never modified — repairs happen on scratch copies.
+--no-repair turns that off; --skip-unrecoverable combines the readable parts instead
+of refusing, naming every part left out and the pages it held (those files stay on
+disk, untouched).
+
 The combined PDF is VERIFIED before this exits: it must open and carry exactly the
 sum of its inputs' page counts (after duplicates are dropped — the count is checked
 against what was actually merged). That check is what makes it safe to delete the
 source folder afterwards — merging is where pages go missing silently, since a
-short PDF looks no different from a complete one.
+short PDF looks no different from a complete one. Note that with
+--skip-unrecoverable the count verifies what was MERGED, so it cannot tell you the
+manual is incomplete; the INCOMPLETE summary is what says that.
 """
 import argparse
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import namedtuple
 from pathlib import Path
 
@@ -425,7 +438,7 @@ def report_dups(dups, folder: Path) -> None:
         ka = g.size[g.keep][0] * g.size[g.keep][1]
         for p in g.drop:
             pa = g.size[p][0] * g.size[p][1]
-            print(f'  DROP {label(p)}  {px(g, p)}  ->  keeping {g.keep.name}  '
+            print(f'  DROP {label(p)}  {px(g, p)}  ->  keeping {label(g.keep)}  '
                   f'{px(g, g.keep)}, {ka / pa:.1f}x bigger')
     n_drop = sum(len(g.drop) for g in dups)
     if n_drop:
@@ -689,7 +702,13 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
     is still checked against the REOPENED result at the end."""
     want, bad = (0, []) if not verify else expected_pages(files)
     if bad:
-        raise CombineFailed(f'{len(bad)} unreadable input(s), first: {bad[0].name}')
+        # EVERY unreadable input, by FULL path, one per line — never a count plus the first.
+        # These are the files the run has to be fixed by hand, and a manual is combined from
+        # hundreds of parts spread over as many subfolders: one real Toyota tree holds `ovi.pdf`
+        # in 60 different ones, so a bare name does not say which to go and look at, and naming
+        # only the first hides the other three. Matches the `--dry-run` listing above.
+        listed = ''.join(f'\n       unreadable: {p}' for p in bad)
+        raise CombineFailed(f'{len(bad)} unreadable input(s):{listed}')
     w = PdfWriter()
     marks = []
     for i, p in enumerate(files):
@@ -700,7 +719,7 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
             else:
                 w.append(io.BytesIO(_image_to_pdf_bytes(p)))
         except Exception as ex:
-            raise CombineFailed(f'{p.name}: {type(ex).__name__}: {ex}') from ex
+            raise CombineFailed(f'{p}: {type(ex).__name__}: {ex}') from ex
         if bookmarks and i in bookmarks:
             marks.append((bookmarks[i], first, p))
     # Page indices come from the merge, not from a prediction: a section whose first part is a
@@ -711,7 +730,7 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
     for title, pg, src in marks:
         if pg >= n_pages:
             raise CombineFailed(f'bookmark {title!r} would point past the end (page {pg + 1} '
-                                f'of {n_pages}): {src.name} contributed no pages')
+                                f'of {n_pages}): {src} contributed no pages')
         w.add_outline_item(title, pg)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_pdf.with_suffix(out_pdf.suffix + '.part')
@@ -749,6 +768,16 @@ def main():
                          'a doc id')
     ap.add_argument('--dry-run', action='store_true',
                     help='print the page order and output path, then stop (write nothing)')
+    ap.add_argument('--no-repair', action='store_true',
+                    help='do NOT try to repair unreadable inputs (qpdf, then Ghostscript) '
+                         'before combining; refuse the merge instead. Repair is on by default '
+                         'because it only ever substitutes a copy that recovered AT LEAST as '
+                         'many pages as the original held — the source files are never modified')
+    ap.add_argument('--skip-unrecoverable', action='store_true',
+                    help='combine what IS readable when some parts cannot be repaired, instead '
+                         'of refusing the whole manual. The skipped parts and the pages they '
+                         'held are named in full; the files themselves are left where they are. '
+                         'Opt-in, so an unattended run never ships a manual with pages missing')
     ap.add_argument('--no-compress', action='store_true',
                     help='produce the raw combined PDF only; skip the compress + OCR step')
     ap.add_argument('--language', default='auto',
@@ -817,19 +846,96 @@ def main():
               + (f' — WARNING: {len(bad)} unreadable input(s)' if bad else ''))
         for p in bad:
             print(f'    unreadable: {p}')
+        if bad:
+            # Say what the real run would DO about them, so a dry run is a faithful preview:
+            # the difference between "would repair these" and "would refuse" is the whole
+            # reason to look at a dry run first.
+            print('    -> would ' + ('refuse the merge (--no-repair)' if args.no_repair else
+                                     'try qpdf/Ghostscript repair first'
+                                     + (', then leave out any that stay broken'
+                                        if args.skip_unrecoverable else
+                                        ', then refuse if any stays broken')))
         print('(--dry-run: nothing written)')
         return
 
     if out_pdf.exists():
         print(f'\nNOTE: overwriting existing {out_pdf.name}')
-    print(f'\nCombining -> {out_pdf} ...', flush=True)
+
+    # Repair unreadable parts BEFORE combining, in a scratch dir. One malformed page out of
+    # hundreds would otherwise strand a whole manual as un-combinable, and these archives are
+    # full of them. `repair_inputs` substitutes a repaired COPY only when it recovered at least
+    # as many pages as the original's raw bytes say it held, so a partial salvage can never
+    # pass itself off as complete; the originals on disk are never modified.
+    work, skipped = None, []
     try:
-        pages = combine(files, out_pdf, bookmarks=marks)
-    except CombineFailed as ex:
-        sys.exit(f'ERROR: combine refused: {ex}\n'
-                 f'       {folder} is untouched — do NOT delete it.')
+        if not args.no_repair:
+            unreadable = expected_pages(files)[1]
+            if unreadable:
+                print(f'\n{len(unreadable)} unreadable input(s) — trying qpdf/Ghostscript '
+                      f'repair ...', flush=True)
+                work = Path(tempfile.mkdtemp(prefix='combman_'))
+                files, reps = repair_inputs(files, work, base=folder)
+                for r in reps:
+                    print('  ' + (
+                        f'repaired: {r.src} ({r.recovered} pages)' if r.status == 'repaired'
+                        else f'UNRECOVERABLE: {r.src} — only {r.recovered} of ~{r.expected} '
+                             f'pages can be salvaged' if r.status == 'incomplete'
+                        else f'UNRECOVERABLE: {r.src} — nothing could be read out of it'))
+                broken = [r for r in reps if r.status != 'repaired']
+                n_fixed = len(reps) - len(broken)
+                if n_fixed:
+                    print(f'  {n_fixed} repaired and merged from a scratch copy '
+                          f'(the originals on disk are untouched)')
+                if broken:
+                    if not args.skip_unrecoverable:
+                        lost = sum(r.expected or 0 for r in broken)
+                        sys.exit(
+                            f'ERROR: {len(broken)} input(s) could not be repaired'
+                            + (f' (~{lost} page(s) affected)' if lost else '') + ':\n'
+                            + ''.join(f'       {r.src}\n' for r in broken)
+                            + f'       {folder} is untouched — do NOT delete it.\n'
+                            + '       Pass --skip-unrecoverable to combine the readable parts '
+                              'without them.')
+                    # Combine what IS readable. Unlike the section tool this never deletes the
+                    # source folder, so the damaged originals are LEFT WHERE THEY ARE rather
+                    # than moved aside — moving files out of a tree this tool otherwise never
+                    # touches would be a worse surprise than leaving them. They are named
+                    # here and again in the summary, because a manual quietly missing pages is
+                    # indistinguishable from a complete one.
+                    bad_set = {r.src for r in broken}
+                    skipped = broken
+                    files = [p for p in files if p not in bad_set]
+                    if not files:
+                        sys.exit(f'ERROR: every input is unrecoverable — nothing to combine.\n'
+                                 f'       {folder} is untouched.')
+                    lost = sum(r.expected or 0 for r in broken)
+                    print(f'  --skip-unrecoverable: leaving out {len(broken)} part(s)'
+                          + (f', ~{lost} page(s)' if lost else '')
+                          + ' — the files stay on disk, untouched')
+                    marks = section_bookmarks(files, folder)   # indices shifted; recompute
+
+        print(f'\nCombining -> {out_pdf} ...', flush=True)
+        try:
+            pages = combine(files, out_pdf, bookmarks=marks)
+        except CombineFailed as ex:
+            sys.exit(f'ERROR: combine refused: {ex}\n'
+                     f'       {folder} is untouched — do NOT delete it.')
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
     size_mb = out_pdf.stat().st_size / 1048576
     print(f'Combined: {len(files)} files -> {pages} pages, {size_mb:.1f} MB (page count verified)')
+    if skipped:
+        # Repeated AFTER the result, not only before it: this is the one fact that makes the
+        # output incomplete, and on a long run the earlier notice has scrolled away. The page
+        # count "verified" above is verified against what was MERGED, so it cannot reveal this.
+        lost = sum(r.expected or 0 for r in skipped)
+        print(f'INCOMPLETE: {len(skipped)} unrecoverable part(s) left out'
+              + (f', ~{lost} page(s) missing' if lost else '') + ':')
+        for r in skipped:
+            print(f'  {r.src}'
+                  + (f'  (~{r.expected} page(s), {r.recovered} salvageable)'
+                     if r.expected else ''))
     if marks:
         # Read back out of the finished file, like the page count. A missing bookmark is
         # reported as what it is — lost navigation — and never as lost pages.

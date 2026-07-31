@@ -281,6 +281,8 @@ python combine_manual.py "…\Honda\--Engines--\Haynes_ZC_Manual"
 python combine_manual.py FOLDER --dry-run       # just print the page order, write nothing
 python combine_manual.py FOLDER --no-compress   # raw combined PDF only, skip compress/OCR
 python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdata
+python combine_manual.py FOLDER --skip-unrecoverable   # combine the readable parts, name the rest
+python combine_manual.py FOLDER --no-repair            # refuse instead of repairing
 ```
 
 - Uses only files **directly** in the folder (a `*_files` HTML-asset subdir, or a
@@ -325,6 +327,22 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
   resolution may be two different pages, so both are kept and flagged for you. Grouping is
   **per folder** — all 21 sections had a `cover.jpg`. Every drop is printed, and **nothing is
   deleted from disk**.
+- **An unreadable part is repaired, not fatal.** These archives are full of slightly
+  malformed PDFs, and refusing a 755-part manual over one of them would strand it forever. So
+  each unreadable input is run through the same qpdf-then-Ghostscript repair the main tool
+  uses, on a **scratch copy** — the originals are never modified. A repair is *not* taken on
+  trust: the repaired copy is merged only if it recovered **at least as many pages as the
+  original's raw bytes say it held**. Measured on a real Baja transmission section, three
+  truncated parts held 3, 9 and 6 page objects and qpdf salvaged exactly **one page from each**
+  — accepting those would have lost ~15 pages while the page count agreed with itself.
+  A part that fails that bar stays unreadable and the merge is **refused**, listing every such
+  file by full path and how much of it is salvageable. `--no-repair` skips the attempt.
+- `--skip-unrecoverable` combines the readable parts instead of refusing, and prints an
+  **`INCOMPLETE:`** summary naming every part left out and the pages it held — before *and*
+  after the result, because on a long run the first notice scrolls away. The verified page
+  count checks what was *merged*, so it cannot tell you the manual is short; that summary is
+  what does. The skipped files are **left on disk untouched** (this tool never deletes or moves
+  sources). It's opt-in, so an unattended run never ships a manual with pages missing.
 - Images are wrapped losslessly (img2pdf embeds the JPEG as-is, no re-encode). As
   usual, if the combined scan won't benefit from JBIG2 (photo-heavy Haynes-style
   pages), the compress step keeps the images and just adds the OCR layer.

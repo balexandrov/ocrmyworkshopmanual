@@ -6,6 +6,7 @@ something that actually went wrong on the real archive (an `EM11.jpg` sorting se
 cover landing last, a capital O typed for a zero splitting one chapter into four).
 """
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -301,7 +302,10 @@ def test_low_res_rescan_is_dropped_and_reported(tmp_path, capsys):
     assert tif.is_file()
     CM.report_dups(dups, tmp_path)
     out = capsys.readouterr().out
-    assert 'DROP' in out and 'GI-12.tif' in out and 'keeping GI-12.jpg' in out
+    # both sides of the comparison are labelled the same way — a bare name for the KEPT file
+    # was ambiguous in exactly the folders this runs on (every section has a `cover.jpg`)
+    assert 'DROP' in out and 'GI-12.tif' in out
+    assert str(Path('general info') / 'GI-12.jpg') in out.split('keeping', 1)[1]
 
 
 def test_a_tif_that_is_the_only_copy_of_its_page_is_kept(tmp_path):
@@ -693,3 +697,88 @@ def test_repair_reports_how_much_is_salvageable(tmp_path, monkeypatch):
 # ── the driver's delete gate ──────────────────────────────────────────────────
 
 
+
+
+# ── repair and --skip-unrecoverable are wired into the tool, not just available ──
+
+def _run_combine(folder, *extra):
+    """Invoke combine_manual as the user does, with --no-compress so the test does not
+    render or OCR anything. Returns (returncode, stdout+stderr)."""
+    r = subprocess.run([sys.executable, str(Path(CM.__file__)), str(folder),
+                        '--recursive', '--no-compress', *extra],
+                       capture_output=True, text=True)
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def test_an_unrepairable_part_refuses_the_merge_and_names_every_one(tmp_path):
+    """Default behaviour: a part that cannot be repaired must stop the merge, and the message
+    must name EVERY such file by full path — a count plus 'first:' does not say what to fix.
+    Regression guard: `repair_inputs` existed but nothing in this tool called it, so the only
+    behaviour was an immediate refusal with no repair attempt at all."""
+    d = tmp_path / 'manual'
+    (d / 'a').mkdir(parents=True)
+    _pdf(d / 'a' / '1. Good.pdf', npages=2)
+    for n in ('2. Junk.pdf', '3. AlsoJunk.pdf'):
+        (d / 'a' / n).write_bytes(b'%PDF-1.4 but truncated garbage')
+
+    rc, out = _run_combine(d)
+    assert rc != 0, out
+    assert 'could not be repaired' in out, out
+    # BOTH bad parts, by full path — not just the first
+    assert str(d / 'a' / '2. Junk.pdf') in out, out
+    assert str(d / 'a' / '3. AlsoJunk.pdf') in out, out
+    assert '--skip-unrecoverable' in out, 'the message must say how to proceed'
+    assert not (tmp_path / 'manual.pdf').exists(), 'refused, so nothing may be written'
+
+
+def test_skip_unrecoverable_combines_the_rest_and_says_what_is_missing(tmp_path):
+    """Opt-in: combine the readable parts, and report the omission loudly. The verified page
+    count checks what was MERGED, so it cannot reveal that pages are missing — the INCOMPLETE
+    summary is the only thing that can."""
+    d = tmp_path / 'manual'
+    (d / 'a').mkdir(parents=True)
+    _pdf(d / 'a' / '1. Good.pdf', npages=2)
+    _pdf(d / 'a' / '3. AlsoGood.pdf', npages=1)
+    bad = d / 'a' / '2. Junk.pdf'
+    bad.write_bytes(b'%PDF-1.4 but truncated garbage')
+
+    rc, out = _run_combine(d, '--skip-unrecoverable')
+    assert rc == 0, out
+    assert 'INCOMPLETE' in out, out
+    assert str(bad) in out, out
+    outfile = tmp_path / 'manual.pdf'
+    assert outfile.is_file()
+    assert len(PdfReader(str(outfile)).pages) == 3, 'the two readable parts, nothing invented'
+    assert bad.is_file(), 'a skipped part must be LEFT on disk, not moved or deleted'
+
+
+def test_no_repair_skips_the_attempt(tmp_path):
+    """--no-repair must refuse without trying, and say so rather than reporting a repair
+    that never ran."""
+    d = tmp_path / 'manual'
+    (d / 'a').mkdir(parents=True)
+    _pdf(d / 'a' / '1. Good.pdf', npages=1)
+    (d / 'a' / '2. Junk.pdf').write_bytes(b'%PDF-1.4 but truncated garbage')
+
+    rc, out = _run_combine(d, '--no-repair')
+    assert rc != 0, out
+    assert 'trying qpdf' not in out, 'no repair should have been attempted'
+    assert str(d / 'a' / '2. Junk.pdf') in out, out
+
+
+def test_dry_run_says_what_it_would_do_about_unreadable_inputs(tmp_path):
+    """A dry run has to be a faithful preview: 'would repair' vs 'would refuse' is the whole
+    reason to look at one first."""
+    d = tmp_path / 'manual'
+    (d / 'a').mkdir(parents=True)
+    _pdf(d / 'a' / '1. Good.pdf', npages=1)
+    (d / 'a' / '2. Junk.pdf').write_bytes(b'%PDF-1.4 but truncated garbage')
+
+    rc, out = _run_combine(d, '--dry-run')
+    assert rc == 0, out
+    assert 'would' in out and 'repair' in out, out
+    assert str(d / 'a' / '2. Junk.pdf') in out, out
+    assert not (tmp_path / 'manual.pdf').exists()
+
+    rc, out = _run_combine(d, '--dry-run', '--skip-unrecoverable')
+    assert 'leave out' in out, out
