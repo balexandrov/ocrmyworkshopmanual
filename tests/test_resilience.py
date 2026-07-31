@@ -1182,3 +1182,27 @@ def test_below_normal_priority_actually_takes_effect_and_children_inherit():
     assert ok == 'True', 'set_below_normal_priority reported failure'
     assert int(cls) == 0x4000, f'process not BELOW_NORMAL: {hex(int(cls))}'
     assert int(child) == 0x4000, f'child did not inherit BELOW_NORMAL: {hex(int(child))}'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_every_dpi_band_renders_even_when_sharding_is_off(tmp_path):
+    """A mixed-resolution document has one band PER resolution run, and ALL of them must
+    render — including when the file is under the shard floor and runs single-threaded.
+
+    Regression: the unsharded path rendered only `runs[0]`, so `Suzuki Vitara - Manual
+    usuario.pdf` (43 pages, 16 dpi bands, first band a single page) rendered 1 page of 43. The
+    page-loss guard caught it and kept the original, but the file failed instead of compressing.
+    Asserted with shards=1 BECAUSE that is the branch that was wrong; a single-band fixture
+    cannot see it."""
+    src = U.make_scan_pdf(tmp_path / 'mixed.pdf', npages=6, dpi=150)
+    pages = len(PdfReader(str(src)).pages)
+    # alternate the resolution so every page is its own band, the shape that broke
+    dpis = [150 if i % 2 == 0 else 200 for i in range(pages)]
+    assert len(U.owm._render_bands(dpis, 1)) > 1, 'fixture must produce multiple bands'
+
+    work = tmp_path / 'w'; work.mkdir()
+    assert U.owm._render_all(src, work, dpis, 200, 0, shards=1)
+    got = sorted(p.name for p in work.glob('p*.png'))
+    assert len(got) == pages, f'rendered {len(got)} of {pages} pages: {got}'
+    # and the page numbering must be the global 1..N, with no gap
+    assert got == [f'p{i:04d}.png' for i in range(1, pages + 1)], got

@@ -1134,9 +1134,16 @@ def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int
             shutil.rmtree(sub, ignore_errors=True)
             return True
 
-        if len(runs) == 1 or shards <= 1:
+        if shards <= 1 or len(runs) == 1:
+            # EVERY band, sequentially — a mixed-dpi document has one band per resolution run
+            # and all of them must render. Rendering only the first shipped a 43-page manual
+            # with 1 page (caught by the page-loss guard, original kept), because a document
+            # under the shard floor still has many bands: `_render_bands` returned 16 for it.
             try:
-                return _one((0, runs[0])) if runs else True
+                for n, band in enumerate(runs):
+                    if not _one((n, band)):
+                        return False
+                return True
             except subprocess.TimeoutExpired:
                 raise        # a STALL must surface as such, not as a generic failure
             except Exception:
