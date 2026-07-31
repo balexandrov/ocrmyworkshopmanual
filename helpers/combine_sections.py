@@ -204,6 +204,15 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool,
         return row
 
     try:
+        # NOT CM.dedupe_pages, on purpose. combine_manual drops a redundant low-resolution
+        # rescan from its PDF and leaves the file on disk, so a wrong call there costs a
+        # reprint. Here --delete rmtree's the section afterwards, so the same wrong call
+        # DESTROYS the file. A ratio gate calibrated on one measured folder (26 pairs at
+        # 4.0-16.9x) is evidence enough to leave a page out of a PDF, and not evidence enough
+        # to delete it. Wiring it in later also means fixing the src_MB/merge_b denominators
+        # (the dropped bytes would be charged to the merge and trip MIN_SIZE_RATIO), giving
+        # the drops their own CSV column rather than letting `lost_other_files` swallow them,
+        # and making an ambiguous group block --delete. That is its own change.
         files = CM.collect(sec, recursive=True)
         files, self_dup = drop_self_combined(sec, files)
         if self_dup:
@@ -314,7 +323,12 @@ def process_section(sec: Path, root: Path, delete: bool, dry: bool,
             # transmission section with 3 repaired parts came out at 0.852 against the
             # 0.90 floor, while its page count verified exactly).
             merge_b = sum(p.stat().st_size for p in files)
-            pages = CM.combine(files, out)          # raises CombineFailed on page loss
+            # A section split into per-topic subfolders needs an outline as much as a combined
+            # manual does; `section_bookmarks` returns {} for a flat one, so those outputs are
+            # byte-identical to before. Outline items are not page text, so `word_recall` is
+            # unaffected, and the extra bytes can only push `ratio` up, never below the floor.
+            pages = CM.combine(files, out,          # raises CombineFailed on page loss
+                               bookmarks=CM.section_bookmarks(files, sec))
         finally:
             shutil.rmtree(work, ignore_errors=True)
         row['pages'] = pages

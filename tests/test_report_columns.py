@@ -299,6 +299,112 @@ def test_report_csv_header_and_rows_line_up(tmp_path):
     assert rows[2]['action'] == 'FAILED' and rows[2]['reason'] == 'error'
 
 
+def test_the_file_column_carries_the_full_path(tmp_path):
+    """The prose report used to record `Source: <root>` in its header, so a path relative to
+    it had an anchor. With the report being this table alone, a relative path cannot say which
+    tree it came from — and reports are read days later, side by side, from a folder that is
+    not the archive. `rel` is still honoured so an older result dict keeps working."""
+    full = str(tmp_path / 'DAEWOO' / 'Tico.pdf')
+    results = [{'path': full, 'rel': r'DAEWOO\Tico.pdf', 'orig': 1048576, 'new': 524288,
+                'err': None, 'action': 'compressed', 'reason': owm.REASON_COMPRESSIBLE,
+                'ocr_state': owm.OCR_NEW, 'lang': 'eng'}]
+    with open(owm.write_run_csv(tmp_path / 'r.csv', results), newline='',
+              encoding='utf-8') as f:
+        row = next(csv.DictReader(f))
+    assert row['file'] == full
+    assert Path(row['file']).is_absolute()
+
+
+def test_duplicate_of_names_twins_by_full_path(tmp_path):
+    """A twin you cannot go and look at is not a useful flag, and the column has to agree
+    with `file` or the two cannot be joined."""
+    a = {'path': r'C:\arch\A\m.pdf', 'rel': r'A\m.pdf', 'hash': 'same'}
+    b = {'path': r'C:\arch\B\m.pdf', 'rel': r'B\m.pdf', 'hash': 'same'}
+    assert owm._flag_duplicates([a, b]) == 1
+    assert a['duplicate_of'] == r'C:\arch\B\m.pdf'
+    assert b['duplicate_of'] == r'C:\arch\A\m.pdf'
+
+
+# ── --retry-failed reads that column back ─────────────────────────────────────
+
+def test_retry_derives_the_dest_from_the_relative_path_not_the_recorded_one(tmp_path):
+    """The bug this guards is a silent overwrite of the SOURCE. `dest_root / p` with an
+    absolute `p` discards dest_root and yields `p` itself, so letting pathlib handle the
+    recorded path would have made a non-in-place retry write its output on top of the file it
+    was reading. The dest must always come from the path relative to the source root."""
+    src_root, dest_root = tmp_path / 'src', tmp_path / 'out'
+    (src_root / 'DAEWOO').mkdir(parents=True)
+    f = src_root / 'DAEWOO' / 'Tico.pdf'
+    f.write_bytes(b'%PDF-1.4\n')
+
+    jobs, missing, foreign = owm._retry_jobs([str(f)], src_root, dest_root, in_place=False)
+    assert (missing, foreign) == ([], [])
+    assert jobs == [(str(f), str(dest_root / 'DAEWOO' / 'Tico.pdf'))]
+    assert jobs[0][1] != jobs[0][0], 'the dest must never be the source'
+    # in-place is the one mode where they are the same, and that is explicit
+    assert owm._retry_jobs([str(f)], src_root, dest_root, in_place=True)[0] == \
+        [(str(f), str(f))]
+
+
+def test_retry_still_reads_an_older_relative_report(tmp_path):
+    """Reports written before the column held full paths must keep working — the whole point
+    of a report is that you can come back to it."""
+    src_root, dest_root = tmp_path / 'src', tmp_path / 'out'
+    (src_root / 'DAEWOO').mkdir(parents=True)
+    (src_root / 'DAEWOO' / 'Tico.pdf').write_bytes(b'%PDF-1.4\n')
+    jobs, missing, foreign = owm._retry_jobs([r'DAEWOO/Tico.pdf'], src_root, dest_root,
+                                             in_place=False)
+    assert (missing, foreign) == ([], [])
+    assert jobs == [(str(src_root / 'DAEWOO' / 'Tico.pdf'),
+                     str(dest_root / 'DAEWOO' / 'Tico.pdf'))]
+
+
+def test_retry_refuses_entries_from_another_tree(tmp_path):
+    """A report naming files that are not under `src` means one of the two arguments is
+    wrong. Guessing which tree was meant is how you compress the wrong archive, so those
+    entries are reported and skipped, not resolved."""
+    src_root = tmp_path / 'src'
+    other = tmp_path / 'elsewhere'
+    (src_root).mkdir()
+    other.mkdir()
+    stray = other / 'x.pdf'
+    stray.write_bytes(b'%PDF-1.4\n')
+    jobs, missing, foreign = owm._retry_jobs([str(stray)], src_root, tmp_path / 'out',
+                                             in_place=False)
+    assert jobs == [] and missing == []
+    assert foreign == [str(stray)]
+
+
+def test_retry_reports_a_file_that_is_gone(tmp_path):
+    """Skipped, and counted — a retry that silently does less than the report asked for looks
+    exactly like a retry that worked."""
+    src_root = tmp_path / 'src'
+    src_root.mkdir()
+    jobs, missing, foreign = owm._retry_jobs([str(src_root / 'vanished.pdf'), 'also-gone.pdf'],
+                                             src_root, tmp_path / 'out', in_place=False)
+    assert jobs == [] and foreign == [] and len(missing) == 2
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_cli_report_holds_full_paths_and_feeds_retry(tmp_path):
+    """End to end: the path a real run records is absolute, and it is the path a retry of that
+    report resolves back to the same file."""
+    import subprocess
+    src = tmp_path / 'tree' / 'sub'
+    src.mkdir(parents=True)
+    U.make_scan_pdf(src / 'manual.pdf', npages=2)
+    logs = tmp_path / 'logs'
+    r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
+                        str(tmp_path / 'tree'), '--no-ocr', '--log', str(logs)],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    report = next(logs.glob('*.csv'))
+    with open(report, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    assert [r['file'] for r in rows] == [str(src / 'manual.pdf')]
+    assert Path(rows[0]['file']).is_file(), 'the recorded path must resolve as-is'
+
+
 def test_report_csv_is_the_only_file_written(tmp_path):
     """One report, not three. The prose .log and the _by_folder.csv rollup are gone:
     the console already carries the run header and summary, the rollup is a pivot over
@@ -326,7 +432,7 @@ def test_prescan_warnings_survive_in_the_csv(tmp_path):
     assert pre['file'] == '(pre-scan)'
     assert '4x pypdf: incorrect startxref pointer' in pre['warnings']
     assert pre['error'] == '' and pre['action'] == '', 'must not look like a file to retry'
-    assert owm._read_failed_rels(got) == []
+    assert owm._read_failed_files(got) == []
 
 
 def test_scan_signals_are_a_column_now_that_the_log_is_gone(tmp_path):

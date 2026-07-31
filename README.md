@@ -151,7 +151,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
 | `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
-| `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4) |
+| `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4). OCR threads are handed out from the same budget and **follow how many files are still in flight**, so the last file of a batch gets the cores the batch is no longer using |
 | `--language L` | `auto` | Tesseract language(s). The default detects each file's script from the image (Tesseract OSD) and picks the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng`, CJK→`jpn+eng`. Pass an explicit spec to override, e.g. `eng+fra+spa+deu`; a source whose existing text layer proves another script still gets that pack added, because OCR'ing Cyrillic as English replaces real text with Latin noise |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--sauvola-k F` | `0.30` | Adaptive threshold sensitivity (lower = bolder/thicker ink, higher = thinner/cleaner) |
@@ -288,6 +288,43 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
 - Orders pages by a **natural sort**, so `1-2` comes before `1-11` and `2a` before
   `2b`. Page order is the one thing that has to be right, so it **always prints the
   order first** — run `--dry-run` to eyeball it before committing.
+- The page key **forgives how scans actually get named**. Measured on a 21-section Daihatsu
+  manual where a plain filename sort mis-ordered **14 of the 21 sections**: separators carry
+  no order, so `EM11.jpg` is page 11 rather than sorting second beside `EM-2.jpg`; a `0` that
+  follows a letter is an `O`, so `B0-4`/`B040`/`BO169`/`BO-2` are one chapter instead of four;
+  and a mojibake byte (`╡FS-2.jpg`) is ignored instead of sorting after every ASCII name.
+- **Front matter leads its folder**, in the order it's printed: **cover → foreword → index /
+  contents → numbered pages**. These pages carry no page number to sort on, so without this
+  `GI-COVER.jpg` landed near the *end* of its section and `index.tif` after page 50. Matched on
+  whole words, and the keyword has to **dominate** the name (at most a 2-letter section tag
+  besides it, so `covera`, `coverhw`, `GI-COVER`, `FW Foreword.pdf` and `index-BO-1` all
+  qualify). Measured over 1.11M image/PDF names in one archive, that budget is the difference
+  between genuine front matter and **169 false hits**: `DISCOVER.PDF` is a Discovery
+  manual, `…-STEERING-COLUMN-COVER.jpg` is a photo of a part, `tyrerotation_fwd.jpg` is
+  front-wheel drive, and `DTC Index.pdf` is a topic name in a print-captured manual — which is
+  what `--order docid` is for.
+
+  A publisher's own naming defeats that budget on its own, so the keyword also gets a second
+  chance against **whatever the folder's files do not share**. In a folder of
+  `PBGE95E1_FOR_EUROPE_CARISMA_96_BRM_0.pdf` … `_8.pdf` … `_COVER.pdf`, everything before the
+  last `_` identifies the *manual*, not the page — strip it and the cover is simply `COVER`,
+  which is why it now leads instead of sorting last. Those parts photos share nothing with each
+  other, so they are still rejected. Measured across 578 archive folders: **51 real covers
+  gained, none lost** — the full name is always judged first, so this can only add a hit.
+
+  `fwd` ranks **only as the bare name** (`fwd.pdf`), never with a tag or page number, because
+  three letters is genuinely ambiguous: in that archive every bare `fwd.pdf` turned out to be a
+  drivetrain section sitting among Nissan FSM section codes or Toyota EWD systems, not a
+  foreword. So in a folder like that it *will* sort first — which is why the tool prints the
+  page order before writing. `foreword` in any spelling has no such problem.
+- **The same page scanned twice** is merged once. One real section held 26 of its pages as
+  *both* a 2550×3508 JPG and a 637×877 TIF; the higher-resolution copy wins. The rule is
+  pixel area, not format, because 4 of that folder's 30 TIFs were the **only** copy of their
+  page — "drop the TIFs" would have lost 4 pages silently. A copy is only dropped if it is
+  **≥2× smaller** (the real pairs measured 4.0–16.9×); two files that collide at a *similar*
+  resolution may be two different pages, so both are kept and flagged for you. Grouping is
+  **per folder** — all 21 sections had a `cover.jpg`. Every drop is printed, and **nothing is
+  deleted from disk**.
 - Images are wrapped losslessly (img2pdf embeds the JPEG as-is, no re-encode). As
   usual, if the combined scan won't benefit from JBIG2 (photo-heavy Haynes-style
   pages), the compress step keeps the images and just adds the OCR layer.
@@ -302,12 +339,26 @@ python combine_manual.py FOLDER --language eng+rus --tessdata C:\path\to\tessdat
   1. Foreword.pdf … 8. Pre-delivery Inspection.pdf
   PERIODIC MAINTENANCE SERVICES PM\1. …      <- follows 8., as printed
   ```
+
+  Under `--recursive` each section folder also gets a **bookmark** at its first page, in
+  page order, so a combined manual of a thousand pages can be navigated. The page a
+  bookmark lands on is measured during the merge, not assumed one-page-per-file, and the
+  outline is read back out of the finished PDF and reported. A flat folder gets none.
+  Section order is the same natural sort — i.e. alphabetical for named sections.
+
+  A whole scanned manual in one pass:
+
+  ```
+  bertone\general info\GI-1.jpg …            21 sections, 1246 files
+    ->  bertone.pdf   1220 pages, 135.0 MB, 26 low-res duplicates dropped, 21 bookmarks
+  ```
 - **The combined PDF is verified before the tool exits**: it must reopen and carry
-  exactly the sum of its inputs' page counts. It is staged to a `.part` and moved into
-  place only once that passes, so a failure never leaves a half-written file that looks
-  finished. A malformed input is repaired first (qpdf, then Ghostscript) — and the repair
-  must recover the page count the file's raw bytes say it had, so a partial salvage can't
-  pass itself off as complete.
+  exactly the sum of its inputs' page counts — counted over the pages **actually merged**,
+  i.e. after duplicates are dropped, with every dropped file listed. It is staged to a
+  `.part` and moved into place only once that passes, so a failure never leaves a
+  half-written file that looks finished. A malformed input is repaired first (qpdf, then
+  Ghostscript) — and the repair must recover the page count the file's raw bytes say it had,
+  so a partial salvage can't pass itself off as complete.
 
 ### Right-click "Compress + OCR" on a PDF (Windows)
 
@@ -471,6 +522,35 @@ damage; failing to compress something only costs savings. Concretely:
 - Always on — there's no flag to force-rasterize a file this check calls born-digital,
   because doing so would defeat the one thing this safety check exists for.
 
+### Stamped watermarks aren't a text layer
+
+**A text layer says something different on every page; a stamp says the same thing.** Text
+that repeats on ~every sampled page is discounted wherever the tool asks "is this already
+searchable?" — because a paywall watermark used to answer yes on behalf of a file that had no
+text layer at all.
+
+Measured on a real 256-page Mitsubishi Carisma supplement: every page carried exactly 66 chars,
+`www.WorkshopManuals.co.uk` / `Purchased from www.WorkshopManuals.co.uk`, and nothing else.
+That's over the 40-char floor on every page, so the file was reported `kept existing` and
+**never OCR'd** — while the born-digital check, which uses a 100-char floor, correctly called
+the same file a scan. The two gates disagreed and the dumber one won. Worse, that file's images
+are already CCITT G4 at 596 dpi, so it projects 103% of original and can't be compressed at
+all: a text layer was the *only* thing on offer, and it was the one thing withheld.
+
+The discount is deliberately narrow, so it can't quietly write off a real text layer: at least
+3 pages must carry text, a line must appear on ~90% of them, and the whole thing must be at
+most 4 lines / 400 chars — twenty identical lines is a form template, and a template is
+content. It's applied **line-wise**, so a page with a repeated running header *plus* body text
+keeps its body and still counts as searchable.
+
+It also protects two things further up. A stamp longer than 100 chars would otherwise push a
+scanned page over the born-digital floor and skip the whole manual — worse than skipping OCR —
+and would make `classify_page` pass every page through as vector, which also drops it from the
+OCR render. A stamp in a CID font that can't be decoded still counts as real text, which is the
+safe direction. The stamp is **not removed**: the page looks exactly as it did, and the file is
+reported with `boiler=2ln/66c` in `scan signals` plus a note, so a row whose `ocr` cell changed
+explains itself.
+
 ## Run report
 
 A run reports to the console and writes nothing but its output. Pass **`--log`** to keep a
@@ -484,6 +564,11 @@ per-file record — what happened, **why**, and **what became of its text layer*
 - one row per file: `file, action, reason, ocr, language, orig size (MB), new size (MB), %,
   duplicate of, page types, scan signals, note, warnings, error` (sizes in MB; filter
   `error` non-blank to feed `--retry-failed`).
+
+  `file` is the **full path**, and so is `duplicate of` — a report is read days later, next to
+  other reports, from a folder that isn't the archive, and a bare relative path can't say which
+  tree it came from. `--retry-failed` reads those paths back and still derives each output from
+  the path *relative* to the `src` you give it, so a retry never writes on top of its source.
 
   The **four decision columns** each take values from a fixed vocabulary, so a run over
   thousands of files sorts, filters and pivots without reading the prose `note`:
@@ -550,7 +635,12 @@ only a compact `[3 pdf warnings]` marker; `--verbose` echoes each one prefixed w
   it left off, and failed files (no output written) are retried next time.
 - **`--retry-failed report.csv`** — after a run, reprocess *only* the files the CSV marked
   `FAILED` (e.g. after freeing disk, fixing a tool, or raising `--timeout`), without
-  re-scanning the whole tree.
+  re-scanning the whole tree. It reads the full paths in the report's `file` column but
+  derives each output from the path **relative to the `src` you pass**, so the retry can never
+  write over the file it is reading. An entry that has since been deleted is skipped and
+  counted; an entry that isn't under `src` at all means one of the two arguments is wrong, so
+  it's reported loudly and skipped rather than guessed at. Reports written before `file` held
+  full paths still work.
 - **Duplicate flagging** (always on) — large
   collections often contain byte-identical copies of the same PDF. Each file's content
   hash is computed as it's processed and, when two files match, **both are flagged** in

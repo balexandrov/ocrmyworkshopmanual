@@ -5,7 +5,9 @@
   - config file, duplicate hashing, retry-CSV parsing, malformed-PDF repair
 """
 import argparse
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -499,13 +501,15 @@ def test_flag_duplicates_annotates_but_keeps_all():
     assert 'duplicate_of' not in results[2]       # unique file untouched
 
 
-def test_read_failed_rels(tmp_path):
+def test_read_failed_files(tmp_path):
+    """Only the FAILED rows, and the `file` value exactly as recorded — full paths in a current
+    report, relative ones in an older one. Resolving them is `_retry_jobs`' job."""
     csv = tmp_path / 'r.csv'
     csv.write_text('file,action,orig_bytes,new_bytes,pct_of_orig,scan_frac,note,error\n'
                    'ok.pdf,compressed,10,1,10,,,\n'
-                   'bad.pdf,FAILED,10,0,,,,timed out\n'
+                   r'C:\arch\bad.pdf,FAILED,10,0,,,,timed out' + '\n'
                    'sub/also_bad.pdf,FAILED,10,0,,,,render failed\n', encoding='utf-8')
-    assert U.owm._read_failed_rels(csv) == ['bad.pdf', 'sub/also_bad.pdf']
+    assert U.owm._read_failed_files(csv) == [r'C:\arch\bad.pdf', 'sub/also_bad.pdf']
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11),
@@ -799,6 +803,91 @@ def test_one_unreadable_page_does_not_blank_the_whole_text_sample():
     assert sum(len(t) for t in text.values()) > 20000, 'text was lost with the bad page'
 
 
+# ── OCR thread budget at the tail of a run ───────────────────────────────────────
+# Measured on a real 5,243-file run: the budget was computed once, before the pool, from the
+# TOTAL job count — `6 // min(6, 5243)` = 1 — and never revisited. Its last file, a 57.9 MB
+# Russian book, therefore OCR'd on ONE core for 20+ minutes while the other five sat idle
+# with nothing left to do. `--jobs 1` was correct for the first 5,242 files and wrong for the
+# one that decided when the run ended.
+
+def _budget(cores, workers, remaining, monkeypatch):
+    """`_ocr_jobs_now()` for a given machine and a given point in the run."""
+    import multiprocessing as mp
+    monkeypatch.setattr(U.owm, '_OCR_CORES', cores)
+    monkeypatch.setattr(U.owm, '_OCR_WORKERS', workers)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', mp.Value('i', remaining))
+    return U.owm._ocr_jobs_now()
+
+
+def test_a_saturated_pool_still_gets_one_thread_each(monkeypatch):
+    """The behaviour that must NOT change: while there is more work than workers, dividing
+    the cores again would oversubscribe the machine."""
+    for remaining in (5243, 100, 7, 6):
+        assert _budget(6, 6, remaining, monkeypatch) == 1, remaining
+
+
+def test_the_last_file_gets_the_idle_cores(monkeypatch):
+    """The fix. With one file left there is nothing else to spend the machine on."""
+    assert _budget(6, 6, 1, monkeypatch) == 6
+    assert _budget(6, 6, 2, monkeypatch) == 3
+    assert _budget(6, 6, 3, monkeypatch) == 2
+
+
+def test_the_budget_is_never_zero_and_never_exceeds_the_cores(monkeypatch):
+    """It is passed straight to `ocrmypdf --jobs`, so 0 or a negative would be an argument
+    error on a file that was otherwise fine. `remaining` can legitimately reach 0 between the
+    last completion and the pool shutting down."""
+    for remaining in (0, -1, 1, 3, 999):
+        got = _budget(6, 6, remaining, monkeypatch)
+        assert 1 <= got <= 6, (remaining, got)
+
+
+def test_no_shared_counter_falls_back_to_the_static_value(monkeypatch):
+    """A worker started without one — and any direct call outside a pool — must still get a
+    usable number. A thread-count hint may never be the thing that fails a file."""
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', None)
+    monkeypatch.setattr(U.owm, 'OCR_JOBS', 3)
+    assert U.owm._ocr_jobs_now() == 3
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 0)     # cores unknown
+    assert U.owm._ocr_jobs_now() == 3
+
+
+def test_an_unreadable_counter_falls_back_instead_of_raising(monkeypatch):
+    """Same rule, for a counter that is present but broken."""
+    class Boom:
+        @property
+        def value(self):
+            raise RuntimeError('shared memory gone')
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_WORKERS', 6)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', Boom())
+    monkeypatch.setattr(U.owm, 'OCR_JOBS', 1)
+    assert U.owm._ocr_jobs_now() == 1
+
+
+def test_the_counter_reaches_the_workers_and_tracks_the_parent():
+    """The mechanism, end to end through a real pool. A `multiprocessing.Value` survives
+    Windows spawn only because it is passed through process CREATION — `initargs` — so this
+    pins the one property the whole fix rests on: workers see the parent's later writes, not
+    a snapshot taken when the pool was built."""
+    import concurrent.futures as cf
+    import multiprocessing as mp
+    remaining = mp.Value('i', 8)
+    with cf.ProcessPoolExecutor(
+            max_workers=2, initializer=U.owm._init_worker,
+            initargs=(1, 6, 6, remaining)) as ex:
+        saturated = list(ex.map(_read_budget, range(2)))
+        remaining.value = 1                      # the batch drains
+        tail = list(ex.map(_read_budget, range(2)))
+    assert saturated == [1, 1], saturated
+    assert tail == [6, 6], tail
+
+
+def _read_budget(_i):
+    """Module-level so it is picklable for the pool above."""
+    return U.owm._ocr_jobs_now()
+
+
 # ── OCR language ─────────────────────────────────────────────────────────────────
 # --language defaulted to 'eng', so a 532-page Cyrillic Suzuki manual was re-OCR'd as
 # English: that does not read it worse, it REPLACES real text with Latin noise. It scored
@@ -927,3 +1016,169 @@ def test_a_file_with_no_links_still_compresses(tmp_path):
     res = U.owm.compress_one(str(src), str(out), 200, ocr=False)
     assert res.get('err') is None, res
     assert out.exists() and out.stat().st_size < src.stat().st_size
+
+
+# ── core allocation: a huge file must get the whole box, deterministically ─────────────
+
+def test_ocr_jobs_scale_with_page_count(monkeypatch):
+    """The budget is a function of the FILE, not of the queue. Measured on the 2026-07-31
+    Mazda run: a 2910-page manual launched ocrmypdf while ~50 files were queued, got
+    `6 // 6` = 1 thread and held it for two hours while five of six cores idled."""
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', None)
+    assert U.owm._ocr_jobs_for(2910) == 6        # large -> the whole box
+    assert U.owm._ocr_jobs_for(800) == 6         # boundary is inclusive
+    assert U.owm._ocr_jobs_for(400) == 3         # medium -> half
+    assert U.owm._ocr_jobs_for(80) == 2
+    assert U.owm._ocr_jobs_for(10) == 1          # small -> file-level parallelism is enough
+    # never exceeds the physical-core cap, whatever the page count
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 2)
+    assert U.owm._ocr_jobs_for(5000) == 2
+
+
+def test_ocr_jobs_fall_back_to_size_when_pages_unreadable(monkeypatch):
+    """Some sources cannot be opened to be counted at all — measured: pypdf raises
+    AttributeError('NullObject') on the 1990 RX7 section manuals. A thread-count hint must
+    degrade to bytes, never raise and never fail the file."""
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', None)
+    assert U.owm._ocr_jobs_for(0, 143 * 1024 * 1024) == 6
+    assert U.owm._ocr_jobs_for(0, 20 * 1024 * 1024) == 3
+    assert U.owm._ocr_jobs_for(0, 900 * 1024) == 1
+    assert U.owm._ocr_jobs_for(0, 0) == 1        # nothing known at all -> narrowest
+
+
+def test_ocr_jobs_budget_survives_an_unopenable_file(tmp_path, monkeypatch):
+    """End-to-end of the fallback: a file pypdf cannot parse still yields a usable budget."""
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', None)
+    junk = tmp_path / 'broken.pdf'
+    junk.write_bytes(b'\x7e\xa0\x90\x11M' + b'\x00' * 4096)   # no %PDF header, like the real ones
+    jobs = U.owm._ocr_jobs_budget(junk)
+    assert 1 <= jobs <= 6
+
+
+def test_ocr_jobs_budget_keeps_the_draining_queue_floor(monkeypatch):
+    """The old queue-drain rule stays live as a FLOOR: one small file left on a 6-core box
+    should still get the idle cores, which is the case `_ocr_jobs_now` was written for."""
+    import multiprocessing
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_WORKERS', 6)
+    monkeypatch.setattr(U.owm, '_OCR_REMAINING', multiprocessing.Value('i', 1))
+    monkeypatch.setattr(U.owm, '_OCR_TOKENS', None)
+    assert U.owm._ocr_jobs_budget(pages=3) == 6      # tiny file, empty queue -> all of it
+
+
+def test_thread_claims_clamp_at_oversubscribe_and_never_block(monkeypatch):
+    """Concurrent files derive budgets independently, so the shared tally is what stops six
+    workers each claiming the whole machine. It CLAMPS: a step that finds the budget spent
+    runs narrow rather than waiting, because a step that never starts produces no progress
+    for the stall watchdog to see."""
+    import multiprocessing
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_TOKENS', multiprocessing.Value('i', 0))
+    monkeypatch.setattr(U.owm, 'OVERSUBSCRIBE', 1.5)
+    cap = int(6 * 1.5)
+    assert U.owm._claim_threads(6) == 6
+    assert U.owm._claim_threads(6) == cap - 6         # only what is left
+    assert U.owm._claim_threads(6) == 1               # spent -> narrowest, still runs
+    U.owm._release_threads(cap)
+    assert U.owm._claim_threads(4) == 4               # released, budget available again
+
+
+def test_thread_grant_is_released_even_when_the_step_raises(monkeypatch):
+    """A crashed, stalled or killed step must not leak its share — otherwise every later file
+    in that run silently drops to one thread."""
+    import multiprocessing
+    monkeypatch.setattr(U.owm, '_OCR_CORES', 6)
+    monkeypatch.setattr(U.owm, '_OCR_TOKENS', multiprocessing.Value('i', 0))
+    with pytest.raises(RuntimeError):
+        with U.owm._threads(4) as got:
+            assert got == 4
+            raise RuntimeError('step blew up')
+    assert U.owm._OCR_TOKENS.value == 0, 'threads leaked after a failing step'
+
+
+def test_render_bands_cover_every_page_exactly_once():
+    """The sharding correctness property: whatever the split, the bands must reproduce the
+    page sequence exactly — no gap, no overlap, no page rendered at another page's dpi.
+    A silent off-by-one here would ship a manual with duplicated or missing pages."""
+    for n in (1, 7, 49, 50, 51, 120, 401, 2910):
+        for shards in (1, 2, 4, 6):
+            for dpis in ([200] * n, [200] * (n // 2) + [300] * (n - n // 2)):
+                bands = U.owm._render_bands(dpis, shards)
+                pages = [p for f, l, _d in bands for p in range(f, l + 1)]
+                assert pages == list(range(1, n + 1)), (n, shards, bands[:4])
+                for f, l, d in bands:
+                    assert all(dpis[p - 1] == d for p in range(f, l + 1)), (n, shards, f, l)
+
+
+def test_render_bands_leave_small_and_medium_files_as_one_call():
+    """Only what is worth splitting gets split: below two shards' worth of pages, the extra
+    process starts cost more than they save, and the ~350 small files in a real run must not
+    change behaviour at all."""
+    assert U.owm._render_bands([200] * 30, 6) == [(1, 30, 200)]
+    assert U.owm._render_bands([200] * 99, 6) == [(1, 99, 200)]
+    assert len(U.owm._render_bands([200] * 100, 6)) == 2
+    # shards=1 must reproduce the original, unsharded bands exactly
+    mixed = [200] * 60 + [300] * 60
+    assert U.owm._render_bands(mixed, 1) == [(1, 60, 200), (61, 120, 300)]
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_sharded_render_matches_sequential_page_for_page(tmp_path):
+    """Sharding must be invisible in the output: the same pages, in the same order, with the
+    same pixels. This is the test that catches a page-ordering regression, which would
+    otherwise surface only as a scrambled 2900-page manual."""
+    src = U.make_scan_pdf(tmp_path / 'many.pdf', npages=6, dpi=150)
+    dpis = U.owm._page_render_dpis(src, 150)
+
+    seq = tmp_path / 'seq'; seq.mkdir()
+    assert U.owm._render_all(src, seq, dpis, 150, 0, shards=1)
+    sha = tmp_path / 'sha'; sha.mkdir()
+    # force a split regardless of the page-count floor by sharding the band list directly
+    bands = [(1, 3, dpis[0]), (4, 6, dpis[0])]
+    U.owm._render_bands_orig = U.owm._render_bands
+    try:
+        U.owm._render_bands = lambda d, s: bands
+        assert U.owm._render_all(src, sha, dpis, 150, 0, shards=2)
+    finally:
+        U.owm._render_bands = U.owm._render_bands_orig
+
+    a = sorted(p.name for p in seq.glob('p*.png'))
+    b = sorted(p.name for p in sha.glob('p*.png'))
+    assert a == b and len(a) == 6, (a, b)
+    for name in a:
+        assert (seq / name).read_bytes() == (sha / name).read_bytes(), \
+            f'{name} differs between sequential and sharded render'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Win32 priority classes')
+def test_below_normal_priority_actually_takes_effect_and_children_inherit():
+    """It must be OBSERVED, not just called. The original used ctypes without declaring the
+    Win32 types, so `GetCurrentProcess`'s pseudo-handle came back as a 32-bit -1, reached the
+    64-bit HANDLE parameter as 0x00000000FFFFFFFF, and SetPriorityClass failed with
+    GetLastError() 6 (ERROR_INVALID_HANDLE) — silently, behind `except: pass`. Every run stayed
+    at NORMAL. Asserted in a SUBPROCESS so the test does not renice the test runner, and the
+    child's own class is checked too, since gs/tesseract inherit rather than call this."""
+    probe = (
+        "import ctypes;from ctypes import wintypes;import ocrmyworkshopmanual as owm;"
+        "ok=owm.set_below_normal_priority();"
+        "k=ctypes.WinDLL('kernel32');k.GetCurrentProcess.restype=wintypes.HANDLE;"
+        "k.GetPriorityClass.argtypes=[wintypes.HANDLE];k.GetPriorityClass.restype=wintypes.DWORD;"
+        "cls=k.GetPriorityClass(k.GetCurrentProcess());"
+        "import subprocess,sys;"
+        "child=subprocess.run([sys.executable,'-c',"
+        "\"import ctypes;from ctypes import wintypes;k=ctypes.WinDLL('kernel32');\""
+        "\"k.GetCurrentProcess.restype=wintypes.HANDLE;\""
+        "\"k.GetPriorityClass.argtypes=[wintypes.HANDLE];k.GetPriorityClass.restype=wintypes.DWORD;\""
+        "\"print(k.GetPriorityClass(k.GetCurrentProcess()))\"],capture_output=True,text=True);"
+        "print(ok, cls, child.stdout.strip())"
+    )
+    r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
+                       cwd=str(Path(U.owm.__file__).parent))
+    assert r.returncode == 0, r.stderr
+    ok, cls, child = r.stdout.split()
+    assert ok == 'True', 'set_below_normal_priority reported failure'
+    assert int(cls) == 0x4000, f'process not BELOW_NORMAL: {hex(int(cls))}'
+    assert int(child) == 0x4000, f'child did not inherit BELOW_NORMAL: {hex(int(child))}'

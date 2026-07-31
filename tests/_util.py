@@ -121,6 +121,28 @@ def workdir(prefix: str = 'owmtest_') -> Path:
     return Path(tempfile.mkdtemp(prefix=prefix))
 
 
+def make_page_image(path: Path, px=(2550, 3508), label: str = '', dpi: int = 300) -> Path:
+    """Write a standalone page IMAGE — not wrapped in a PDF — sized `px`, format from the
+    suffix. Returns the path.
+
+    Every other make_* here builds an image only to wrap it and unlink it, but a folder of
+    loose scans IS what combine_manual.py takes as input (measured: 1216 .jpg + 30 .tif in one
+    real Daihatsu folder), so these tests need the image itself. `px` is the point of the
+    helper: a low-resolution rescan of a page (637x877) has to be writable beside its
+    high-resolution copy (2550x3508) to exercise the duplicate gate at the ratio really
+    observed there. `label` is drawn on the page so a merged result can be identified per
+    page rather than merely counted."""
+    from PIL import Image, ImageDraw
+    path.parent.mkdir(parents=True, exist_ok=True)
+    im = Image.new('L', px, 255)
+    d = ImageDraw.Draw(im)
+    d.rectangle([px[0] // 20, px[1] // 20, px[0] - px[0] // 20, px[1] - px[1] // 20],
+                outline=0, width=max(1, px[0] // 200))
+    d.text((px[0] // 8, px[1] // 8), label or path.stem, fill=0)
+    im.save(path, dpi=(dpi, dpi))
+    return path
+
+
 def make_color_pdf(path: Path, size=(1000, 1400)) -> Path:
     """Make a 1-page BRIGHT-colour PDF (orange bars on white) with NO dark pixels —
     its grayscale luminance is all >= 100. Reproduces the regression where such a
@@ -200,6 +222,134 @@ def make_scan_pdf(path: Path, npages: int = 3, dpi: int = 300) -> Path:
         pg_pdf.unlink(missing_ok=True)
     with open(path, 'wb') as f:
         wr.write(f)
+    return path
+
+
+STAMP_66 = 'www.WorkshopManuals.co.uk\nPurchased from www.WorkshopManuals.co.uk'
+"""The real paywall stamp from Supplement_A.pdf (Mitsubishi Carisma 1996-2000 supplement,
+21,273,852 bytes, 256 pages) — exactly 66 chars, the ONLY text on any of its pages, and
+enough to make `has_text` call the file searchable when it had no text layer at all."""
+
+
+def _stamp_ops(lines, size_pts=(25, 12), pos=((103.1, 818.8), (149.3, 81.2))) -> bytes:
+    """The content-stream operators a stamping tool really emits for a watermark: one
+    self-contained `q … Q` per line, drawn AFTER the page image, orange fill, its own
+    ExtGState and font, and the full Tm/Td/Tz/Tw/Tc/TL/Ts operator soup.
+
+    Transcribed from Supplement_A.pdf page 2's 615-byte stream rather than simplified to
+    `BT /F1 12 Tf (x) Tj ET`, because the point of the fixture is to exercise the block
+    scanner on what real tools produce — nested q/Q, an operand pile between BT and Tj, and
+    two separate blocks for what reads as one stamp."""
+    out = b''
+    for i, ln in enumerate(lines):
+        s, (x, y) = size_pts[min(i, len(size_pts) - 1)], pos[min(i, len(pos) - 1)]
+        esc = ln.replace('\\', r'\\').replace('(', r'\(').replace(')', r'\)')
+        out += (f' q 1.00 0.40 0.00 rg 1 i /RelativeColorimetric ri /NxGS{i} gs BT '
+                f'/NxF{i} 1 Tf {s:.6f} 0.000000 0.000000 {s:.6f} {x:.6f} {y:.6f} Tm '
+                f'0 Tw 0 Tc 100 Tz 0 TL 0 Ts 0.000000 0.227997 Td '
+                f'({esc}) Tj ET Q \n').encode('latin1')
+    return out
+
+
+def _sub_dict(parent, key):
+    """`parent[key]`, creating an empty dictionary there first if it is missing. pikepdf's
+    Dictionary has no setdefault, and a page built by img2pdf has no /Font at all."""
+    import pikepdf
+    if key not in parent:
+        parent[key] = pikepdf.Dictionary()
+    return parent[key]
+
+
+def _add_font(pdf, res, name: str, base: str = '/Helvetica'):
+    """Register a simple Type1 font under `name` in a page's /Resources."""
+    import pikepdf
+    _sub_dict(res, '/Font')[name] = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name('/Font'), Subtype=pikepdf.Name('/Type1'),
+        BaseFont=pikepdf.Name(base)))
+
+
+def _append_page_ops(path: Path, ops: bytes, nfonts: int = 2) -> Path:
+    """Append `ops` to every page's content stream, adding the `/NxF*` Helvetica-Bold fonts
+    and `/NxGS*` ExtGStates they reference. Rewrites `path` in place."""
+    import pikepdf
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            res = _sub_dict(page.obj, '/Resources')
+            gs = _sub_dict(res, '/ExtGState')
+            for i in range(nfonts):
+                _add_font(pdf, res, f'/NxF{i}', '/Helvetica-Bold')
+                gs[f'/NxGS{i}'] = pdf.make_indirect(pikepdf.Dictionary(
+                    Type=pikepdf.Name('/ExtGState'), ca=1, CA=1))
+            page.contents_add(pikepdf.Stream(pdf, ops), prepend=False)
+        pdf.save()
+    return path
+
+
+def make_stamped_scan_pdf(path: Path, npages: int = 6, dpi: int = 200,
+                          stamp: str = STAMP_66) -> Path:
+    """A scan with a paywall stamp on every page and NO other text — the measured file's
+    shape, and the regression this whole feature exists for.
+
+    Deliberately built from `make_scan_pdf`'s raster (so `_largest_image_dpi` reads a real
+    scan) with the stamp appended AFTER the image draw, which is where a stamping tool puts
+    it and therefore the one position `_stream_visible_text` counts as visible."""
+    from pypdf import PdfReader
+    lines = stamp.split('\n')
+    # `make_scan_pdf`'s raster carries readable WORDS as pixels, so OCR has something real to
+    # find — without that, a test asserting "a text layer was added" cannot tell a broken
+    # gate from an empty page. None of it is extractable, so the stamp is still provably the
+    # only TEXT in the file, which is what the assertion below pins.
+    make_scan_pdf(path, npages=npages, dpi=dpi)
+    _append_page_ops(path, _stamp_ops(lines), nfonts=len(lines))
+    got = (PdfReader(str(path)).pages[0].extract_text() or '').strip()
+    assert len(got) == len(stamp), f'fixture must reproduce the stamp exactly: {got!r}'
+    return path
+
+
+def make_stamped_body_over_scan_pdf(path: Path, npages: int = 6, dpi: int = 200,
+                                    stamp: str = 'CONFIDENTIAL - DO NOT COPY') -> Path:
+    """A full-page scan carrying BOTH a repeated stamp AND real per-page vector type.
+
+    The nasty case: the stamp line IS boilerplate, but the page still has publisher text
+    that rasterising would destroy, so the page must keep counting as real text. This is
+    what stops the discount from weakening the born-digital protection."""
+    lines = [stamp]
+    make_scan_pdf(path, npages=npages, dpi=dpi)
+    from pypdf import PdfReader
+    import pikepdf
+    ops = _stamp_ops(lines)
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf:
+        for k, page in enumerate(pdf.pages):
+            body = (' q BT /NxF9 11 Tf 1 0 0 1 60 600 Tm ' +
+                    ' '.join(f'(Page {k + 1} paragraph {j}: torque the bolt to '
+                             f'{40 + j} Nm and inspect the seal for wear.) Tj 0 -14 Td'
+                             for j in range(9)) + ' ET Q \n').encode('latin1')
+            _add_font(pdf, _sub_dict(page.obj, '/Resources'), '/NxF9')
+            page.contents_add(pikepdf.Stream(pdf, body), prepend=False)
+        pdf.save()
+    _append_page_ops(path, ops, nfonts=len(lines))
+    t = (PdfReader(str(path)).pages[0].extract_text() or '')
+    assert 'torque' in t and stamp in t, f'fixture broken: {t[:200]!r}'
+    return path
+
+
+def make_ocr_layer_pdf(path: Path, npages: int = 4, dpi: int = 200) -> Path:
+    """A scan plus a genuine per-page-DIFFERENT invisible (mode 3) OCR layer — the file
+    that must keep reporting `kept existing`, because its layer really is a text layer."""
+    import pikepdf
+    from pypdf import PdfReader
+    make_scan_pdf(path, npages=npages, dpi=dpi)
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf:
+        for k, page in enumerate(pdf.pages):
+            ops = (' q BT 3 Tr /NxF8 11 Tf 1 0 0 1 60 700 Tm ' +
+                   ' '.join(f'(Section {k + 1}.{j} removal and installation of the '
+                            f'number {k * 10 + j} component) Tj 0 -13 Td'
+                            for j in range(8)) + ' ET Q \n').encode('latin1')
+            _add_font(pdf, _sub_dict(page.obj, '/Resources'), '/NxF8')
+            page.contents_add(pikepdf.Stream(pdf, ops), prepend=False)
+        pdf.save()
+    t = (PdfReader(str(path)).pages[0].extract_text() or '')
+    assert 'removal' in t, f'fixture broken: {t[:200]!r}'
     return path
 
 

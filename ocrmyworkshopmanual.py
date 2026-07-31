@@ -69,8 +69,10 @@ import argparse
 import concurrent.futures as cf
 import csv
 import contextlib
+import functools
 import hashlib
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -80,6 +82,7 @@ import tempfile
 import time
 from collections import Counter, namedtuple
 from pathlib import Path
+from typing import NamedTuple
 
 import img2pdf
 import numpy as np
@@ -255,7 +258,37 @@ _INSTALLED_LANGS = None
 # pool is saturated — but when there are fewer files in flight than cores (a short run,
 # a --from-list of one manual, or the tail of a batch) that leaves the machine idle:
 # measured on an 8-page file, ocrmypdf took 17.3s at --jobs 1 and 7.3s at --jobs 4.
+#
+# This is the STATIC fallback. The live value comes from `_ocr_jobs_now()`, because a number
+# fixed before the pool starts is wrong for exactly the case the paragraph above describes —
+# see that function.
 OCR_JOBS = 1
+
+# Total threads the box may have promised across ALL running steps, as a multiple of physical
+# cores. Deliberately above 1.0: ocrmypdf and Ghostscript both spend long stretches in serial
+# phases (page assembly, the final PDF write) with their threads idle, so a strict 1.0 cap
+# leaves the machine short of work. Kept modest because the per-page binarize is
+# memory-bandwidth-bound, so real oversubscription thrashes cache instead of adding
+# throughput. This is a CLAMP, never a gate: a step that finds the budget spent runs smaller,
+# it never waits.
+OVERSUBSCRIBE = 1.5
+
+# Page counts at which one file is worth more threads. Keyed on the FILE's own cost, because a
+# budget read from queue state is decided at one arbitrary instant and then frozen for the
+# life of the subprocess — measured on the 2026-07-31 Mazda run: a 2910-page manual launched
+# ocrmypdf while ~50 files were still queued, got `6 // 6` = 1 thread, and held it for two
+# hours while five of six cores idled. Page count is a property of the input, so the same file
+# gets the same budget on every run.
+OCR_PAGES_LARGE = 800
+OCR_PAGES_MEDIUM = 200
+OCR_PAGES_SMALL = 50
+
+# Set by `_init_worker`: the machine's physical cores, the pool's worker count, the parent's
+# shared count of files still outstanding, and the shared tally of threads already promised.
+_OCR_CORES = 0
+_OCR_WORKERS = 0
+_OCR_REMAINING = None
+_OCR_TOKENS = None
 
 
 def _installed_langs() -> set:
@@ -292,31 +325,176 @@ def _available_ocr_lang(lang: str) -> str:
     return 'eng' if 'eng' in inst else sorted(inst)[0]
 
 
-def _init_worker(ocr_jobs: int = 1):
+def _ocr_jobs_now() -> int:
+    """How many threads to hand ocrmypdf, decided when it is about to run rather than when
+    the pool was built.
+
+    The budget used to be computed once, before the pool, from the TOTAL job count — so on a
+    5,243-file run over 6 cores it was `6 // min(6, 5243)` = 1 for the whole run, and stayed
+    1 as the batch drained. Measured on that run's tail: one file left, a 57.9 MB Russian
+    book, `ocrmypdf --jobs 1`, ~1 of 6 cores busy, 20+ minutes. The pool had nothing else to
+    do with those five cores.
+
+    What matters is how many files are IN FLIGHT, which is `min(workers, remaining)` and only
+    the parent knows it — hence the shared counter it updates as files complete. While the
+    pool is saturated this returns exactly what it returns today; the budget only opens up
+    once the batch is genuinely winding down. Capped at PHYSICAL cores, the same bound
+    `_default_workers` uses.
+
+    Falls back to the static `OCR_JOBS` if the counter is missing or unreadable: a
+    thread-count hint must never be the thing that fails a file."""
+    if _OCR_REMAINING is None or _OCR_CORES <= 0:
+        return OCR_JOBS
+    try:
+        remaining = int(_OCR_REMAINING.value)
+    except Exception:
+        return OCR_JOBS
+    inflight = min(_OCR_WORKERS or _OCR_CORES, remaining)
+    return max(1, _OCR_CORES // max(1, inflight))
+
+
+def _ocr_jobs_for(pages: int = 0, size_bytes: int = 0) -> int:
+    """Thread budget one file DESERVES, from its own size. Independent of the queue, so it is
+    the same on every run and — the point — it is already large when a huge file STARTS,
+    rather than becoming large once the batch drains, by which time the file has been running
+    single-threaded for hours.
+
+    Page count is the cost proxy; bytes are the fallback, because some sources cannot be
+    opened at all to be counted (measured: pypdf raises AttributeError('NullObject') on the
+    1990 RX7 section manuals). Neither may raise: a thread-count hint must never be the thing
+    that fails a file."""
+    cores = _OCR_CORES if _OCR_CORES > 0 else (os.cpu_count() or 4)
+    if pages <= 0:
+        mb = (size_bytes or 0) / (1024 * 1024)
+        if mb >= 50:
+            return max(1, cores)
+        if mb >= 10:
+            return max(2, cores // 2)
+        if mb >= 2:
+            return min(2, max(1, cores))
+        return 1
+    if pages >= OCR_PAGES_LARGE:
+        return max(1, cores)
+    if pages >= OCR_PAGES_MEDIUM:
+        return max(2, cores // 2)
+    if pages >= OCR_PAGES_SMALL:
+        return min(2, max(1, cores))
+    return 1
+
+
+def _ocr_jobs_budget(src_p=None, pages: int = 0) -> int:
+    """What to actually hand a step: the larger of what this file deserves and what the
+    draining queue allows, capped at PHYSICAL cores (the bound `_default_workers` uses).
+
+    Taking the max keeps both fixes live — a big file gets its share immediately, and a run of
+    small files still opens up at the tail, which is what `_ocr_jobs_now` was written for."""
+    size = 0
+    if pages <= 0 and src_p is not None:
+        try:
+            pages = _page_count(Path(src_p))
+            size = Path(src_p).stat().st_size
+        except Exception:
+            pages, size = 0, 0
+    want = max(_ocr_jobs_for(pages, size), _ocr_jobs_now())
+    cap = _OCR_CORES if _OCR_CORES > 0 else want
+    return max(1, min(want, cap))
+
+
+def _claim_threads(want: int) -> int:
+    """Take up to `want` threads from the shared budget and return how many were granted.
+
+    Clamps, never blocks: if the budget is spent this returns 1 and the step runs narrow.
+    Waiting here would trade a slow file for a stalled one, and the stall watchdog reads no
+    progress from a process that has not been allowed to start."""
+    want = max(1, int(want))
+    if _OCR_TOKENS is None or _OCR_CORES <= 0:
+        return want
+    cap = max(1, int(_OCR_CORES * OVERSUBSCRIBE))
+    try:
+        with _OCR_TOKENS.get_lock():
+            free = cap - int(_OCR_TOKENS.value)
+            take = want if want <= free else max(1, free)
+            _OCR_TOKENS.value = int(_OCR_TOKENS.value) + take
+        return take
+    except Exception:
+        return want
+
+
+def _release_threads(n: int) -> None:
+    """Hand threads back. Floored at 0 so a lost or double release can only ever make the
+    budget look FREER, never permanently smaller — an accounting slip must not silently
+    shrink every later file to one thread."""
+    if _OCR_TOKENS is None or n <= 0:
+        return
+    try:
+        with _OCR_TOKENS.get_lock():
+            _OCR_TOKENS.value = max(0, int(_OCR_TOKENS.value) - int(n))
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _threads(want: int):
+    """Hold a thread grant for the duration of one step. The release is in a `finally` so a
+    crashed, stalled or killed step cannot leak its share and starve the rest of the run."""
+    got = _claim_threads(want)
+    try:
+        yield got
+    finally:
+        _release_threads(got)
+
+
+def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=None,
+                 tokens=None):
     """Worker start-up: run below normal priority, tell ocrmypdf how many threads it may
     use in THIS process, and capture library logging so it stops leaking to the shared
     stderr. The pool parallelises across files, so the thread budget is the machine's cores
     divided among the workers — that keeps a short run (fewer files than cores) from leaving
     most of the CPU idle. The log capture must be installed HERE: the pool is processes, so
-    a handler attached in the parent cannot see a child's records."""
-    global OCR_JOBS
+    a handler attached in the parent cannot see a child's records.
+
+    `remaining` is the parent's live count of files still outstanding — a shared
+    `multiprocessing.Value`, which survives Windows spawn precisely because it is passed
+    through process creation (`initargs`). It has to arrive here, since this is the only hook
+    the pool offers, but it is READ per OCR call by `_ocr_jobs_now`: a budget fixed at start
+    is wrong by the end of the run, which is the bug this exists to fix.
+
+    `tokens` is the matching shared tally of threads already promised to running steps, so
+    per-file budgets derived independently in six processes cannot add up to more work than
+    the machine has (see `_claim_threads`)."""
+    global OCR_JOBS, _OCR_CORES, _OCR_WORKERS, _OCR_REMAINING, _OCR_TOKENS
     OCR_JOBS = max(1, int(ocr_jobs))
+    _OCR_CORES = max(0, int(cores))
+    _OCR_WORKERS = max(0, int(workers))
+    _OCR_REMAINING = remaining
+    _OCR_TOKENS = tokens
     _install_lib_log_capture()
     set_below_normal_priority()
 
 
-def set_below_normal_priority():
-    """Lower this process (and thus its subprocess children, which inherit it) to
-    below-normal priority so long runs keep the machine responsive."""
+def set_below_normal_priority() -> bool:
+    """Lower this process (and thus its subprocess children, which inherit it at creation) to
+    below-normal priority so long runs keep the machine responsive. True if it took effect.
+
+    The Win32 types MUST be declared. Without them `GetCurrentProcess` defaults to a c_int
+    restype, so its pseudo-handle comes back as 32-bit -1 and reaches the 64-bit HANDLE
+    parameter as 0x00000000FFFFFFFF — measured: SetPriorityClass returned 0 with
+    GetLastError() 6 (ERROR_INVALID_HANDLE), and every run stayed at NORMAL while the
+    `except: pass` hid it. Priority is a courtesy to the rest of the machine, so a failure
+    must never raise — but it must be reportable, hence the bool."""
     try:
         if os.name == 'nt':
             import ctypes
-            ctypes.windll.kernel32.SetPriorityClass(
-                ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL
-        else:
-            os.nice(10)
+            from ctypes import wintypes
+            k = ctypes.WinDLL('kernel32', use_last_error=True)
+            k.GetCurrentProcess.restype = wintypes.HANDLE
+            k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k.SetPriorityClass.restype = wintypes.BOOL
+            return bool(k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000))
+        os.nice(10)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _say(*a, **k):
@@ -727,7 +905,8 @@ def _page_has_color(work: Path, src_p: Path, page_no: int, dpi: int) -> bool:
 
 def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
                   detect_photos: bool, photo_thresh: float, photo_dpi: int,
-                  blank_ink: float = 0.0008, page=None) -> PageClass:
+                  blank_ink: float = 0.0008, page=None,
+                  boiler=frozenset()) -> PageClass:
     """Route one rendered grayscale page to a PageType. Cheap signals: ink fraction
     (BLANK), tiled continuous-tone coverage (PHOTO vs LINE), a colour render + cast-
     robust colour test for photo pages (PHOTO_GRAY vs PHOTO_COLOR), and — critically —
@@ -759,8 +938,11 @@ def classify_page(png: Path, page_no: int, src_p: Path, work: Path, dpi: int,
             # OR: real VISIBLE text drawn over a background scan. Rasterising would
             # destroy publisher text that OCR cannot faithfully reproduce, so this page
             # is passed through too. An invisible (mode 3) OCR layer does NOT count —
-            # that we can and do regenerate.
-            if _visible_text_chars(page):
+            # that we can and do regenerate — and neither does a repeated stamp: a
+            # watermark over 100 chars long would make EVERY page of a scanned manual
+            # PT_VECTOR, which passes it through uncompressed AND drops it from the OCR
+            # render (`skip_pages`), with no report column exposing either.
+            if _visible_text_chars(page, boiler=boiler):
                 return PageClass(PT_VECTOR, None)
         except Exception:
             pass
@@ -870,44 +1052,113 @@ def _page_render_dpis(src_p: Path, base_dpi: int, cap: int = MAX_RENDER_DPI) -> 
         return []
 
 
-def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int,
-                on_retry=None) -> bool:
-    """Render every page ONCE, in COLOUR, at its own resolution. Consecutive pages that
-    share a resolution go in one Ghostscript call, so a uniformly-scanned manual still
-    costs a single pass; only genuinely mixed documents need a few. Ghostscript writes
-    pages as it goes, so page count is a live progress signal for the stall watchdog.
+RENDER_SHARD_MIN_PAGES = 50
 
-    Each run renders into its own directory because Ghostscript restarts its %d counter
-    at 1 for every invocation — writing straight into `work` would make run 2 overwrite
-    run 1's pages."""
+
+def _render_bands(dpis: list, shards: int) -> list:
+    """(first, last, dpi) bands to render, 1-based inclusive.
+
+    Consecutive pages sharing a resolution belong to one Ghostscript call, so a uniformly
+    scanned manual is one band; only genuinely mixed documents need several. A band longer
+    than `RENDER_SHARD_MIN_PAGES * 2` is then split into up to `shards` roughly equal pieces
+    that can render CONCURRENTLY — Ghostscript is single-threaded, so a 2910-page manual
+    otherwise renders on one core (measured: 2h20m) while the rest of the box idles.
+
+    Kept a pure function of (dpis, shards) so the split is testable without invoking gs, and
+    so `shards=1` reproduces the original bands exactly."""
     if not dpis:
-        dpis = [base_dpi]
-    runs, start = [], 0
+        return []
+    bands, start = [], 0
     for i in range(1, len(dpis) + 1):
         if i == len(dpis) or dpis[i] != dpis[start]:
-            runs.append((start + 1, i, dpis[start]))     # 1-based, inclusive
+            bands.append((start + 1, i, dpis[start]))     # 1-based, inclusive
             start = i
-    for n, (first, last, d) in enumerate(runs):
-        sub = work / f'r{n:03d}'
-        sub.mkdir(exist_ok=True)
-        cmd = [GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={first}', f'-dLastPage={last}',
-               '-dNOPAUSE', '-dBATCH', '-dQUIET', _GS_INTERPOLATE,
-               '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src_p)]
-        try:
+    if shards <= 1:
+        return bands
+    out = []
+    for first, last, d in bands:
+        n = last - first + 1
+        # only split what is worth splitting: below two shards' worth, one call is faster than
+        # the process starts it would cost.
+        k = min(shards, n // RENDER_SHARD_MIN_PAGES)
+        if k <= 1:
+            out.append((first, last, d))
+            continue
+        step = -(-n // k)                                  # ceil, so k pieces cover n pages
+        for s in range(first, last + 1, step):
+            out.append((s, min(s + step - 1, last), d))
+    return out
+
+
+def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int,
+                on_retry=None, shards: int = 0, stats: dict = None) -> bool:
+    """Render every page ONCE, in COLOUR, at its own resolution. Ghostscript writes pages as
+    it goes, so page count is a live progress signal for the stall watchdog — kept PER BAND,
+    so a band is killed only when IT stops producing pages, never for being slow.
+
+    Bands render concurrently (`shards`), because gs itself is single-threaded and the render
+    is half the cost of a big manual. The threads here only wait on subprocesses.
+
+    Each band renders into its own directory because Ghostscript restarts its %d counter
+    at 1 for every invocation — writing straight into `work` would make one band overwrite
+    another's pages. That renumber is also what makes sharding safe: output page numbers come
+    from the band's own `first`, not from gs's counter."""
+    if not dpis:
+        dpis = [base_dpi]
+    if shards <= 0:
+        shards = _claim_threads(_ocr_jobs_for(len(dpis)))
+        release = shards
+    else:
+        release = 0
+    try:
+        runs = _render_bands(dpis, shards)
+        if stats is not None:
+            stats['bands'] = len(runs)
+            stats['shards'] = min(shards, len(runs)) if runs else 0
+
+        def _one(n_band) -> bool:
+            n, (first, last, d) = n_band
+            sub = work / f'r{n:03d}'
+            sub.mkdir(exist_ok=True)
+            cmd = [GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={first}',
+                   f'-dLastPage={last}', '-dNOPAUSE', '-dBATCH', '-dQUIET', _GS_INTERPOLATE,
+                   '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src_p)]
             rr, tries = _run_retry(lambda: _run_stalled(
                 cmd, lambda: len(list(sub.glob('p*.png'))), timeout, text=True))
-        except subprocess.TimeoutExpired:
-            raise            # a STALL must surface as such, not as a generic failure
-        except Exception:
-            return False
-        if tries > 1 and on_retry:
-            on_retry(tries - 1)
-        if rr is None or rr.returncode != 0:
-            return False
-        for k, f in enumerate(sorted(sub.glob('p*.png'))):   # renumber to global index
-            f.replace(work / f'p{first + k:04d}.png')
-        shutil.rmtree(sub, ignore_errors=True)
-    return True
+            if tries > 1 and on_retry:
+                on_retry(tries - 1)
+            if rr is None or rr.returncode != 0:
+                return False
+            for k, f in enumerate(sorted(sub.glob('p*.png'))):   # renumber to global index
+                f.replace(work / f'p{first + k:04d}.png')
+            shutil.rmtree(sub, ignore_errors=True)
+            return True
+
+        if len(runs) == 1 or shards <= 1:
+            try:
+                return _one((0, runs[0])) if runs else True
+            except subprocess.TimeoutExpired:
+                raise        # a STALL must surface as such, not as a generic failure
+            except Exception:
+                return False
+        # Concurrent bands. A stall in ANY band must still surface as TimeoutExpired rather
+        # than a generic failure, so the caller keeps treating stalls and crashes differently.
+        stalled, failed = [], False
+        with cf.ThreadPoolExecutor(max_workers=min(shards, len(runs))) as tp:
+            futs = [tp.submit(_one, nb) for nb in enumerate(runs)]
+            for fut in futs:
+                try:
+                    if not fut.result():
+                        failed = True
+                except subprocess.TimeoutExpired as ex:
+                    stalled.append(ex)
+                except Exception:
+                    failed = True
+        if stalled:
+            raise stalled[0]
+        return not failed
+    finally:
+        _release_threads(release)
 
 
 def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
@@ -969,7 +1220,7 @@ def _page_count(p: Path) -> int:
 
 
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
-                timeout: int = 0, preserve_images: bool = False) -> tuple:
+                timeout: int = 0, preserve_images: bool = False, pages: int = 0) -> tuple:
     """Run OCR on the SOURCE at full resolution and return (ocr'd_pdf, language, note).
 
     OCR must read the ORIGINAL, never our own output: every compression we apply is
@@ -1004,15 +1255,22 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     else:
         mode = '--force-ocr'                  # images will be replaced by compressed ones
     out = work / 'src_ocr.pdf'
-    r, tries = _run_retry(lambda: subprocess.run(
-        OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
-                    mode, '--quiet', '--jobs', str(OCR_JOBS), str(src_p), str(out)],
-        capture_output=True, text=True))
+    # Budget from THIS file's page count, held for the whole call. `--jobs` cannot be changed
+    # on a running process, so a number sampled from queue state here is frozen for however
+    # long the file takes — hours, on the manuals that need the threads most.
+    with _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
+        r, tries = _run_retry(lambda: subprocess.run(
+            OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
+                        mode, '--quiet', '--jobs', str(jobs), str(src_p), str(out)],
+            capture_output=True, text=True))
     note = f' (lang:{language}'
     # the MODE, not a claim about the outcome: --redo-ocr is chosen to protect the images,
     # and it runs on files that have no text layer to redo at all. Whether this was a first
     # OCR or a replacement is reported by the `ocr` column, which reads the source.
     note += f', mode {mode}' if mode == '--redo-ocr' else ''
+    # Only worth saying when it is not the saturated-pool default: it is how you confirm the
+    # tail of a run actually got the idle cores, from the report alone.
+    note += f', jobs {jobs}' if jobs > 1 else ''
     note += f', retried x{tries - 1}' if tries > 1 else ''
     note += ')'
     if r is not None and r.returncode == 0 and out.exists() and out.stat().st_size > 0:
@@ -1037,7 +1295,71 @@ def _xobjects(resources):
         return {}
 
 
-def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
+_BT_ET = re.compile(rb'(?<![A-Za-z0-9])BT(?![A-Za-z0-9]).*?(?<![A-Za-z0-9])ET(?![A-Za-z0-9])',
+                    re.S)
+
+
+def _pdf_strings(data: bytes) -> list:
+    """Every literal string in a content-stream fragment: `(…)` with balanced nesting and
+    backslash escapes, plus `<hex>`. Hand-scanned rather than regex'd because a PDF string
+    may contain unescaped balanced parens, which no regex handles.
+
+    Byte-level on purpose: matching a stamp does not need a font's ToUnicode map, and a CID
+    font's glyph bytes simply will not match, which is the safe direction — see
+    `_block_draws_only`."""
+    out, i, n = [], 0, len(data)
+    while i < n:
+        c = data[i:i + 1]
+        if c == b'(':
+            depth, j, buf = 1, i + 1, bytearray()
+            while j < n:
+                ch = data[j:j + 1]
+                if ch == b'\\':
+                    buf += data[j + 1:j + 2]
+                    j += 2
+                    continue
+                if ch == b'(':
+                    depth += 1
+                elif ch == b')':
+                    depth -= 1
+                    if not depth:
+                        break
+                buf += ch
+                j += 1
+            out.append(bytes(buf))
+            i = j + 1
+        elif c == b'<' and data[i + 1:i + 2] != b'<':
+            j = data.find(b'>', i)
+            if j < 0:
+                break
+            try:
+                out.append(bytes.fromhex(re.sub(rb'\s', b'', data[i + 1:j]).decode('ascii')))
+            except Exception:
+                out.append(b'')
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _block_draws_only(block: bytes, boiler) -> bool:
+    """True when every string this BT…ET block draws is boilerplate — a stamp, not content.
+
+    Anything that cannot be read as one of the boilerplate lines counts as real text: a CID
+    or Identity-H font's bytes will not match, so such a stamp is simply not discounted and
+    today's behaviour cannot regress. Failing towards 'this is real' is the only safe
+    direction here, because the caller's next move is to allow rasterising the page."""
+    if not boiler:
+        return False
+    strs = _pdf_strings(block)
+    if not strs:
+        return False
+    line = _norm_line(''.join(s.decode('latin1', 'replace') for s in strs))
+    return bool(line) and line in boiler
+
+
+def _stream_visible_text(data: bytes, resources, depth: int = 0,
+                         boiler=frozenset()) -> bool:
     """Is any VISIBLE text drawn by this content stream, or by a Form XObject it paints
     on top of its own imagery?
 
@@ -1045,7 +1367,14 @@ def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
     down. Producers routinely wrap an entire page in a single Form XObject — measured on
     two Subaru manuals (iText) whose page stream is 27 bytes, `q /Xf1 Do Q`, with all 42
     text ops and every raster nested inside `/Xf1`. Looking only at the page stream saw no
-    text at all and let real publisher type be rasterised and re-OCR'd."""
+    text at all and let real publisher type be rasterised and re-OCR'd.
+
+    With `boiler`, a show op inside a BT…ET block that draws NOTHING but repeated
+    boilerplate does not count. Without that, a stamp longer than the caller's min_chars
+    makes a scanned page read as a real-text page — which routes a whole scanned manual to
+    'born digital' and skips it entirely, and makes `classify_page` return PT_VECTOR so the
+    page is dropped from the OCR render. Both are the same bug as the one in `has_text`,
+    one floor up."""
     if not data:
         return False
     xo = _xobjects(resources)
@@ -1066,6 +1395,8 @@ def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
         elif name in forms:
             form_calls.append((m.start(), name))
     modes = [(m.start(), int(m.group(1))) for m in _TR_MODE.finditer(data)]
+    # Blocks are needed only to discount a stamp, so they are not parsed without one.
+    blocks = [(m.start(), m.end(), m.group(0)) for m in _BT_ET.finditer(data)] if boiler else []
     for show in _TEXT_SHOW.finditer(data):
         if show.start() < last_img:
             continue                          # covered by the scan painted over it
@@ -1075,8 +1406,12 @@ def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
                 mode = md
             else:
                 break
-        if mode != 3:                         # mode 3 = invisible OCR layer
-            return True
+        if mode == 3:                         # mode 3 = invisible OCR layer
+            continue
+        if any(a <= show.start() < b and _block_draws_only(blk, boiler)
+               for a, b, blk in blocks):
+            continue                          # a stamp, not the page's own text
+        return True
     if depth >= _FORM_MAX_DEPTH:
         return False
     # Only recurse once this stream itself yielded nothing: the common (unwrapped) page
@@ -1093,14 +1428,14 @@ def _stream_visible_text(data: bytes, resources, depth: int = 0) -> bool:
         # A Form without its own /Resources inherits the parent's, or nested names
         # (images, further forms) would not resolve.
         sub_res = form.get('/Resources') or resources
-        if _stream_visible_text(sub_data, sub_res, depth + 1):
+        if _stream_visible_text(sub_data, sub_res, depth + 1, boiler):
             return True
     return False
 
 
-def _visible_text_chars(page, min_chars: int = 100) -> int:
+def _visible_text_chars(page, min_chars: int = 100, boiler=frozenset()) -> int:
     """Characters of REAL (visible) text on the page — 0 if its only text is an
-    invisible OCR layer.
+    invisible OCR layer, or a repeated stamp.
 
     This is the line between text we may destroy and text we may not. An OCR layer is
     drawn in text-render mode 3 (invisible): rasterising the page loses nothing we
@@ -1112,7 +1447,13 @@ def _visible_text_chars(page, min_chars: int = 100) -> int:
 
     The visibility test runs over the page stream AND any Form XObject it draws (see
     `_stream_visible_text`); `extract_text()` already recurses, so the `min_chars` floor
-    keeps a bare page number inside a wrapper from vetoing compression."""
+    keeps a bare page number inside a wrapper from vetoing compression.
+
+    `boiler` discounts a repeated stamp on BOTH counts — the visibility test ignores a
+    BT…ET block that draws only boilerplate, and the returned character count is net of
+    those lines. Neither alone is enough: this function is a visibility GATE followed by a
+    RAW count, so one visible stamp word used to make an entire invisible OCR layer count
+    as visible publisher text."""
     try:
         data = page.get_contents().get_data()
     except Exception:
@@ -1125,10 +1466,10 @@ def _visible_text_chars(page, min_chars: int = 100) -> int:
         res = None
     if res is None:
         res = page.get('/Resources')
-    if not _stream_visible_text(data, res):
+    if not _stream_visible_text(data, res, 0, boiler):
         return 0
     try:
-        n = len((page.extract_text() or '').strip())
+        n = len(_minus_boilerplate((page.extract_text() or '').strip(), boiler).strip())
     except Exception:
         return 0
     return n if n >= min_chars else 0
@@ -1255,6 +1596,146 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
         raise GraftFailed(repr(ex)) from ex
 
 
+# ── Stamped boilerplate (paywall watermarks) ─────────────────────────────────
+#
+# A TEXT LAYER says something different on every page. A STAMP says the same thing on all of
+# them. That is the whole discriminator, it needs no watermark-specific knowledge, and it is
+# what the OCR decision should have been measuring all along.
+#
+# Measured on Supplement_A.pdf (Mitsubishi Carisma 1996-2000 supplement, 21,273,852 bytes,
+# 256 pages), where every page carries exactly 66 chars and nothing else:
+#     "www.WorkshopManuals.co.uk\nPurchased from www.WorkshopManuals.co.uk"
+# 66 >= has_text's min_chars of 40 on all 8 sampled pages, so has_text said the file was
+# already searchable, `_ship_original` returned OCR_KEPT, and ocrmypdf was never run.
+# `looks_born_digital` got the same file RIGHT (66 < its own min_chars of 100 -> scan_frac
+# 1.0, text_pages 0) and lost the argument, because `_ship_original` does not ask it.
+#
+# The cost of that disagreement is the whole point: the file's images are already
+# /CCITTFaxDecode G4 at 595.7 dpi, so the sample projects 103% of original and it cannot be
+# compressed at all. A text layer was the ONLY thing this tool had to offer it, and that is
+# precisely what it silently withheld.
+
+_BOILER_COVERED = 0.9      # a line must be on ~every sampled page. Not 1.0: one blank or
+                           # unreadable page must not be able to hide a stamp.
+_BOILER_MIN_PAGES = 3      # two pages that say the same thing is a coincidence, not a repeat
+_BOILER_MAX_LINES = 4      # a stamp is a line or two (measured: 2 lines, 66 chars). Twenty
+_BOILER_MAX_CHARS = 400    # identical lines is a form template, and a template is content.
+
+_WS = re.compile(r'\s+')
+
+
+def _norm_line(s: str) -> str:
+    """A line reduced to what a repeat test may compare: casefolded, inner whitespace
+    collapsed, ends stripped. Case and spacing are what a stamping tool varies between
+    pages — the measured stamp draws its two lines at 25pt and 12pt from different Tm."""
+    return _WS.sub(' ', s).strip().casefold()
+
+
+def _boilerplate_lines(texts: dict) -> frozenset:
+    """The normalised lines that appear on (nearly) EVERY page with text — a stamp.
+
+    Deliberately narrow, because everything downstream treats these lines as worthless:
+      * needs `_BOILER_MIN_PAGES` pages carrying text — a 2-page file cannot show a repeat;
+      * a line must be on `_BOILER_COVERED` of them, not all of them, so one blank or
+        unreadable page cannot hide the stamp;
+      * at most `_BOILER_MAX_LINES` lines totalling `_BOILER_MAX_CHARS` chars, because a
+        stamp is short. A page of twenty identical lines is a form template, and a template
+        is the document's content, not an overlay on it.
+
+    A page that repeats ONE line and says something different on the rest is a running
+    header: the line is boilerplate, the page still has a text layer, and `has_text` still
+    says so because the body survives `_minus_boilerplate`."""
+    with_text = [t for t in texts.values() if t and t.strip()]
+    if len(with_text) < _BOILER_MIN_PAGES:
+        return frozenset()
+    counts = Counter()
+    for t in with_text:
+        counts.update({ln for ln in (_norm_line(x) for x in t.splitlines()) if ln})
+    need = _BOILER_COVERED * len(with_text)
+    lines = frozenset(ln for ln, n in counts.items() if n >= need)
+    if not lines or len(lines) > _BOILER_MAX_LINES or \
+            sum(len(ln) for ln in lines) > _BOILER_MAX_CHARS:
+        return frozenset()
+    return lines
+
+
+def _minus_boilerplate(text: str, boiler) -> str:
+    """`text` with its boilerplate lines dropped. Line-wise, so a page that shares one LINE
+    with a stamp loses only that line and keeps everything else."""
+    if not boiler or not text:
+        return text or ''
+    return '\n'.join(ln for ln in text.splitlines() if _norm_line(ln) not in boiler)
+
+
+class TextSample(NamedTuple):
+    """Everything the text/scan gates need from one file, read ONCE.
+
+    `has_text`, `has_any_text` and `looks_born_digital` each opened the PDF and sampled the
+    same 8 pages independently — four opens and up to 32 extract_text() calls per file for
+    three answers about the same pages — and the boilerplate set has to be computed across
+    those pages anyway. Sharing it makes the discount free rather than a fourth pass.
+
+    Per sampled page index: `text` is the RAW extract_text(), `net` the length of that text
+    with the boilerplate lines removed, `dpi` is `_largest_image_dpi`. Callers apply their
+    OWN min_chars floor to `net`, so has_text's 40 and looks_born_digital's 100 stay
+    independent, exactly as they are today."""
+    pages: int          # total pages in the file, not in the sample
+    idxs: tuple         # 0-based page indexes actually read
+    text: dict          # {idx: str}
+    net: dict           # {idx: int}
+    dpi: dict           # {idx: float}
+    boiler: frozenset   # normalised lines (nearly) every sampled page repeats
+    err: str            # '' or why the sample is empty/partial
+
+
+@functools.lru_cache(maxsize=8)
+def _text_sample_cached(path: str, size: int, mtime_ns: int, sample: int) -> TextSample:
+    """See `_text_sample`. Keyed on size+mtime as well as the path, so a file rewritten
+    under the same name (a repair, a graft) can never be served a stale answer. Only ints,
+    floats, strings and frozensets are retained — no pypdf reader stays alive."""
+    text, net, dpi = {}, {}, {}
+    try:
+        r = PdfReader(path)
+        n = len(r.pages)
+    except Exception as ex:
+        return TextSample(0, (), {}, {}, {}, frozenset(), f'unreadable ({ex})')
+    if n == 0:
+        return TextSample(0, (), {}, {}, {}, frozenset(), 'no pages')
+    k = min(sample, n)
+    idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
+    read = []
+    for i in idxs:
+        try:
+            page = r.pages[i]
+        except Exception:
+            continue
+        read.append(i)
+        try:
+            text[i] = (page.extract_text() or '').strip()
+        except Exception:
+            text[i] = ''
+        try:
+            dpi[i] = _largest_image_dpi(page)
+        except Exception:
+            dpi[i] = 0.0
+    boiler = _boilerplate_lines(text)
+    for i in read:
+        net[i] = len(_minus_boilerplate(text[i], boiler).strip())
+    return TextSample(n, tuple(read), text, net, dpi, boiler,
+                      '' if read else 'no readable pages')
+
+
+def _text_sample(pdf: Path, sample: int = 8) -> TextSample:
+    """Sample `sample` evenly-spaced pages and answer every text question about them at
+    once, cached per (path, size, mtime)."""
+    p = str(pdf)
+    try:
+        st = os.stat(p)
+        return _text_sample_cached(p, st.st_size, st.st_mtime_ns, sample)
+    except OSError as ex:
+        return TextSample(0, (), {}, {}, {}, frozenset(), f'unreadable ({ex})')
+
+
 def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
              covered: float = 0.8) -> bool:
     """True if the PDF ALREADY has a text layer on (essentially) every page, i.e. OCR
@@ -1264,24 +1745,18 @@ def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
     (a vector TOC/nav page plus scanned content) one text-rich page would blow past a
     global threshold and suppress OCR for every scanned page, leaving the actual content
     unsearchable. Requiring most pages to carry text means a partly-scanned file still
-    goes to ocrmypdf, whose --skip-text adds a layer only to the pages missing one."""
-    try:
-        r = PdfReader(str(pdf))
-        n = len(r.pages)
-        if n == 0:
-            return False
-        k = min(sample, n)
-        idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
-        with_text = 0
-        for i in idxs:
-            try:
-                if len((r.pages[i].extract_text() or '').strip()) >= min_chars:
-                    with_text += 1
-            except Exception:
-                pass
-        return with_text >= covered * len(idxs)
-    except Exception:
+    goes to ocrmypdf, whose --skip-text adds a layer only to the pages missing one.
+
+    Chars are counted with the file's own repeated boilerplate DISCOUNTED. Counting raw
+    extract_text() called a 256-page Carisma supplement searchable on the strength of 66
+    chars of "www.WorkshopManuals.co.uk" per page — a paywall stamp, not a text layer — so
+    it shipped with no text layer at all, because this function said it needed none. See
+    the section comment above `_boilerplate_lines`."""
+    ts = _text_sample(pdf, sample)
+    if not ts.idxs:
         return False
+    with_text = sum(1 for i in ts.idxs if ts.net[i] >= min_chars)
+    return with_text >= covered * len(ts.idxs)
 
 
 def has_any_text(pdf: Path) -> bool:
@@ -1292,7 +1767,10 @@ def has_any_text(pdf: Path) -> bool:
     add nothing"). This one separates a file that has never been OCR'd from one whose
     existing layer we are about to REPLACE, which is the distinction the report's `ocr`
     column has to make: those are 'new ocr' and 're-ocr', and they are not the same
-    event to a reviewer deciding whether a manual was touched."""
+    event to a reviewer deciding whether a manual was touched.
+
+    Inherits the boilerplate discount, so a stamped-but-unOCR'd file reports 'new ocr'
+    rather than claiming there was a layer to redo."""
     return has_text(pdf, covered=0.01)
 
 
@@ -1389,47 +1867,50 @@ def looks_born_digital(src_p: Path, scan_fraction: float = 0.5,
     off those would declare a genuinely scanned archive born-digital and skip it entirely.
     An all-raster 'image PDF' (images exported to PDF, no text) still reads as scanned and
     is compressed.
+
+    Repeated boilerplate is discounted the same way an invisible layer is, and for the same
+    reason: a stamp longer than `min_chars` would make every scanned page read as a text
+    page, drop `scan_frac` below the threshold, and skip a whole scanned manual. That is a
+    worse outcome than the `has_text` bug this discount was written for, because it skips
+    the file entirely rather than just its OCR.
     Returns (is_born_digital, signals_dict) — signals go to the run log for review."""
     sig = {'sampled': 0, 'scan_pages': 0, 'text_pages': 0, 'scan_frac': 0.0, 'chars': 0}
+    ts = _text_sample(src_p, sample)
+    if ts.err and not ts.idxs:
+        sig['error'] = ts.err
+        return False, sig                      # let the normal path try (and error-report) it
     try:
         r = PdfReader(str(src_p))
-        n = len(r.pages)
     except Exception as ex:
         sig['error'] = f'unreadable ({ex})'
-        return False, sig                      # let the normal path try (and error-report) it
-    if n == 0:
-        sig['error'] = 'no pages'
         return False, sig
-    k = min(sample, n)
-    idxs = sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
     scan = text = readable = 0
-    for i in idxs:
+    for i in ts.idxs:
         try:
             page = r.pages[i]
         except Exception:
             continue
         readable += 1
-        try:
-            nchars = len((page.extract_text() or '').strip())
-        except Exception:
-            nchars = 0
+        nchars = len(ts.text.get(i, ''))
         sig['chars'] += nchars
         # Real visible text wins over the presence of a big image: a page can legitimately
         # be both (publisher type plus a photo figure), and rasterising it would destroy
-        # the type. `_visible_text_chars` discounts an invisible OCR layer, so a true scan
-        # is unaffected and still counts as a scan page.
-        visible = _visible_text_chars(page, min_chars)
+        # the type. `_visible_text_chars` discounts an invisible OCR layer and a repeated
+        # stamp, so a true scan is unaffected and still counts as a scan page.
+        visible = _visible_text_chars(page, min_chars, ts.boiler)
         if visible >= min_chars:
             text += 1
-        elif _largest_image_dpi(page) >= dpi_floor:
+        elif ts.dpi.get(i, 0.0) >= dpi_floor:
             scan += 1
-        elif nchars >= min_chars:
+        elif ts.net.get(i, 0) >= min_chars:
             text += 1
     if readable == 0:
         sig['error'] = 'no readable pages'
         return False, sig
     frac = scan / readable
     sig.update(sampled=readable, scan_pages=scan, text_pages=text, scan_frac=round(frac, 3))
+    if ts.boiler:
+        sig['boiler'] = sorted(ts.boiler)
     return frac < scan_fraction, sig
 
 
@@ -2207,11 +2688,17 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             # silent for ~90% of a run), so any wall-clock bound would just kill healthy
             # work on big files — which is exactly how a 6,855-page manual "failed" while
             # OCR'ing correctly. A crash is retried; slowness is simply waited out.
-            r, tries = _run_retry(lambda: subprocess.run(
-                OCRMYPDF + ['--language', language, '--optimize', '0',
-                            '--output-type', 'pdf', '--skip-text', '--quiet',
-                            '--jobs', str(OCR_JOBS),
-                            str(base), str(ocr_pdf)], capture_output=True, text=True))
+            with _threads(_ocr_jobs_budget(base, pages)) as ocr_jobs:
+                r, tries = _run_retry(lambda: subprocess.run(
+                    OCRMYPDF + ['--language', language, '--optimize', '0',
+                                '--output-type', 'pdf', '--skip-text', '--quiet',
+                                '--jobs', str(ocr_jobs),
+                                str(base), str(ocr_pdf)], capture_output=True, text=True))
+            # Only worth saying when it is not the saturated-pool default: with it, the report
+            # alone proves a big file actually got the threads. This path used to record
+            # nothing, so its budget was invisible.
+            if ocr_jobs > 1:
+                note += f' (jobs {ocr_jobs})'
             if r is not None and r.returncode == 0 and ocr_pdf.exists() and ocr_pdf.stat().st_size > 0:
                 final = ocr_pdf
                 ocr_added = True
@@ -2266,7 +2753,8 @@ def _reader_page(pdf: Path, page_no: int):
 def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
                       min_size: int, photo_thresh: float, photo_dpi: int, jpeg_quality: int,
                       sauvola_k: float = 0.30,
-                      photo_descreen: float = 0.6, k: int = 10) -> float:
+                      photo_descreen: float = 0.6, k: int = 10,
+                      boiler=frozenset()) -> float:
     """Estimate the whole-file compressed/original ratio by running the per-page
     pipeline on k evenly-spaced SAMPLE pages only (cheap 'will this compress?'
     pre-check). Returns projected ratio; ~0 if unreadable (-> just try compressing).
@@ -2295,7 +2783,11 @@ def sample_projection(src_p: Path, work: Path, dpi: int, despeckle: bool,
         if not png.exists():
             continue
         got += 1
-        pc = classify_page(png, p, src_p, sub, dpi, True, photo_thresh, photo_dpi)
+        # `boiler` for the same reason the real run gets it: a stamp long enough to read as
+        # visible text makes every page PT_VECTOR here, so the projection charges each page
+        # its ORIGINAL size, lands near 100%, and skips a file that would have compressed.
+        pc = classify_page(png, p, src_p, sub, dpi, True, photo_thresh, photo_dpi,
+                           boiler=boiler)
         if pc.type in _PT_BITONAL:
             binarize_png(png, min_size, despeckle, pd, sauvola_k)
             r = subprocess.run([JBIG, '-p', '-a', '-D', str(pd), png.name], cwd=sub, capture_output=True)
@@ -2377,7 +2869,8 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
     had_text = has_any_text(base)
     ocred, language, onote = _ocr_source(base, work, language,
                                          has_vector=_has_vector_pages(base),
-                                         timeout=timeout, preserve_images=True)
+                                         timeout=timeout, preserve_images=True,
+                                         pages=src_pages)
     note += onote
     if not ocred:
         return base, language, note, OCR_FAILED, None
@@ -2483,6 +2976,16 @@ def _compress_one(src: str, dest: str, dpi: int,
                     # exactly — and one it never had is not created (this path runs no OCR).
                     'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
                     'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})' + rnote}
+        # A stamp is worth saying out loud on the rows it changes: without this, a file whose
+        # `ocr` column flipped from 'kept existing' to 'new ocr' gives a reviewer no reason
+        # why. `signals` is attached ONLY when there is a stamp, so every other row in a
+        # normal archive keeps the empty `scan signals` cell it has today.
+        bnote, bsignals = '', {}
+        if bsig.get('boiler'):
+            nchars = sum(len(x) for x in bsig['boiler'])
+            bnote = (f' ({nchars} chars of boilerplate repeated on every page discounted '
+                     f'— a stamp, not a text layer)')
+            bsignals = {'signals': bsig}
         note0 = ''
         skip_reason = ''
         floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
@@ -2502,7 +3005,8 @@ def _compress_one(src: str, dest: str, dpi: int,
         elif src_pages >= PRECHECK_MIN_PAGES:
             proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                      photo_thresh, photo_dpi, jpeg_quality,
-                                     sauvola_k, photo_descreen)
+                                     sauvola_k, photo_descreen,
+                                     boiler=frozenset(bsig.get('boiler') or ()))
             if proj >= PRECHECK_SKIP_RATIO:
                 skip_reason = REASON_ALREADY
                 note0 = f' (compression skipped: sample projected {proj*100:.0f}% of original)'
@@ -2513,11 +3017,12 @@ def _compress_one(src: str, dest: str, dpi: int,
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                                  src_pages or len(PdfReader(str(base)).pages), True,
-                                 note0 + snote, timeout, in_place,
+                                 note0 + bnote + snote, timeout, in_place,
                                  already_ocred=_ocr_layer_added(ocr_state),
                                  ocr_state=ocr_state)
             res['action'] = 'kept_original'
             res['reason'] = skip_reason
+            res.update(bsignals)
             return res
         # 1) RENDER ONCE — in colour, at each page's own source resolution. Every check
         #    below reads this one render, so nothing is judged on a degraded image and no
@@ -2528,10 +3033,13 @@ def _compress_one(src: str, dest: str, dpi: int,
         repair_stats = {}      # what the repair resolved/dropped, for the per-file note
         n_retry = [0]          # transient external-tool crashes that a retry recovered
 
+        render_stats = {}
+
         def _render():
             dpis = _page_render_dpis(render_src, dpi)
             return _render_all(render_src, work, dpis, dpi, timeout,
-                               on_retry=lambda n: n_retry.__setitem__(0, n_retry[0] + n))
+                               on_retry=lambda n: n_retry.__setitem__(0, n_retry[0] + n),
+                               stats=render_stats)
 
         ok = _render()
         pngs = sorted(p.name for p in work.glob('p*.png'))
@@ -2590,7 +3098,8 @@ def _compress_one(src: str, dest: str, dpi: int,
             except Exception:
                 return None
         classes = [classify_page(work / n, k + 1, render_src, work, dpi,
-                                 True, photo_thresh, photo_dpi, page=_page_at(k))
+                                 True, photo_thresh, photo_dpi, page=_page_at(k),
+                                 boiler=frozenset(bsig.get('boiler') or ()))
                    for k, n in enumerate(pngs)]
         n_color_line = sum(c.type == PT_COLOR_LINE for c in classes)
         n_vector = sum(c.type == PT_VECTOR for c in classes)
@@ -2679,7 +3188,8 @@ def _compress_one(src: str, dest: str, dpi: int,
             # carries no text: every page gets OCR'd, and ocrmypdf has nothing to
             # rasterise a second time.
             ocr_src, language, ocr_note = _ocr_source(
-                ocr_input, work, language, has_vector=True, timeout=timeout)
+                ocr_input, work, language, has_vector=True, timeout=timeout,
+                pages=src_pages)
             ocr_state = (OCR_FAILED if ocr_src is None
                          else OCR_REDO if src_had_text else OCR_NEW)
 
@@ -2741,10 +3251,16 @@ def _compress_one(src: str, dest: str, dpi: int,
         if not kept_original and not grafted:
             note += (f' (rebuilt — graft failed: {graft_err} — links/bookmarks not carried over)'
                      if graft_err else ' (rebuilt — links/bookmarks not carried over)')
+        # Only when it is not the single-call default, so the report proves a big manual really
+        # did render on more than one core instead of leaving the box idle.
+        if render_stats.get('shards', 0) > 1:
+            note += (f' (rendered {render_stats["bands"]} bands x'
+                     f'{render_stats["shards"]} concurrent)')
         if n_retry[0]:
             note += f' (render retried x{n_retry[0]})'
         if did_repair:
             note += _repair_note(repair_stats)
+        note += bnote
         note += ocr_note
         # OCR already ran on the source above and its layer was grafted on, so the place
         # step must NOT re-run it against our compressed images.
@@ -2760,6 +3276,7 @@ def _compress_one(src: str, dest: str, dpi: int,
         # Machine-readable page-type tally. The note says the same thing in English, but
         # prose is not something a downstream index can group on without regex-guessing.
         res['types'] = dict(Counter(c.type for c in classes))
+        res.update(bsignals)
         return res
     except subprocess.TimeoutExpired as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0,
@@ -2873,6 +3390,13 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
         ocr_state, language = _predict_ocr(src_p, work, ocr, language)
         rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
+        # Same note and same signals the real run reports, so the preview row explains the
+        # `ocr` prediction rather than leaving a reviewer to wonder why it changed.
+        bnote = ''
+        if bsig.get('boiler'):
+            bnote = (f' ({sum(len(x) for x in bsig["boiler"])} chars of boilerplate repeated '
+                     f'on every page discounted — a stamp, not a text layer)')
+            rep['signals'] = bsig
         # The size floor, before the sample projection — same order as the real run, and
         # the reason a dry run over a folder of small PDFs is now nearly free.
         floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
@@ -2881,10 +3405,11 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     'kept': True, 'err': None, 'action': 'kept_original',
                     'reason': REASON_SMALL, **rep,
                     'note': f' (would skip compression: {mb(orig):.2f} MB is under the '
-                            f'{mb(floor):.0f} MB floor — OCR only)'}
+                            f'{mb(floor):.0f} MB floor — OCR only)' + bnote}
         proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
-                                 sauvola_k, photo_descreen)
+                                 sauvola_k, photo_descreen,
+                                 boiler=frozenset(bsig.get('boiler') or ()))
         est_new = int(proj * orig)
         if proj >= PRECHECK_SKIP_RATIO:
             action, reason = 'kept_original', REASON_ALREADY
@@ -2897,9 +3422,12 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
         else:
             action, reason = 'compressed', REASON_COMPRESSIBLE
             note = f' (projected {proj*100:.0f}% of original)'
+        psig = {'scan_frac': round(proj, 3)}
+        if bsig.get('boiler'):
+            psig['boiler'] = bsig['boiler']
         return {'src': src_p.name, 'orig': orig, 'new': est_new, 'pages': None,
-                'kept': action != 'compressed', 'err': None, 'action': action, 'note': note,
-                'reason': reason, **rep, 'signals': {'scan_frac': round(proj, 3)}}
+                'kept': action != 'compressed', 'err': None, 'action': action,
+                'note': note + bnote, 'reason': reason, **rep, 'signals': psig}
     except Exception as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': repr(ex)}
     finally:
@@ -2970,9 +3498,13 @@ def _flag_duplicates(results: list) -> int:
     for members in groups.values():
         if len(members) > 1:
             sets += 1
-            rels = sorted(m['rel'] for m in members)
+            # full paths, to match the `file` column — a twin named only by its relative path
+            # is not something you can go and look at
+            def name(m):
+                return m.get('path') or m.get('rel', '')
+            names = sorted(name(m) for m in members)
             for m in members:
-                others = [x for x in rels if x != m['rel']]
+                others = [x for x in names if x != name(m)]
                 m['duplicate_of'] = '; '.join(others)
                 m['note'] = (m.get('note') or '') + \
                     f' [DUPLICATE — same content as: {", ".join(others)}]'
@@ -3021,6 +3553,10 @@ def _csv_row(fields: list) -> str:
 # file kept because it was born-digital from one kept because it was already compressed
 # or too small — so a reviewer had to read the prose `note` of every row to find out.
 # Each of the four takes values from a fixed vocabulary, so they sort, filter and pivot.
+# `file` carries the FULL path, not a path relative to the source root. The prose report used
+# to record `Source: <root>` in its header, so a relative path had an anchor; with the report
+# being this table alone, a relative path cannot say which tree it came from — and reports get
+# read days later, side by side, from a folder that is not the archive.
 REPORT_COLUMNS = ['file', 'action', 'reason', 'ocr', 'language',
                   'orig size (MB)', 'new size (MB)', '%',
                   'duplicate of', 'page types', 'scan signals',
@@ -3049,6 +3585,12 @@ def _signals_text(sg) -> str:
     for k in ('text_pages', 'chars'):
         if sg.get(k) is not None:
             out.append(f'{k}={sg[k]}')
+    if sg.get('boiler'):
+        # The stamp that made this file's `ocr` column read 'kept existing' when it had no
+        # text layer at all. Reported as its shape, not its wording: `chars` above is the
+        # raw count, so 2ln/66c against chars=528 over 8 pages says the whole of it.
+        b = sg['boiler']
+        out.append(f'boiler={len(b)}ln/{sum(len(x) for x in b)}c')
     if sg.get('error'):
         out.append(f'[{sg["error"]}]')
     return ' '.join(out)
@@ -3059,7 +3601,7 @@ def _report_row(r: dict) -> list:
     err = r.get('err')
     o, n = r.get('orig') or 0, r.get('new') or 0
     pct = (n * 100 // o) if (not err and o) else ''
-    return [r.get('rel', ''), _action_label(r), _reason_label(r), _ocr_label(r),
+    return [r.get('path') or r.get('rel', ''), _action_label(r), _reason_label(r), _ocr_label(r),
             r.get('lang', '') if not err else '',
             f'{o / 1048576:.2f}' if o else '0.00',
             f'{n / 1048576:.2f}' if (not err and n) else '',
@@ -3101,7 +3643,7 @@ def write_run_csv(csv_path: Path, results: list, prescan_warns: list = None) -> 
                                                  'source, not tied to one file')
             row[REPORT_COLUMNS.index('warnings')] = _warns_text(prescan_warns)
             w.writerow(row)
-        for r in sorted(results, key=lambda x: x['rel'].lower()):
+        for r in sorted(results, key=lambda x: (x.get('path') or x.get('rel', '')).lower()):
             w.writerow(_report_row(r))
     return csv_path
 
@@ -3164,14 +3706,47 @@ def _file_hash(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def _read_failed_rels(csv_path: Path) -> list:
-    """Return the rel-paths marked FAILED (non-empty error column) in a report CSV."""
-    rels = []
+def _read_failed_files(csv_path: Path) -> list:
+    """Return the `file` values marked FAILED (non-empty error column) in a report CSV,
+    exactly as recorded. Current reports hold full paths; older ones hold paths relative to
+    the source root, and `_retry_jobs` handles both."""
+    out = []
     with open(csv_path, newline='', encoding='utf-8') as f:
         for row in csv.DictReader(f):
             if (row.get('error') or '').strip():
-                rels.append(row['file'])
-    return rels
+                out.append(row['file'])
+    return out
+
+
+def _retry_jobs(entries, src_root: Path, dest_root: Path, in_place: bool) -> tuple:
+    """(jobs, missing, foreign) for --retry-failed: map each recorded `file` back to a
+    (src, dest) pair.
+
+    The absolute case has to be handled explicitly, NOT left to pathlib: `dest_root / p` with
+    an absolute `p` discards dest_root and yields `p` itself, so a non-in-place retry would
+    have quietly written its output ON TOP of the source it was reading. The dest must always
+    be derived from the path RELATIVE to the source root, whichever form the report used.
+
+    `foreign` is the entries that lie outside `src_root` — a report from another tree, or the
+    right report pointed at the wrong `src`. Those are returned rather than resolved, because
+    guessing which tree was meant is how you compress the wrong archive."""
+    jobs, missing, foreign = [], [], []
+    for entry in entries:
+        p = Path(entry)
+        if p.is_absolute():
+            try:
+                rel = p.relative_to(src_root)
+            except ValueError:
+                foreign.append(entry)
+                continue
+            src = p
+        else:
+            rel, src = Path(entry), src_root / entry
+        if not src.is_file():
+            missing.append(entry)
+            continue
+        jobs.append((str(src), str(src if in_place else dest_root / rel)))
+    return jobs, missing, foreign
 
 
 # ── Batch driver ─────────────────────────────────────────────────────────────
@@ -3362,12 +3937,20 @@ def main():
         if not args.retry_failed.exists():
             print(f'ERROR: --retry-failed report not found: {args.retry_failed}',
                   file=sys.stderr); sys.exit(1)
-        want = sorted(set(_read_failed_rels(args.retry_failed)))
-        jobs = [(str(src_root / rel), str(dest_root / rel)) for rel in want
-                if (src_root / rel).exists()]
+        want = sorted(set(_read_failed_files(args.retry_failed)))
+        jobs, missing, foreign = _retry_jobs(want, src_root, dest_root, args.in_place)
         skipped = len(pdfs) - len(jobs)
-        print(f'Retry-failed mode: {len(jobs)} previously-FAILED file(s) '
+        print(f'Retry-failed mode: {len(jobs)} of {len(want)} previously-FAILED file(s) '
               f'from {args.retry_failed.name}')
+        if missing:
+            print(f'  ({len(missing)} no longer on disk, skipped: {missing[0]}'
+                  + (f' +{len(missing) - 1} more' if len(missing) > 1 else '') + ')')
+        if foreign:
+            # Loud, and never silently retried against this tree: the report names files that
+            # are not under `src`, which means one of the two arguments is the wrong one.
+            print(f'  WARNING: {len(foreign)} entry/entries are NOT under {src_root} and were '
+                  f'skipped — is this report from a different source tree?\n'
+                  f'           first: {foreign[0]}', file=sys.stderr)
     else:
         jobs = []
         for src in pdfs:
@@ -3378,6 +3961,15 @@ def main():
         skipped = len(pdfs) - len(jobs)
     if args.limit:
         jobs = jobs[:args.limit]
+    # BIGGEST FIRST. The long pole then starts at t=0 and the small files fill in around it,
+    # instead of a single huge manual surfacing at the end and running alone: measured on the
+    # 2026-07-31 Mazda run, one 2910-page file was 4h20m of a 4h53m batch, most of it after
+    # everything else had finished. Sorted by size with the path as tie-break, so the order is
+    # the same on every run over the same tree.
+    try:
+        jobs.sort(key=lambda sd: (-os.path.getsize(sd[0]), sd[0]))
+    except OSError:
+        pass       # a file vanishing mid-scan must not stop the run; order is only a heuristic
 
     print(f'Ghostscript : {GS}')
     print(f'jbig2enc    : {JBIG}')
@@ -3412,6 +4004,13 @@ def main():
     t0 = time.time()
     done = fail = kept = 0
     tot_orig = tot_new = 0
+    # total input bytes, for the byte-weighted ETA below (0 if none could be read, which the
+    # ETA treats as "fall back to counting files")
+    bytes_done = 0
+    try:
+        tot_bytes = sum(os.path.getsize(s) for s, _d in jobs)
+    except OSError:
+        tot_bytes = 0
     results = []  # accumulated for the run log
 
     # open the report CSV up front and flush a row per file, so progress is visible
@@ -3441,11 +4040,22 @@ def main():
     interrupted = False
     try:
         # Give each worker a share of the cores for OCR: with fewer files than workers the
-        # pool cannot use them, so hand the slack to ocrmypdf instead of idling.
-        _ocr_jobs = max(1, _default_workers() // max(1, min(args.workers, N)))
+        # pool cannot use them, so hand the slack to ocrmypdf instead of idling. `_ocr_jobs`
+        # is only the static fallback — the live budget is `_ocr_jobs_now()`, which divides
+        # the cores by the files actually IN FLIGHT. That number is the parent's to know, so
+        # it is published here and updated as the batch drains; without it the tail of a big
+        # run OCR'd on one core while the rest of the machine sat idle.
+        _cores = _default_workers()
+        _ocr_jobs = max(1, _cores // max(1, min(args.workers, N)))
+        _remaining = multiprocessing.Value('i', N)
+        # Threads already promised to running render/OCR steps. Per-file budgets are derived
+        # independently in each worker, so without a shared tally six of them could each claim
+        # the whole machine; `_claim_threads` clamps against this.
+        _tokens = multiprocessing.Value('i', 0)
         with cf.ProcessPoolExecutor(max_workers=args.workers,
                                     initializer=_init_worker,
-                                    initargs=(_ocr_jobs,)) as ex:
+                                    initargs=(_ocr_jobs, _cores, args.workers,
+                                              _remaining, _tokens)) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size,
@@ -3482,6 +4092,17 @@ def main():
                         orig = 0
                     res = {'src': Path(s).name, 'orig': orig, 'new': 0,
                            'err': f'worker died ({type(ex).__name__}): {str(ex)[:140]}'}
+                # `path` is what the report shows and what --retry-failed reads back: a report
+                # is read days later, next to other reports, and a bare relative path does not
+                # say WHICH tree it came from. `rel` stays for the dest mapping and the console.
+                # Publish how many are still outstanding BEFORE anything slow below (the
+                # whole-file hash), so a worker picking up the next file — or reaching OCR on
+                # one it already has — sees the batch draining as it actually drains.
+                try:
+                    _remaining.value = N - i
+                except Exception:
+                    pass
+                res['path'] = os.path.abspath(s)
                 res['rel'] = os.path.relpath(s, str(rel_base))
                 results.append(res)
                 dmark = ''
@@ -3497,7 +4118,19 @@ def main():
                         else:
                             seen_hash[res['hash']] = res['rel']
                 elapsed = time.time() - t0
-                eta = (N - i) * (elapsed / i) if i < N and elapsed > 0 else 0
+                # BYTE-weighted, not file-count-weighted. Cost per file spans four orders of
+                # magnitude here (0.06 MB to 405 MB), so averaging over files completed makes
+                # the estimate collapse as the many small ones fly past: measured on the
+                # 2026-07-31 run, "[ETA 1m]" was displayed for over two hours while a single
+                # 2910-page manual finished. Falls back to the file count if sizes are
+                # unusable, so an unreadable size can never remove the estimate entirely.
+                bytes_done += res.get('orig') or 0
+                if i < N and elapsed > 0 and bytes_done and tot_bytes > bytes_done:
+                    eta = (tot_bytes - bytes_done) * (elapsed / bytes_done)
+                elif i < N and elapsed > 0:
+                    eta = (N - i) * (elapsed / i)
+                else:
+                    eta = 0
                 eta_str = f'  [ETA {eta/60:.0f}m]' if eta >= 30 else ''
                 # A compact marker only: the warnings themselves go to the report (and to
                 # the console under --verbose). Printing them here is what made the old

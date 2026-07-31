@@ -5,6 +5,355 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (one huge manual was the whole run: 4h20m of 4h53m, at 12% CPU)
+
+A 405-file batch took **293 minutes**, of which a single 2910-page manual
+(`1st Gen Mazda3_Mazdaspeed3_Workshop_Manual.pdf`, 143 MB) was **~4h20m** — the other 404 files
+finished in about half an hour. Measured during that tail: **12% CPU (~1.4 of 12 logical
+cores)**, C: 99% idle, disk queue 0. Serial work, not I/O.
+
+Both per-file stages were single-threaded. `_render_all` issued **one** Ghostscript call
+(`-dFirstPage=1 -dLastPage=2910`, ~2h20m); `ocrmypdf` ran at `--jobs 1` for ~2h at 0.39 pages/s.
+
+The dynamic budget meant to prevent exactly this already existed and never fired.
+`_ocr_jobs_now()` divides cores by files in flight, but it is read **once**, immediately before
+launching a subprocess that then runs for hours: that OCR started while ~50 files were still
+queued, so `6 // 6` = 1, and `--jobs` cannot be changed on a running process. By the time one
+file was left it would have returned 6, but nothing re-consults it. The report proves it — the
+`jobs N` note is written only when N > 1 and no row carried it.
+
+The budget is now keyed on the **file's own cost**, not on queue state at an arbitrary instant:
+`_ocr_jobs_for(pages, size_bytes)` gives ≥800 pages the whole box, ≥200 half, ≥50 two, else one,
+capped at physical cores. Page count is a property of the input, so the same file gets the same
+budget on every run. `_ocr_jobs_budget` takes the **max** of that and `_ocr_jobs_now()`, keeping
+the old queue-drain rule alive as a floor. Page count comes from `_page_count`, which returns 0
+on sources that cannot be opened at all (measured: pypdf raises `AttributeError('NullObject')`
+on the 1990 RX7 section manuals) — so it falls back to bytes, then to the static hint. A
+thread-count guess must never be the thing that fails a file.
+
+`_render_all` now renders **bands concurrently**. `_render_bands` is split out as a pure
+function of `(dpis, shards)` so the split is testable without invoking Ghostscript, and
+`shards=1` reproduces the previous bands exactly; a band shorter than two shards' worth of
+pages is not split at all, so the hundreds of small files in a real run are untouched. Safety
+comes free from machinery that already existed for another reason: each band renders into its
+own `r{n:03d}` directory and is renumbered to `p{first + k:04d}.png`, because Ghostscript
+restarts its `%d` counter per invocation — so output page numbers come from the band, never from
+the counter. Each band keeps its own `_run_stalled` watchdog, and a stall in any band is
+re-raised as `TimeoutExpired`, so stalls stay distinguishable from crashes.
+
+Six workers deriving budgets independently could each claim the whole machine, so a shared
+`multiprocessing.Value` tally (`_claim_threads` / `_threads`) clamps the total to
+`OVERSUBSCRIBE` (1.5) × physical cores. It **clamps and never blocks**: a step that finds the
+budget spent runs narrow, because a process that has not been allowed to start produces no
+progress for the stall watchdog to read. The grant is released in a `finally`, so a crashed or
+killed step cannot leak its share and starve the rest of the run.
+
+Two smaller things fell out of the same measurement. Files are now submitted **biggest first**
+(size, path as tie-break), so the long pole starts at t=0 and the small files fill in around it
+instead of it surfacing alone at hour four. And the ETA is **byte-weighted**: per-file cost spans
+0.06 MB to 405 MB here, so averaging over files completed made it collapse — `[ETA 1m]` was
+displayed for over two hours while that one manual finished.
+
+Verified on a 199-file run: **9 concurrent Ghostscript processes** (exactly the 1.5 × 6 cap)
+with contiguous non-overlapping bands — `2015 Suzuki Vitara - RUS.pdf` rendering pages 1-178,
+179-356 and 357-532 at once — at **96% CPU** against the 12% above. Band coverage is also
+property-checked for 1-399 pages × 1-8 shards, uniform and mixed dpi: no gap, no overlap, no
+page rendered at another page's dpi, and a sharded render is asserted **byte-identical** to the
+sequential one page for page.
+
+### Fixed (every run had been at NORMAL priority, silently)
+
+`set_below_normal_priority()` never worked on Windows. `ctypes.windll.kernel32.GetCurrentProcess`
+had no declared `restype`, so its pseudo-handle came back as a 32-bit `-1` and reached the
+64-bit `HANDLE` parameter as `0x00000000FFFFFFFF`. Measured: `SetPriorityClass` returned **0**
+with `GetLastError()` **6 (ERROR_INVALID_HANDLE)** — and `except Exception: pass` hid it, so
+long runs competed with foreground work at Normal priority. Sampled mid-run: 13 of 13 worker,
+Ghostscript and tesseract processes at base priority 8.
+
+The Win32 types are now declared, and the function **returns a bool** instead of swallowing
+failure. Pinned by a test that *observes* the result rather than trusting the call: it runs in a
+subprocess (so it does not renice the test runner) and checks a spawned child too, since
+Ghostscript and tesseract inherit the class rather than calling this themselves.
+
+### Fixed (a publisher's `..._COVER.pdf` sorted last instead of first)
+
+In `…\Carisma\Manuals\1996 Body Repair Manual` the cover landed at the **end** of the combined
+PDF — the worst possible place:
+
+```
+PBGE95E1_FOR_EUROPE_CARISMA_96_BRM_0.pdf … _8.pdf … _COVER.pdf   <- last
+```
+
+`_lead_rank` rejected it on the tag budget: `words` carries **24 characters besides `cover`**,
+and the budget is 10. That budget is not an accident — it is what keeps **135 parts photos**
+(`Medium_2002-CHEVY-TRUCK-COLUMN-COVER.jpg` is a photo of a steering-column cover) and
+`DISCOVER.PDF` (a Land Rover Discovery manual) out of the cover rank. The publisher's file is
+structurally identical to those: a long descriptive name ending in `COVER`. **Name length
+cannot tell them apart.**
+
+The folder can. Every sibling here shares `PBGE95E1_FOR_EUROPE_CARISMA_96_BRM_`, and the part
+that actually distinguishes the files is `0`…`8` against `COVER`; the parts photos share
+nothing with each other, and many of them end in `COVER` because it is their *subject*. So the
+keyword now gets a **second chance against the folder-relative remainder** — the same principle
+as the stamped-boilerplate fix above: what every sibling shares carries no information.
+
+`_folder_affix` computes the longest common prefix and suffix over a folder's stems, **cut back
+to a separator** so `ABC_1` and `ABC_12` do not "share" `ABC_1` and leave one file with an empty
+remainder, and returns nothing for a folder of fewer than two files. `_lead_rank`, `pagekey` and
+`natkey` take it as an optional argument that defaults to today's behaviour exactly, so
+`combine_sections.sections_of` and `order_by_docid` are untouched. `collect` computes it per
+directory as it walks; `dedupe_pages` computes the same one per parent group so an identity key
+and a sort key can never disagree about the same file.
+
+**The full name is always judged first**, so this can only ever add a hit, never remove one —
+and the tag budget still applies to the remainder, which is what keeps the parts photos out even
+in a folder where they do share a `Medium_` prefix. Measured over the same archive sweep used to
+design it, 578 folders / 18,640 files: **51 covers newly ranked, 0 lost.** All 51 are genuine
+Mitsubishi publisher covers (`..._BRM_COVER.pdf`, `..._CHASSIS_COVER.pdf`, `..._EW_COVER.pdf`),
+including one — `PHDE9608-C_GALANT_2001_COVER_ELECTRICAL_WIRING.pdf` — that needs *both* ends
+stripped before the keyword stands alone.
+
+The affix changes only the front-matter **rank**, never the sort tokens: pages sharing a folder
+prefix already sort correctly on the part they do not share, so re-tokenising the remainder
+would be risk without gain.
+
+### Fixed (the last file of a batch OCR'd on one core while the rest of the machine idled)
+
+A 5,243-file run sat at `[5242/5243]` for over twenty minutes with no output. Measured live,
+mid-run, rather than guessed at:
+
+- one file outstanding — a 57.9 MB Russian book — which had already rendered every page to
+  **1,522 MB** of scratch PNGs and was inside ocrmypdf;
+- the command actually running: `ocrmypdf --language rus+eng --skip-text --quiet --jobs 1`;
+- the machine: **6 physical cores, ~1 busy**.
+
+The thread budget was computed **once**, before the pool, from the **total** job count —
+`_ocr_jobs = cores // min(workers, N)`, i.e. `6 // min(6, 5243)` = 1 — passed to
+`_init_worker` through `initargs`, and never revisited. `--jobs 1` is right for the first
+5,242 files, because the batch is already parallel across files. It is wrong for the one file
+that decides when the run ends, and that is precisely the file it was still applied to.
+
+The intent was already documented — `OCR_JOBS`' own comment names "the tail of a batch" as a
+case it means to cover, and measures the cost (*17.3s at `--jobs 1` vs 7.3s at `--jobs 4` on
+an 8-page file*). The adaptation simply never happened, because `N` is the size of the run and
+not the number of files in flight.
+
+**The fix:** the parent publishes how many files are still outstanding in a shared
+`multiprocessing.Value`, updated in the completion loop, and the new `_ocr_jobs_now()` divides
+the physical cores by `min(workers, remaining)` at the moment ocrmypdf is about to be spawned
+— not when the pool was built. While the pool is saturated it returns exactly what it returned
+before; the budget only opens up as the batch drains. Verified end to end on a 3-file run with
+`--workers 2`: the two concurrent files got `jobs 3`, the tail file got `jobs 6`.
+
+That a `multiprocessing.Value` survives Windows *spawn* was proven before the design relied on
+it — it works because `initargs` is passed through process creation — and a test pins the
+property the whole fix rests on: workers see the parent's **later** writes, not a snapshot from
+when the pool was built. If the counter is ever missing or unreadable the static value is used
+instead; a thread-count hint must never be the thing that fails a file.
+
+The chosen value now appears in the note when it is above the saturated default
+(`(lang:rus+eng, mode --skip-text, jobs 6)`), so the tail's behaviour is checkable from the
+report alone.
+
+Two honest limits. A file that reaches OCR *early* keeps the small budget it was given —
+ocrmypdf's `--jobs` cannot be changed once it is running — but the case that matters starts its
+OCR when few files remain. And two concurrent runs of the tool will each see "one file left"
+and each claim the whole machine; workers already run at below-normal priority, so that
+contends rather than thrashes, and cross-process coordination is not worth building for it.
+
+Not addressed here, and still true: nothing is printed while a file is in flight, so a long
+file is indistinguishable from a hang; files are submitted in alphabetical order rather than
+biggest-first; and the ETA divides elapsed time by completed count, so it reads "a few minutes"
+right before a long tail.
+
+### Fixed (a stamped watermark was read as a text layer, so the one thing the file needed was skipped)
+
+A 256-page Mitsubishi Carisma supplement (`Supplement_A.pdf`, 21,273,852 bytes) came out of a
+compress+OCR run **unsearchable**. Every page carries exactly **66 chars** and nothing else:
+
+```
+www.WorkshopManuals.co.uk
+Purchased from www.WorkshopManuals.co.uk
+```
+
+`has_text` counts raw `extract_text()` against a 40-char floor, so 66 chars of paywall stamp on
+all 8 sampled pages meant "already searchable" → `_ship_original` returned `OCR_KEPT` →
+**ocrmypdf was never run**. `looks_born_digital` got the *same file* right — it uses
+`_visible_text_chars` against a 100-char floor, and 66 < 100, so it reported
+`scan_frac=1.0 scan_pages=8/8 text_pages=0`. **The two gates disagreed and the dumber one won**,
+because `_ship_original` only ever asks `has_text`.
+
+The cost is the whole point. That file's images are already `/CCITTFaxDecode` G4 at **595.7 dpi**,
+so the sample projects **103% of original** and it cannot be compressed at all. A text layer was
+the only thing this tool had to offer it, and that is precisely what it silently withheld — and
+there are more such files in the archive.
+
+**The fix: a text layer says something different on every page; a stamp says the same thing.**
+Text repeating on ~every sampled page is discounted wherever the tool asks whether a file is
+already searchable. No watermark-specific knowledge, no new flag, and nothing about the page is
+altered — the stamp stays exactly where it is, the file just gets the text layer it needed.
+
+Deliberately narrow, because the alternative failure is writing off a real text layer:
+`_BOILER_MIN_PAGES = 3` (two pages agreeing is a coincidence), `_BOILER_COVERED = 0.9` (not 1.0,
+so one blank or unreadable page cannot hide a stamp), and `_BOILER_MAX_LINES = 4` /
+`_BOILER_MAX_CHARS = 400` — a stamp is short, while twenty identical lines is a form template and
+a template is content. Applied **line-wise**, so a page carrying a repeated running header *plus*
+body text keeps its body and still counts as searchable.
+
+The same blind spot two floors up is closed by the same discount, and both are worse than the
+reported bug:
+
+- `_visible_text_chars` is a visibility *gate* followed by a *raw* count, so one visible stamp
+  word made a whole page's text count as publisher type. A stamp over 100 chars therefore pushed
+  every scanned page over `looks_born_digital`'s floor, dropped `scan_frac`, and **skipped the
+  entire manual** — never compressed *and* never OCR'd. Verified on a 129-char fixture:
+  `_visible_text_chars(page, 100)` reads 129 without the discount and 0 with it.
+- `classify_page` uses the same floor and returns `PT_VECTOR`, which is passed through
+  uncompressed **and** dropped from the OCR render (`skip_pages`) — so a long stamp made every
+  page silently un-OCR'd while the report row still claimed `new ocr`. `sample_projection` gets
+  the discount too, or it would charge every page its original size and skip a compressible file.
+
+A show op whose bytes cannot be decoded or matched still counts as real text, so a stamp in a
+CID/Identity-H font is simply not discounted and the old behaviour cannot regress. A watermark
+living in an annotation appearance stream never reached `extract_text()` in the first place, so
+it never caused this bug; stamps inside Form XObjects *are* handled, because both
+`extract_text()` and `_stream_visible_text` already recurse into forms.
+
+`has_text`, `has_any_text` and `looks_born_digital` each used to open the file and extract the
+same 8 pages independently — four opens and up to 32 `extract_text()` calls per file for three
+answers about the same pages. They now share one `TextSample`, cached on (path, size, mtime), so
+adding the discount to all of them costs **less** than the old code, not more; a file rewritten
+in place cannot be served a stale answer.
+
+Reported, not silently handled: `scan signals` gains a `boiler=2ln/66c` token and the note reads
+`(65 chars of boilerplate repeated on every page discounted — a stamp, not a text layer)`, so a
+row whose `ocr` cell changed from `kept existing` to `new ocr` explains itself. No new column —
+`signals` is attached only when a stamp was found, so every other row in a normal archive is
+byte-for-byte what it is today. Note also that a slightly-over-100% row on this path is now the
+correct outcome: adding a text layer makes a ship-the-original file a little *larger*.
+
+One recorded caveat: `scan_candidates.py` keeps its own private copies of `has_text` and
+`looks_born_digital` and will now disagree with the tool about files like this. Out of scope for
+this change.
+
+### Changed (the report's `file` column holds the FULL path)
+
+A regression from collapsing three report files into one. The prose `.log` recorded
+`Source : <root>` in its header, so a path relative to that root had an anchor. The `.csv`
+never carried the root — and now that the `.csv` *is* the report, `DAEWOO\Tico.pdf` in a file
+sitting in some other folder, read a week later beside three other reports, does not say which
+tree it came from. `file` and `duplicate of` are now full paths; a twin you cannot go and look
+at is not a useful flag either.
+
+`--retry-failed` reads that column, and the fix there is not the obvious one. `dest_root / p`
+with an **absolute** `p` discards `dest_root` and yields `p` itself, so letting pathlib resolve
+the recorded path would have made a non-in-place retry write its output **on top of the source
+it was reading**. `_retry_jobs` derives the dest from the path relative to `src_root` in both
+forms instead, and returns what it could not place:
+
+- an entry no longer on disk is skipped **and counted** — a retry that silently does less than
+  the report asked for looks exactly like a retry that worked;
+- an entry that is not under `src` means one of the two arguments is wrong, so it is reported
+  loudly and skipped. Guessing which tree was meant is how you compress the wrong archive.
+
+Reports written before this still work: a relative `file` value is resolved against `src_root`
+as before. `_read_failed_rels` is now `_read_failed_files` (it no longer returns rel-paths).
+
+### Fixed (`combine_manual.py`: page order, the same page scanned twice, and bookmarks)
+
+Pointed at a folder of scanned page images — which it has always accepted; `IMAGE_EXTS` and
+the img2pdf wrap have been there from the start — it produced a PDF whose **pages were in the
+wrong order**. Measured on a 21-section Daihatsu manual, 1216 `.jpg` + 30 `.tif`: **14 of the
+21 sections came out mis-ordered**, and one section's pages appeared **twice**.
+
+The filename sort kept punctuation inside the alpha prefix, so it read one chapter as several:
+
+- `engine mechanical` held `EM11.jpg` beside `EM-2.jpg`. Prefixes `em` and `em-` are not the
+  same string, so **page 11 sorted second**, right after the cover and 78 pages early.
+- `body` held `B0-4`, `B040`, `BO169`, `BO-2` — whoever named the scans typed capital O for
+  zero and dropped hyphens at random. That made **four bogus chapters out of one** 183-page
+  section, page 4 ahead of page 2. A `0` that follows a letter is an `O`.
+- `general info` sorted all nine `GIn.tif` ahead of every `GI-n.jpg`.
+- Every section leads with an unnumbered cover and most hold an index page. Alphabetically
+  `GI-COVER.jpg` landed near the **end** of its section. **Front matter now leads its folder
+  in the order it is printed** — cover, foreword (`foreword`, `fwd`), index/contents, then the
+  numbered pages.
+
+  `fwd` ranks **only as the bare name** (`fwd.pdf`, `FWD.pdf`), never with a tag or a page
+  number. Three letters is not much to go on, and it is measurably ambiguous in this archive:
+  all **274** bare `fwd.pdf` hits are a drivetrain section rather than front matter —
+  `…\2009 Maxima A34\fwd.pdf` sits among the Nissan FSM section codes (`ADP, BR, CHG, CO, EC,
+  EM, FAX, FSU, GI, LU, MA…`) and `…\LX570\EWD\system\pdf\fwd.pdf` among 60 EWD systems
+  including `mm4wd`. The bare-name rule does not resolve that — those files are the bare name —
+  but it does keep numbered `FWD-12.jpg` series and `fwd2.pdf` out of the rank, and it excludes
+  10 further names such as `PWEE9508-ABCDEFG_FWD_AT_E-W_21B.pdf`. All 40 genuine forewords in
+  the archive are spelled `foreword`, which needs none of this. If you combine one of those
+  Nissan or Lexus folders, `fwd.pdf` will sort first — the printed page order and `--dry-run`
+  are the check.
+
+  The match is on whole **words**, split on separators, and the keyword has to dominate the
+  name: at most a short section tag besides it. Both halves of that are load-bearing, and
+  each was settled by scanning **1.11M image/PDF names** in the archive rather than by
+  guessing. Word matching is what keeps `DISCOVER.PDF` — a Land Rover Discovery manual, ending
+  in `cover` — out of the cover rank. The tag budget is what keeps out the **135 parts photos**
+  (`Medium_2002-CHEVY-TRUCK-COLUMN-COVER.jpg` is a steering-column cover) and
+  `tyrerotation_fwd.jpg` (front-wheel-drive tyre rotation, not a foreword).
+
+  The budget is **10**, which is a deliberate loosening of the 2 this entry was first written
+  against. At 10 a short topic tag fits, so `DTC Index.pdf` / `dtc_index.gif` now DO rank as
+  front matter — topic names in print-captured manuals, whose filename order is arbitrary by
+  definition and is exactly what `--order docid` exists to override, so hoisting them costs
+  nothing there. What 10 still excludes is the wordy end, which is where the false hits live:
+  the parts photos carry 24+ characters besides the keyword.
+
+  This replaces a cruder first attempt from earlier in this entry, which matched a 5-character
+  prefix/suffix and excused itself by ranking **images only**. That was wrong twice over: it
+  hoisted all 135 parts photos, and the images-only escape hatch would have excluded the
+  foreword pages entirely, since in practice they are `Foreword.pdf`, not scans.
+- One file is mojibake, `╡FS-2.jpg` (U+2561), which sorted after every ASCII name.
+
+Two properties of the old key were load-bearing and are preserved deliberately, each pinned by
+a test: a separator **between two digits** carries order (strip it and `1-1` becomes the number
+11, breaking the documented `1-1, 1-2, 1-11, 2-1, 2a-1, 2b-1`), and the empty strings
+`re.split` emits keep digit-leading names sorting ahead of alpha-leading ones. `_base` strips
+only a **known** page extension rather than using `Path.stem`, because these keys sort folder
+names too and `Path('4.2 ENGINE').stem` is `'4'`.
+
+**The same page scanned twice.** `general info` held 26 of its pages as *both* a 2550×3508 JPG
+and a 637×877 TIF, so both went into the manual. Now the higher-resolution copy wins. The rule
+is pixel area and not format, because **4 of that folder's 30 TIFs are the only copy of their
+page** — "drop the TIFs" loses four pages silently, which is the failure the page-count check
+exists to catch. A copy is dropped only when it is ≥2× smaller (the 26 real pairs measured
+**4.0×–16.9×**); a collision at a *similar* resolution may be two different pages, so
+everything is kept and flagged. Grouping is **per folder**: grouping globally put 17 of the 21
+sections' `cover.jpg` in one group and would have thrown away 16 covers. Every drop is printed
+with both pixel sizes and the ratio, on dry runs too, and **nothing is deleted from disk**.
+
+**Bookmarks.** Under `--recursive`, one per section folder at that section's first page — a
+1220-page manual with no outline cannot be navigated. The page index is measured during the
+merge, so a section whose first part is a 9-page PDF does not land its bookmark 8 pages early;
+an index past the end can only mean an input contributed no pages (a 0-page PDF, which
+`expected_pages` counts as 0 and which would otherwise merge invisibly), so it is refused. The
+outline is read back out of the finished file and reported, and a missing one is called lost
+*navigation*, never lost pages.
+
+Result on that manual: **1246 files → 1220 pages**, 26 duplicates dropped, 21 bookmarks,
+every source file still in place.
+
+API: `natkey` is now `pagekey` plus a name tiebreak (so a run is reproducible even though
+`pagekey` is deliberately lossy) and returns a tuple; `dedupe_pages`, `report_dups`,
+`section_bookmarks`, `bookmark_preview` and `outline_pages` are new; `combine` takes
+`bookmarks=None`. `helpers/combine_sections.py` picks up the ordering fix and the bookmarks,
+but **not** `dedupe_pages` — its `--delete` removes the source folder, and a ratio gate
+calibrated on one measured folder is evidence enough to leave a page out of a PDF, not evidence
+enough to destroy the file. There is a comment at that call saying so, and what wiring it in
+would additionally require.
+
+One thing to expect downstream: a combined PDF now carries an outline, which **activates** the
+main tool's bookmark-preservation audit that was previously passing trivially at 0→0. If the
+graft cannot carry them over, the compress step says `rebuilt — links/bookmarks not carried
+over` — reported, not silent.
+
 ### Changed (BREAKING: the report is one `.csv` — the prose `.log` and `_by_folder.csv` are gone)
 
 `--log` wrote three files: a prose `_ocrmyworkshopmanual_report_<ts>.log`, the per-file
