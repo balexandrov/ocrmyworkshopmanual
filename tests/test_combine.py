@@ -1,8 +1,9 @@
-"""Tests for combining a split manual into one PDF per section.
+"""Tests for `combine_manual.py`: which page of which chapter a loose file holds, and the
+order the combined PDF puts them in.
 
-These guard an IRREVERSIBLE step: helpers/combine_sections.py deletes the source folder
-once the combined PDF passes verification, so a bug here loses pages permanently. Every
-check below corresponds to something that actually went wrong on the real archive.
+Page ORDER is the whole point and it is not obvious — every check below corresponds to
+something that actually went wrong on the real archive (an `EM11.jpg` sorting second, a
+cover landing last, a capital O typed for a zero splitting one chapter into four).
 """
 import shutil
 import sys
@@ -12,10 +13,7 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 
 import _util as U
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'helpers'))
-import combine_manual as CM          # noqa: E402
-import combine_sections as CS        # noqa: E402
+import combine_manual as CM
 
 
 def _pdf(path: Path, npages: int = 1) -> Path:
@@ -243,9 +241,9 @@ def test_page_key_survives_a_mojibake_name():
 
 
 def test_base_strips_only_a_known_page_extension():
-    """These keys sort FOLDER names too (collect walks files and subfolders with one key, and
-    combine_sections orders sections with it), so `Path.stem` is not usable: it turns
-    `4.2 ENGINE` into `4` and would file that whole folder as if it were page 4."""
+    """These keys sort FOLDER names too (collect walks files and subfolders with one key), so
+    `Path.stem` is not usable: it turns `4.2 ENGINE` into `4` and would file that whole folder
+    as if it were page 4."""
     assert CM._base('GI-12.tif') == 'GI-12'
     assert CM._base('4.2 ENGINE') == '4.2 ENGINE'
     assert CM._base('null') == 'null'          # the extensionless PDF keeps its whole name
@@ -627,97 +625,7 @@ def test_docid_order_is_all_or_nothing(tmp_path):
     assert ordered == natural, 'a partial doc-id set must leave the order untouched'
 
 
-def test_section_records_which_order_it_used(tmp_path):
-    """The row has to say whether publisher order was applied, or a reviewer cannot tell a
-    correctly-ordered manual from a fallback."""
-    root = tmp_path / 'M'
-    sec = root / 'AT'
-    sec.mkdir(parents=True)
-    _printed(sec / 'z_later.pdf', '04', 'N5040200P0000300USA')   # doc id puts it FIRST
-    _printed(sec / 'a_first.pdf', '04', 'N5040208N0000500USA')
-
-    row = CS.process_section(sec, root, delete=False, dry=False, order='docid')
-    assert row['status'] == 'OK', row
-    assert row['order'] == 'docid' and row['docid_missing'] == 0
-    # the pages really came out in doc-id order, not filename order: each part carries its
-    # own URL on its first page, so the combined page 1 identifies which part led
-    out = PdfReader(str(root / 'AT.pdf'))
-    assert len(out.pages) == 4
-    first = out.pages[0].extract_text() or ''
-    assert 'N5040200P0000300USA' in first, (
-        f'expected z_later.pdf (lowest doc id) first, got: {first[:200]!r}')
-
-    # a section with a bare part falls back, and says so
-    sec2 = root / 'BR'
-    sec2.mkdir()
-    _printed(sec2 / 'a.pdf', '04', 'N5040200P0000300USA')
-    _pdf(sec2 / 'b.pdf')
-    row2 = CS.process_section(sec2, root, delete=False, dry=False, order='docid')
-    assert row2['status'] == 'OK', row2
-    assert row2['order'] == 'natural' and row2['docid_missing'] == 1
-    assert 'doc-id order was NOT applied' in row2['detail']
-
-
-def test_default_order_is_unchanged(tmp_path):
-    """`--order natural` (the default) must behave exactly as before."""
-    d = tmp_path / 'S'
-    d.mkdir()
-    for n in (1, 2, 10):
-        _printed(d / f'{n}. Part.pdf', '04', f'N504020{n}F0000500USA')
-    root = d.parent
-    row = CS.process_section(d, root, delete=False, dry=False)      # no order= given
-    assert row['order'] == 'natural' and row['docid_missing'] == ''
-    assert [p.name for p in CM.collect(d)] == ['1. Part.pdf', '2. Part.pdf', '10. Part.pdf']
-
-
 # ── the size ratio is a proxy; word recall is the real check ──────────────────
-
-def test_word_recall_is_one_for_a_faithful_merge(tmp_path):
-    d = tmp_path / 's'
-    d.mkdir()
-    a, b = _pdf(d / '1.pdf', npages=2), _pdf(d / '2.pdf', npages=3)
-    out = tmp_path / 'out.pdf'
-    CM.combine(CM.collect(d), out)
-    assert CS.word_recall([a, b], out) == pytest.approx(1.0)
-
-
-def test_a_small_merge_ships_when_every_word_survives(tmp_path, monkeypatch):
-    """A manual captured by PRINTING an online one merges to ~0.83 of its input bytes with
-    nothing missing — each part carries its own catalogue/metadata/xref and pypdf writes the
-    merge compactly. Measured on a real Outlander section: ratio 0.829, word recall 1.0000,
-    all 60 images and 13 font programs intact. Refusing that on size alone threw away three
-    perfect merges, so the size proxy must defer to the content check."""
-    root = tmp_path / 'M'
-    sec = root / 'ABS'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1.pdf', npages=2)
-    _pdf(sec / '2.pdf', npages=2)
-    # force the proxy to trip, exactly as the real print-captures do
-    monkeypatch.setattr(CS, 'MIN_SIZE_RATIO', 1.5)
-
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'OK', row
-    assert row['word_recall'] == pytest.approx(1.0)
-    assert 'nothing lost' in row['detail']
-    assert row['deleted'] == 'yes' and not sec.exists()
-
-
-def test_a_small_merge_with_missing_words_still_fails(tmp_path, monkeypatch):
-    """The other direction: when the bytes are short AND the words are gone, it is real loss
-    and the folder must survive."""
-    root = tmp_path / 'M'
-    sec = root / 'S'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1.pdf', npages=2)
-    _pdf(sec / '2.pdf', npages=2)
-    monkeypatch.setattr(CS, 'MIN_SIZE_RATIO', 1.5)
-    monkeypatch.setattr(CS, 'word_recall', lambda inputs, out: 0.40)
-
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'FAILED', row
-    assert 'content is missing' in row['detail']
-    assert sec.exists() and row['deleted'] == 'no'
-    assert not (root / 'S.pdf').exists(), 'a refused merge leaves no output'
 
 
 # ── a repair must not be taken at face value ──────────────────────────────────
@@ -754,151 +662,6 @@ def test_pages_in_raw_bytes_counts_page_objects_not_the_tree(tmp_path):
     assert CM.pages_in_raw_bytes(p) == 3
 
 
-def test_partial_salvage_is_refused_not_silently_accepted(tmp_path, monkeypatch):
-    """The hole this closes: `expected_pages` runs on the files handed to the merge, so a
-    repair that salvaged 1 page of 9 agrees with itself and passes — and the source folder
-    is then deleted. Measured on a real Baja section: three truncated parts holding 3, 9
-    and 6 page objects, one page salvaged from each, ~15 pages lost silently.
-
-    A repair that cannot recover the raw-byte page count must leave the part unreadable so
-    the merge refuses the whole section."""
-    root = tmp_path / 'M'
-    sec = root / 'Transmission Section'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1. Good.pdf', npages=2)
-    # a part that looks like it holds 9 pages but cannot be parsed
-    (sec / '2. Truncated.pdf').write_bytes(
-        b'%PDF-1.4\n' + b'/Type /Page\n' * 9 + b'\x00\x01truncated mid-stream')
-    assert CM.page_count(sec / '2. Truncated.pdf') < 0
-    assert CM.pages_in_raw_bytes(sec / '2. Truncated.pdf') == 9
-
-    # a repair tool that salvages only ONE page must not be believed
-    import ocrmyworkshopmanual as owm
-
-    def fake_repair(src, work, expect_pages=0, timeout=0, stats=None):
-        out = Path(work) / 'salvaged.pdf'
-        _pdf(out, npages=1)
-        if expect_pages and 1 < expect_pages:
-            return None          # this is what the real _repair_pdf does
-        return out
-
-    monkeypatch.setattr(owm, '_repair_pdf', fake_repair)
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'FAILED', row
-    assert sec.exists() and (sec / '1. Good.pdf').exists(), 'folder must be kept'
-    assert not (root / 'Transmission Section.pdf').exists()
-
-
-def test_full_recovery_is_accepted(tmp_path, monkeypatch):
-    """The other direction: a repair that recovers every page lets the section through, so
-    one malformed part does not strand a manual as un-combinable forever."""
-    root = tmp_path / 'M'
-    sec = root / 'S'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1. Good.pdf', npages=2)
-    (sec / '2. Broken.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 broken')
-    assert CM.pages_in_raw_bytes(sec / '2. Broken.pdf') == 1
-
-    import ocrmyworkshopmanual as owm
-
-    def fake_repair(src, work, expect_pages=0, timeout=0, stats=None):
-        out = Path(work) / 'salvaged.pdf'
-        _pdf(out, npages=1)
-        return out
-
-    monkeypatch.setattr(owm, '_repair_pdf', fake_repair)
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'OK', row
-    assert row['pages'] == 3 and not sec.exists()
-    assert 'repaired' in row['detail']
-
-
-def test_broken_parts_are_named_by_path_not_filename(tmp_path, monkeypatch):
-    """A bare filename cannot identify the culprit: one real section holds
-    `Clutch System\\General Description.pdf` AND `Control Systems\\General
-    Description.pdf`, and a report saying 'General Description.pdf' twice tells you
-    nothing about which is broken."""
-    root = tmp_path / 'M'
-    sec = root / 'Transmission Section'
-    for subname in ('Clutch System', 'Control Systems'):
-        (sec / subname).mkdir(parents=True)
-        (sec / subname / 'General Description.pdf').write_bytes(
-            b'%PDF-1.4\n' + b'/Type /Page\n' * 4 + b'\x00 truncated')
-    _pdf(sec / 'ok.pdf', npages=2)
-
-    import ocrmyworkshopmanual as owm
-    monkeypatch.setattr(owm, '_repair_pdf',
-                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
-    row = CS.process_section(sec, root, delete=False, dry=False)
-    assert row['status'] == 'FAILED', row
-    unrec = row['unrecoverable']
-    assert str(Path('Clutch System') / 'General Description.pdf') in unrec, unrec
-    assert str(Path('Control Systems') / 'General Description.pdf') in unrec, unrec
-    assert unrec.count('General Description.pdf') == 2
-
-
-def test_skip_unrecoverable_combines_the_rest_and_keeps_the_broken_parts(tmp_path,
-                                                                        monkeypatch):
-    """--skip-unrecoverable must not mean --lose-unrecoverable: the section is combined
-    from what is readable, and the damaged originals are MOVED out of the folder before it
-    is deleted, so a better tool can still be tried on them."""
-    root = tmp_path / 'M'
-    sec = root / 'Transmission Section'
-    (sec / 'Clutch System').mkdir(parents=True)
-    _pdf(sec / 'Clutch System' / 'Good.pdf', npages=3)
-    (sec / 'Clutch System' / 'Broken.pdf').write_bytes(
-        b'%PDF-1.4\n' + b'/Type /Page\n' * 9 + b'\x00 truncated')
-    _pdf(sec / '1. Intro.pdf', npages=2)
-
-    import ocrmyworkshopmanual as owm
-    monkeypatch.setattr(owm, '_repair_pdf',
-                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
-    row = CS.process_section(sec, root, delete=True, dry=False, skip_broken=True)
-
-    assert row['status'] == 'OK-PARTIAL', row
-    assert row['pages'] == 5, 'only the readable pages are in the PDF'
-    assert row['pages_dropped'] == 9
-    assert str(Path('Clutch System') / 'Broken.pdf') in row['unrecoverable']
-    assert row['deleted'] == 'yes' and not sec.exists()
-    # the broken original survives, with its subfolder path intact
-    kept = root / 'Transmission Section (UNRECOVERABLE)' / 'Clutch System' / 'Broken.pdf'
-    assert kept.is_file(), 'a skipped part must never be destroyed'
-    assert (root / 'Transmission Section.pdf').is_file()
-    assert len(PdfReader(str(root / 'Transmission Section.pdf')).pages) == 5
-
-
-def test_skip_unrecoverable_still_fails_when_nothing_is_readable(tmp_path, monkeypatch):
-    """Skipping every input would produce an empty PDF and delete the folder — refuse."""
-    root = tmp_path / 'M'
-    sec = root / 'S'
-    sec.mkdir(parents=True)
-    for i in (1, 2):
-        (sec / f'{i}.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 truncated')
-    import ocrmyworkshopmanual as owm
-    monkeypatch.setattr(owm, '_repair_pdf',
-                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
-    row = CS.process_section(sec, root, delete=True, dry=False, skip_broken=True)
-    assert row['status'] == 'FAILED', row
-    assert sec.exists() and row['deleted'] == 'no'
-    assert not (root / 'S.pdf').exists()
-
-
-def test_without_the_flag_a_broken_part_still_refuses_the_section(tmp_path, monkeypatch):
-    """The default stays safe: skipping is opt-in, so an unattended run never silently
-    ships a section with pages missing."""
-    root = tmp_path / 'M'
-    sec = root / 'S'
-    sec.mkdir(parents=True)
-    _pdf(sec / 'good.pdf', npages=2)
-    (sec / 'bad.pdf').write_bytes(b'%PDF-1.4\n/Type /Page\n\x00 truncated')
-    import ocrmyworkshopmanual as owm
-    monkeypatch.setattr(owm, '_repair_pdf',
-                        lambda src, work, expect_pages=0, timeout=0, stats=None: None)
-    row = CS.process_section(sec, root, delete=True, dry=False)   # skip_broken defaults off
-    assert row['status'] == 'FAILED' and sec.exists()
-    assert not (root / 'S (UNRECOVERABLE)').exists(), 'nothing moved without the flag'
-
-
 def test_repair_reports_how_much_is_salvageable(tmp_path, monkeypatch):
     """'recovered 1 of ~9 pages' is what tells you whether a file is worth chasing, so a
     failed strict repair is retried leniently purely to measure that."""
@@ -926,117 +689,7 @@ def test_repair_reports_how_much_is_salvageable(tmp_path, monkeypatch):
 
 # ── a folder that contains a merge of itself ──────────────────────────────────
 
-def test_self_combined_copy_is_ignored(tmp_path):
-    """WIRING DIAGRAM SECTION holds nine parts in subfolders AND a Wiring_diagram.pdf that
-    is those same pages already merged. Combining everything would emit every page twice.
-    Detected by EXACT page-count identity with the subfolders' total."""
-    sec = tmp_path / 'WIRING DIAGRAM SECTION'
-    sub = sec / 'WIRING DIAGRAM'
-    sub.mkdir(parents=True)
-    p1 = _pdf(sub / '1.pdf', npages=2)
-    p2 = _pdf(sub / '2.pdf', npages=3)
-    merged = sec / 'Wiring_diagram.pdf'         # 5 pages == 2 + 3 in the subfolder
-    w = PdfWriter()
-    w.append(str(p1))
-    w.append(str(p2))
-    with open(merged, 'wb') as f:
-        w.write(f)
-    assert CM.page_count(merged) == 5
-
-    files = CM.collect(sec, recursive=True)
-    assert len(files) == 3
-    kept, dropped = CS.drop_self_combined(sec, files)
-    assert dropped == ['Wiring_diagram.pdf'], dropped
-    assert CM.expected_pages(kept)[0] == 5, 'pages must not be double-counted'
-
-
-def test_a_genuine_chapter_is_not_mistaken_for_a_self_copy(tmp_path):
-    """The ratio heuristic tried first (>=40% of the subfolders' pages) flagged 31 real
-    chapters — a 19-page `Pre-delivery Inspection.pdf` beside 43 pages of subfolder. Only
-    exact identity may drop a file, or genuine pages vanish."""
-    sec = tmp_path / 'GENERAL INFORMATION SECTION'
-    sub = sec / 'PERIODIC MAINTENANCE'
-    sub.mkdir(parents=True)
-    _pdf(sub / '1.pdf', npages=6)                    # subfolders hold 6 pages
-    _pdf(sec / '8. Pre-delivery Inspection.pdf', npages=4)   # 4/6 = 0.67, but genuine
-    files = CM.collect(sec, recursive=True)
-    kept, dropped = CS.drop_self_combined(sec, files)
-    assert dropped == [], 'a real chapter must never be dropped'
-    assert len(kept) == 2
-
 
 # ── the driver's delete gate ──────────────────────────────────────────────────
 
-def test_section_is_deleted_only_after_verification(tmp_path):
-    root = tmp_path / 'USDM Manual FSM 2006'
-    sec = root / 'BODY SECTION'
-    sub = sec / 'AIRBAG SYSTEM AB'
-    sub.mkdir(parents=True)
-    _pdf(sub / '1. General Description.pdf', npages=2)
-    _pdf(sub / '2. Airbag Connector.pdf', npages=3)
-    _pdf(sec / '1. Intro.pdf', npages=1)
 
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'OK', row
-    assert row['pages'] == 6 and row['deleted'] == 'yes'
-    assert (root / 'BODY SECTION.pdf').is_file()
-    assert not sec.exists(), 'a verified section folder should be gone'
-    assert len(PdfReader(str(root / 'BODY SECTION.pdf')).pages) == 6
-
-
-def test_failed_section_keeps_its_folder(tmp_path):
-    """The whole safety property: nothing is deleted when verification fails."""
-    root = tmp_path / 'M'
-    sec = root / 'BAD SECTION'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1.pdf', npages=2)
-    (sec / '2.pdf').write_bytes(b'%PDF-1.4 but truncated garbage')
-
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'FAILED', row
-    assert row['deleted'] == 'no'
-    assert sec.exists() and (sec / '1.pdf').exists()
-    assert not (root / 'BAD SECTION.pdf').exists()
-
-
-def test_existing_pdf_is_verified_not_blindly_skipped(tmp_path):
-    """46 sections were combined by another tool in 2019. An existing output is checked
-    against the folder: a faithful one means the folder is redundant (ALREADY, safe to
-    delete); a mismatched one is a CONFLICT and nothing is touched."""
-    root = tmp_path / 'M'
-    sec = root / 'BODY SECTION'
-    sec.mkdir(parents=True)
-    p1 = _pdf(sec / '1.pdf', npages=2)
-    p2 = _pdf(sec / '2.pdf', npages=3)
-
-    good = root / 'BODY SECTION.pdf'
-    w = PdfWriter()
-    w.append(str(p1))
-    w.append(str(p2))
-    with open(good, 'wb') as f:
-        w.write(f)
-    row = CS.process_section(sec, root, delete=True, dry=False)
-    assert row['status'] == 'ALREADY', row
-    assert row['deleted'] == 'yes' and not sec.exists()
-
-    # now the mismatched case — an existing PDF that is short
-    sec2 = root / 'OTHER SECTION'
-    sec2.mkdir()
-    _pdf(sec2 / '1.pdf', npages=2)
-    _pdf(sec2 / '2.pdf', npages=3)
-    shutil.copyfile(str(_pdf(tmp_path / 'short.pdf', npages=1)),
-                    str(root / 'OTHER SECTION.pdf'))
-    row = CS.process_section(sec2, root, delete=True, dry=False)
-    assert row['status'] == 'CONFLICT', row
-    assert row['deleted'] == 'no' and sec2.exists(), 'a conflict must touch nothing'
-
-
-def test_dry_run_writes_and_deletes_nothing(tmp_path):
-    root = tmp_path / 'M'
-    sec = root / 'S'
-    sec.mkdir(parents=True)
-    _pdf(sec / '1.pdf', npages=2)
-    before = set(p.relative_to(tmp_path) for p in tmp_path.rglob('*'))
-    row = CS.process_section(sec, root, delete=False, dry=True)
-    assert row['status'] == 'WOULD-COMBINE' and row['pages'] == 2
-    assert set(p.relative_to(tmp_path) for p in tmp_path.rglob('*')) == before

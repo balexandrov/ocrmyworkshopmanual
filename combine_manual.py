@@ -88,7 +88,7 @@ def _base(name: str) -> str:
     """`name` minus a KNOWN page extension, otherwise unchanged.
 
     Deliberately NOT `Path.stem`: these keys run on FOLDER names too — `collect` orders files
-    and subfolders with one key, and `combine_sections.sections_of` orders sections — and
+    and subfolders with one key — and
     `Path('4.2 ENGINE').stem` is `'4'`, which would file that whole folder as if it were
     page 4. An extensionless page keeps its entire name, which is also right: the archive's
     `null` really is a PDF named `null`."""
@@ -253,8 +253,8 @@ def natkey(name: str, affix=('', '')):
     `GI-12.jpg` and `GI-12.tif` share one key — and `sorted` is only stable with respect to
     whatever order the filesystem happened to hand back, which is not a guarantee.
 
-    `affix` defaults to nothing, so a caller with no sibling context — `combine_sections`
-    ordering sections, `order_by_docid` breaking a tie — behaves exactly as before."""
+    `affix` defaults to nothing, so a caller with no sibling context — `order_by_docid`
+    breaking a tie, for one — behaves exactly as before."""
     return (pagekey(name, affix), name.lower())
 
 

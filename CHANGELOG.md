@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed (`helpers/combine_sections.py`, `helpers/find_split_manuals.py`)
+
+Both were one-time tools for a job that is finished: the split USDM manuals have been
+consolidated, so nothing is left to scan for or combine section-by-section. Their README
+section and the 17 tests covering the delete-after-verify gates go with them. `combine_manual.py`
+— which combines loose pages into one PDF and is what the Explorer right-click wrapper calls —
+is unaffected, and the page-ordering work described below still applies to it.
+
+The entries further down this file that describe those two scripts are left as written: they
+record what was true when the work was done.
+
 ### Fixed (one huge manual was the whole run: 4h20m of 4h53m, at 12% CPU)
 
 A 405-file batch took **293 minutes**, of which a single 2910-page manual
