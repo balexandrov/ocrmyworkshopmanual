@@ -1598,9 +1598,20 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
                         draw.append(f'q {name} Do Q'.encode())
                     body = bytes(sp.obj.Contents.read_bytes()) + b'\n' + b'\n'.join(draw) + b'\n'
                     sp.Contents = s.make_stream(body)
-                for k in ('/MediaBox', '/Rotate'):
-                    if k in fp.keys():
-                        sp[k] = fp[k]
+                if '/MediaBox' in fp.keys():
+                    sp['/MediaBox'] = fp['/MediaBox']
+                # /Rotate must be SET, not copied-if-present. Ghostscript BAKES the source
+                # rotation into the render, so a compressed page's image is already upright
+                # and its /MediaBox describes the rotated geometry; img2pdf then writes no
+                # /Rotate at all. Leaving the source's value in place rotates the page a
+                # SECOND time — measured: a 533-page Daihatsu manual shipped entirely
+                # sideways, and no guard caught it because page count, colour, text and
+                # links all survive a rotation. Deleting the key is not enough either:
+                # /Rotate is inheritable, so a value on an ancestor /Pages node would still
+                # apply. Writing 0 explicitly overrides that. A losslessly passed-through
+                # page (vector / colour line art) keeps its own value, because for those
+                # `fp` IS the original page and carries the real /Rotate.
+                sp['/Rotate'] = fp.get('/Rotate', 0)
             if ctx is not None:
                 ctx.close()
             s.remove_unreferenced_resources()
