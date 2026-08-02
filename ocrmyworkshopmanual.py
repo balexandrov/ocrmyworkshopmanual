@@ -1063,6 +1063,25 @@ def _page_render_dpis(src_p: Path, base_dpi: int, cap: int = MAX_RENDER_DPI) -> 
 
 RENDER_SHARD_MIN_PAGES = 50
 
+# Ghostscript cannot always SEEK to a high page. Measured on seven large manuals (Avensis
+# 2460p, Mirage 2007p, Liberty 1957p, Pajero 1625p, Sigma 1654p/1441p, L400 1159p): every
+# one renders `-dFirstPage=1021` fine and dies on `-dFirstPage>=1022` with "Unrecoverable
+# error, exit code 255", while rendering the SAME pages sequentially from page 1 succeeds.
+#
+# This is Ghostscript bug 709436 — a REGRESSION in 10.07.1 (10.06.0 is fine), where objects
+# accumulate in the PDF interpreter's loop detector until they hit its cap. Fixed upstream
+# in commit f2ba0735d9fd1b69aa901e5cd6d04b56bbc50e38 (2026-06-03) but NOT in any release as
+# of 10.07.1, the current one. What decides whether a file trips it is its page tree: a FLAT
+# tree (every page a direct kid of root /Pages, as old scanners and our own repair path
+# write) walks one object per page and reaches the cap; a balanced tree touches a handful of
+# nodes per lookup and never does — which is why some long files are unaffected.
+#
+# So it cannot be predicted from page count alone, only avoided: a long document is rendered
+# window by window, each window extracted to its own PDF, so no page index handed to gs ever
+# exceeds this. Independent of the gs version, and worth keeping after the fix ships — the
+# cost is one cheap page-copy per window (1441 pages split in 1.7s).
+MAX_SEEK_PAGE = 1000
+
 
 def _render_bands(dpis: list, shards: int) -> list:
     """(first, last, dpi) bands to render, 1-based inclusive.
@@ -1099,6 +1118,55 @@ def _render_bands(dpis: list, shards: int) -> list:
     return out
 
 
+def _extract_pages(src_p: Path, out: Path, first: int, last: int) -> Path:
+    """Copy source pages [first..last] (1-based, inclusive) into their own PDF.
+
+    Used to keep every page index handed to Ghostscript small — see `MAX_SEEK_PAGE`. Uses
+    pikepdf for the same reason `_qpdf_repair` does: it is already a dependency and it
+    rewrites structure rather than re-interpreting content, so nothing is re-encoded."""
+    import pikepdf
+    with pikepdf.open(str(src_p)) as p:
+        q = pikepdf.Pdf.new()
+        q.pages.extend(p.pages[first - 1:last])
+        q.save(str(out))
+    return out
+
+
+def _render_windows(src_p: Path, work: Path, n_pages: int, size: int = 0) -> list:
+    """[(pdf, page_offset, n_pages)] to render — the document itself when it is short
+    enough to seek in, otherwise `size`-page slices of it written out as their own PDFs.
+
+    Splitting is cheap next to rendering (a 1441-page, 53 MB manual splits in 1.7 s) and
+    it keeps bands concurrent: without it, a document over `MAX_SEEK_PAGE` pages can only
+    be rendered as one sequential gs call, which is what the concurrent-band work removed
+    (that tail measured 2h20m at 12% CPU on a 2910-page file).
+
+    `size` is resolved here rather than as a default argument so the module constant stays
+    changeable at runtime (a default would bind its value at import)."""
+    size = size or MAX_SEEK_PAGE
+    if n_pages <= size:
+        return [(src_p, 0, n_pages)]
+    out = []
+    for i, a in enumerate(range(0, n_pages, size)):
+        cnt = min(size, n_pages - a)
+        out.append((_extract_pages(src_p, work / f'w{i:03d}.pdf', a + 1, a + cnt), a, cnt))
+    return out
+
+
+def _render_jobs(windows: list, dpis: list, shards: int) -> list:
+    """(pdf, first, last, dpi, page_offset) for every gs call, `first`/`last` being page
+    numbers WITHIN that pdf and `page_offset` its position in the source document.
+
+    Kept a pure function of (windows, dpis, shards) for the same reason `_render_bands` is:
+    the page arithmetic is where an off-by-one would silently scramble or drop pages, and it
+    must be testable without invoking Ghostscript."""
+    runs = []
+    for wsrc, off, cnt in windows:
+        for first, last, d in _render_bands(dpis[off:off + cnt], shards):
+            runs.append((wsrc, first, last, d, off))
+    return runs
+
+
 def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int,
                 on_retry=None, shards: int = 0, stats: dict = None) -> bool:
     """Render every page ONCE, in COLOUR, at its own resolution. Ghostscript writes pages as
@@ -1120,26 +1188,72 @@ def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int
     else:
         release = 0
     try:
-        runs = _render_bands(dpis, shards)
+        # Window the document so no page index ever exceeds MAX_SEEK_PAGE, then band each
+        # window as before. A short document is one window and behaves exactly as it did.
+        try:
+            windows = _render_windows(src_p, work, len(dpis))
+        except Exception:
+            windows = [(src_p, 0, len(dpis))]     # split failed: try seeking anyway
+        runs = _render_jobs(windows, dpis, shards)
         if stats is not None:
             stats['bands'] = len(runs)
             stats['shards'] = min(shards, len(runs)) if runs else 0
+            if len(windows) > 1:
+                stats['windows'] = len(windows)
 
-        def _one(n_band) -> bool:
-            n, (first, last, d) = n_band
-            sub = work / f'r{n:03d}'
+        def _gs_band(src, sub: Path, first: int, last: int, d: int):
             sub.mkdir(exist_ok=True)
             cmd = [GS, '-sDEVICE=png16m', f'-r{d}', f'-dFirstPage={first}',
                    f'-dLastPage={last}', '-dNOPAUSE', '-dBATCH', '-dQUIET', _GS_INTERPOLATE,
-                   '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src_p)]
-            rr, tries = _run_retry(lambda: _run_stalled(
+                   '-sOutputFile=' + str(sub / 'p%04d.png'), win_long(src)]
+            return _run_retry(lambda: _run_stalled(
                 cmd, lambda: len(list(sub.glob('p*.png'))), timeout, text=True))
+
+        def _note(rr, first, last, d, got, want):
+            """Keep WHY a band failed. Discarding gs's stderr here left every failure in
+            the report as a bare 'render failed', so locating one bad page needed a
+            37-minute band replay."""
+            if stats is None or 'error' in stats:
+                return
+            msg = ''
+            if rr is None:
+                msg = 'no result (killed)'
+            elif rr.returncode != 0:
+                err = (getattr(rr, 'stderr', '') or '').strip().splitlines()
+                msg = f'rc={rr.returncode}' + (f': {err[-1][:120]}' if err else '')
+            else:
+                msg = f'wrote {got} of {want} pages without an error'
+            stats['error'] = f'pages {first}-{last} @ {d}dpi: {msg}'
+
+        def _one(n_band) -> bool:
+            n, (wsrc, first, last, d, off) = n_band
+            sub = work / f'r{n:04d}'
+            rr, tries = _gs_band(wsrc, sub, first, last, d)
             if tries > 1 and on_retry:
                 on_retry(tries - 1)
-            if rr is None or rr.returncode != 0:
-                return False
+            want = last - first + 1
+            got = len(list(sub.glob('p*.png')))
+            # A band that returns 0 is a failure; one that returns FEWER pages than asked
+            # for without erroring is worse, because it is silent — a 494-page file shipped
+            # 432 rendered pages and only the page-loss guard noticed.
+            if rr is None or rr.returncode != 0 or got != want:
+                _note(rr, off + first, off + last, d, got, want)
+                # LAST RESORT: give this band its own document, so gs renders it whole and
+                # never seeks. Cheaper and safer than re-rendering the file at a single
+                # resolution, which would flatten the per-page dpi this band exists for.
+                shutil.rmtree(sub, ignore_errors=True)
+                try:
+                    solo = _extract_pages(wsrc, work / f'b{n:04d}.pdf', first, last)
+                except Exception:
+                    return False
+                rr2, _ = _gs_band(solo, sub, 1, want, d)
+                solo.unlink(missing_ok=True)
+                if rr2 is None or rr2.returncode != 0 or len(list(sub.glob('p*.png'))) != want:
+                    return False
+                if stats is not None:
+                    stats['band_solo'] = stats.get('band_solo', 0) + 1
             for k, f in enumerate(sorted(sub.glob('p*.png'))):   # renumber to global index
-                f.replace(work / f'p{first + k:04d}.png')
+                f.replace(work / f'p{off + first + k:04d}.png')
             shutil.rmtree(sub, ignore_errors=True)
             return True
 
@@ -1175,6 +1289,8 @@ def _render_all(src_p: Path, work: Path, dpis: list, base_dpi: int, timeout: int
         return not failed
     finally:
         _release_threads(release)
+        for w in work.glob('w*.pdf'):        # window copies: scratch, never output
+            w.unlink(missing_ok=True)
 
 
 def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
@@ -3085,10 +3201,15 @@ def _compress_one(src: str, dest: str, dpi: int,
                 render_src, did_repair = fixed, True
                 for old in work.glob('p*.png'):
                     old.unlink(missing_ok=True)
+                render_stats.pop('error', None)   # report the REPAIRED attempt's reason
                 ok = _render()
                 pngs = sorted(p.name for p in work.glob('p*.png'))
         if not ok or not pngs:
-            return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': 'render failed'}
+            # Carry WHY, not just THAT: a bare 'render failed' told us nothing about which
+            # band died or what Ghostscript said, and cost a 37-minute replay to find out.
+            why = render_stats.get('error')
+            return {'src': src_p.name, 'orig': orig, 'new': 0,
+                    'err': f'render failed ({why})' if why else 'render failed'}
         # A render that produced FEWER pages than the source is page loss, not success —
         # typically a corrupt PDF whose repair salvaged only part of it. Fail the file and
         # keep the original rather than silently shipping a truncated manual.

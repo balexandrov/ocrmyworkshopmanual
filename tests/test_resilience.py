@@ -320,7 +320,13 @@ def test_page_loss_fails_instead_of_shipping_a_truncated_file(tmp_path):
         res = U.owm.compress_one(str(src), str(dest), 150, ocr=False)
     finally:
         U.owm._run_stalled = real
-    assert res.get('err') and 'page loss' in res['err'], res
+    # Two guards can catch this now and either is correct: the band-level check notices a
+    # gs call that wrote fewer pages than it was asked for (and retries that band as its own
+    # document first), and the page-loss guard compares the finished render against the
+    # SOURCE page count. What must never change is the guarantee — fail the file, keep the
+    # original, write nothing — so assert that, plus an error that names the shortfall.
+    assert res.get('err'), res
+    assert ('page loss' in res['err'] or 'of 5 pages' in res['err']), res
     assert not dest.exists(), 'a page-losing run must not write an output'
 
 
@@ -1240,3 +1246,77 @@ def test_language_is_resolved_from_the_source_not_our_render(tmp_path, monkeypat
     seen.clear()
     U.owm._ocr_source(source, work, 'auto', has_vector=False, preserve_images=True)
     assert seen['path'] == source
+
+
+# ── Rendering past Ghostscript's page-seek limit ─────────────────────────────
+# Measured on seven large manuals: `gs -dFirstPage=N` dies with "Unrecoverable error,
+# exit code 255" for N >= 1022 while the SAME pages render fine sequentially from page 1.
+# So a long document is rendered window by window, each window extracted to its own PDF,
+# and no page index handed to gs ever exceeds MAX_SEEK_PAGE.
+
+def test_render_jobs_cover_every_page_once_and_stay_seekable():
+    """The windowing correctness property. Every source page must be produced exactly once,
+    at its own dpi, and NO page number handed to Ghostscript may exceed MAX_SEEK_PAGE —
+    that limit is the entire reason windows exist, so a job that violates it is the bug."""
+    cap = U.owm.MAX_SEEK_PAGE
+    for n in (1, 999, 1000, 1001, 2001, 2460):
+        dpis = [200] * n
+        dpis[n // 2:] = [300] * (n - n // 2)          # a resolution change mid-document
+        windows = [(f'w{i}', a, min(cap, n - a)) for i, a in enumerate(range(0, n, cap))]
+        for shards in (1, 2, 6):
+            jobs = U.owm._render_jobs(windows, dpis, shards)
+            pages, seen_dpi = [], []
+            for _src, first, last, d, off in jobs:
+                assert 1 <= first <= last <= cap, (n, shards, first, last)
+                pages += list(range(off + first, off + last + 1))
+                seen_dpi += [d] * (last - first + 1)
+            assert pages == list(range(1, n + 1)), (n, shards, pages[:5], pages[-5:])
+            assert seen_dpi == dpis, (n, shards)
+
+
+def test_render_windows_split_only_long_documents(tmp_path):
+    """A document short enough to seek in is rendered from itself — no copies, no extra
+    I/O, behaviour unchanged. Only a long one is sliced."""
+    src = U.make_born_digital_pdf(tmp_path / 'short.pdf', npages=3)
+    assert U.owm._render_windows(src, tmp_path, 3) == [(src, 0, 3)]
+
+    # and a long one splits into bounded windows that tile the document
+    windows = U.owm._render_windows(src, tmp_path, 2460, size=1000)
+    assert [(off, cnt) for _p, off, cnt in windows] == [(0, 1000), (1000, 1000), (2000, 460)]
+
+
+def test_extract_pages_keeps_the_right_pages(tmp_path):
+    """The window/solo-band copy must be a faithful slice — an off-by-one here would
+    silently renumber a manual."""
+    src = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=8)
+    out = U.owm._extract_pages(src, tmp_path / 'slice.pdf', 3, 5)
+    assert len(PdfReader(str(out)).pages) == 3
+    whole, part = PdfReader(str(src)), PdfReader(str(out))
+    for i, p in enumerate(part.pages):
+        assert p.extract_text() == whole.pages[2 + i].extract_text()
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_windowed_render_matches_unwindowed_page_for_page(tmp_path, monkeypatch):
+    """End to end: forcing windows (by lowering the cap) must produce byte-identical pages
+    in the same order as rendering the document whole. This is what catches a page-offset
+    regression, which would otherwise surface only as a scrambled 2000-page manual."""
+    src = U.make_scan_pdf(tmp_path / 'many.pdf', npages=7, dpi=150)
+    dpis = U.owm._page_render_dpis(src, 150)
+
+    whole = tmp_path / 'whole'; whole.mkdir()
+    assert U.owm._render_all(src, whole, dpis, 150, 0, shards=1)
+
+    monkeypatch.setattr(U.owm, 'MAX_SEEK_PAGE', 3)     # -> windows of 3, 3, 1
+    win = tmp_path / 'win'; win.mkdir()
+    stats = {}
+    assert U.owm._render_all(src, win, dpis, 150, 0, shards=2, stats=stats)
+    assert stats.get('windows') == 3, stats
+
+    a = sorted(p.name for p in whole.glob('p*.png'))
+    b = sorted(p.name for p in win.glob('p*.png'))
+    assert a == b and len(a) == 7, (a, b)
+    for name in a:
+        assert (whole / name).read_bytes() == (win / name).read_bytes(), \
+            f'{name} differs between windowed and whole-document render'
+    assert not list(win.glob('w*.pdf')), 'window copies left behind in the work dir'
