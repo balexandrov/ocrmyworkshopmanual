@@ -55,6 +55,9 @@ Tuning notes (learned on Toyota FSM scans):
                    colour detection is cast-robust so a sepia B&W page stays
                    whitened-grayscale, not a yellow colour JPEG.
   --min-size 10    drop black connected components smaller than N px (scan speckle).
+                   An AREA, given at 300 dpi and scaled by dpi^2 (-> 4 px at the
+                   default 200 dpi), so the floor stays speckle-sized instead of
+                   growing into periods, colons and i-dots as dpi drops.
 
 Dependencies:
   pip:       numpy, scipy, Pillow, ocrmypdf, pypdf, img2pdf  (pip install -r requirements.txt)
@@ -710,9 +713,15 @@ def binarize_png(path: Path, min_size: int, despeckle: bool, dpi: int,
     ink = _sauvola_ink(flat, sauv_win, sauvola_k)
     ink |= flat < ink_floor                # keep solid-black fills solid
     if despeckle:
+        # min_size is an AREA, so it must scale with dpi^2 or it stops meaning
+        # "speckle" and starts meaning "punctuation". A period is ~4-9 px at 200 dpi
+        # but ~9-20 px at 300: a flat 10 px floor deleted 31% of the ink on a 200-dpi
+        # page here — 137 periods/colons/i-dots inside the text vs 4 actual specks.
+        # min_size is calibrated at 300 dpi (-> 4 px at 200, 18 px at 400).
+        ms = max(1, round(min_size * (dpi / 300.0) ** 2))
         lbl, _ = ndimage.label(ink, structure=_STRUCT8)
         counts = np.bincount(lbl.ravel())
-        small = np.where(counts < min_size)[0]
+        small = np.where(counts < ms)[0]
         small = small[small != 0]
         if small.size:
             ink = ink & ~np.isin(lbl, small)
@@ -3795,7 +3804,11 @@ def main():
     ap.add_argument('--sauvola-k', type=float, default=0.30,
                     help='adaptive threshold sensitivity (default 0.30; lower=bolder/thicker ink, '
                          'higher=thinner/cleaner)')
-    ap.add_argument('--min-size', type=int, default=10, help='remove black blobs smaller than N px')
+    ap.add_argument('--min-size', type=int, default=10,
+                    help='remove black blobs smaller than N px, specified at 300 dpi and '
+                         'scaled by dpi^2 (default 10 -> 4 px at the default 200 dpi). It is '
+                         'an area, so it must track resolution: a flat 10 px floor at 200 dpi '
+                         'deletes periods, colons and i-dots, not speckle')
     ap.add_argument('--photo-descreen', type=float, default=0.6,
                     help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
                          'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
