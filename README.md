@@ -13,37 +13,40 @@ and adds an invisible OCR text layer.
 Typical result on clean black-and-white scans: **~8–12% of the original size**,
 crisp, and full-text searchable.
 
+A **born-digital** (vector/text) PDF is never rasterised — but it isn't just copied either. It
+gets [re-stored losslessly](#lossless-rewrite-of-born-digital-pdfs): same drawing operators, same
+pixels, fewer bytes. Measured **−62%** on a 513 MB Subaru manual, half of which turned out to be
+uncompressed authoring metadata.
+
 ---
 
 ## Why this exists (vs. `ocrmypdf --optimize 3`)
 
-[ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF) is excellent, and this tool uses it for the
-OCR step. The gap isn't tuning: a general-purpose optimizer improves *the images it finds*,
-while shrinking a scanned manual means deciding what each *page* is — then proving the decision
-cost nothing.
+[ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF) is excellent, and this tool uses it for the OCR
+step. The gap isn't tuning: a general-purpose optimizer improves *the images it finds*, while
+shrinking a scanned manual means deciding what each *page* is — then proving the decision cost
+nothing.
 
-- **It optimizes the wrong representation.** ocrmypdf JBIG2-compresses only images that are
-  **already 1-bit**; it won't binarize a grayscale scan, so the one step that shrinks line-art
-  4–5× never happens: **~8% here vs ~37%** with `--optimize 3`.
-- **"Smaller" and "intact" are not the same, and file size cannot tell them apart** — losing a
-  page, a colour, a link or the text layer *all make a PDF smaller*. So pages are sorted into
-  six types before anything is re-encoded (colour wiring diagrams have line-art's low ink
-  coverage but their colour *is* the information; binarizing them destroyed diagrams
-  archive-wide here), and every output is audited against its source — page count, colour depth,
-  font metrics, text by word recall, links, bookmarks — keeping the original if a check fails.
-- **Compress-then-OCR reads a degraded image.** Measured: ~1 word error per 70 OCR'ing the
-  source at 400 dpi, ~5× that off the shipped 150-dpi page. So OCR runs on the **original** and
-  its text layer is grafted onto the compressed pages.
-- **It has to render everywhere, and survive an archive.** Generic, self-contained JBIG2 only —
-  PDFium (Chrome/Edge) draws a shared-dictionary JBIG2 as **blank pages**, and symbol mode being
-  ~30% smaller doesn't buy that back. Plus resumable, one corrupt file can't take down the
-  batch, malformed downloads repaired, duplicates flagged.
+- **It optimizes the wrong representation.** ocrmypdf JBIG2s only images that are *already*
+  1-bit and won't binarize a grayscale scan, so the step that shrinks line-art 4–5× never
+  happens: **~8% here vs ~37%** with `--optimize 3`.
+- **"Smaller" and "intact" are not the same, and size can't tell them apart** — losing a page, a
+  colour, a link or the text layer all make a PDF *smaller*. So pages are sorted into six types
+  first (colour wiring diagrams have line-art's low ink coverage but their colour *is* the
+  information), and every output is audited against its source, keeping the original if a check
+  fails.
+- **Compress-then-OCR reads a degraded image.** ~1 word error per 70 off the 400 dpi source, ~5×
+  that off the shipped 150 dpi page — so OCR runs on the original and its text layer is grafted
+  onto the compressed pages.
+- **It has to render everywhere and survive an archive.** Self-contained JBIG2 only (PDFium draws
+  shared-dictionary JBIG2 as **blank pages**), resumable, one corrupt file can't kill the batch.
 
 ## What it does, per page
 
 0. **Safety check first** — if a file doesn't look like a scan (it's a born-digital
-   vector/text PDF), it is **copied to the destination untouched** — never rendered,
-   binarized, or OCR'd (the one exception: a corrupt one is repaired first rather than
+   vector/text PDF), it is **never rendered, binarized, or OCR'd**. It is either copied
+   byte-for-byte or [re-stored losslessly](#lossless-rewrite-of-born-digital-pdfs) when that
+   pays off and verifies (the one exception: a corrupt one is repaired first rather than
    reproduced unreadable). See [Born-digital safety](#born-digital-safety).
 1. **Render** the page (Ghostscript).
 2. **Classify** it into a **page type** and apply that type's strategy:
@@ -70,14 +73,14 @@ than a yellow "color" scan. To handle a new kind of page, add a page type + a
 classifier rule + a strategy (see the `PT_*` constants and `classify_page`).
 
 Runs one worker process per file (uses all cores), at below-normal priority so your
-machine stays responsive. Originals are never modified; output mirrors the source
-tree under a sibling `"<src> (COMPRESSED)"` folder (or `--dest`). Skip-if-exists, so
-it's resumable.
+machine stays responsive. Originals are never modified unless you ask for `--in-place`;
+output mirrors the source tree under a sibling `"<src> (COMPRESSED)"` folder (or
+`--dest`). Skip-if-exists, so it's resumable.
 
-> ⚠️ For **scanned / image** PDFs only — but a built-in safety check protects
-> born-digital PDFs by copying them through untouched (see below), so it's safe to
-> point at a mixed tree. A run reports to the console; add `--log` to keep a **report file**
-> of what happened.
+> ⚠️ Re-imaging is for **scanned / image** PDFs only — a built-in safety check keeps
+> born-digital PDFs out of it (they get the lossless lane instead), so it's safe to point at a
+> mixed tree. A run reports to the console; add `--log` to keep a **report file** of what
+> happened.
 
 ---
 
