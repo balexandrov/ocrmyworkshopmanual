@@ -552,8 +552,10 @@ def test_cli_overrides_config(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_in_place_overwrites_scan_leaves_others(tmp_path):
-    """--in-place (dest == src): a scanned PDF is overwritten with its smaller
-    compressed self; a born-digital PDF is left byte-for-byte untouched."""
+    """--in-place (dest == src): a scanned PDF is overwritten with its smaller compressed
+    self. A born-digital PDF is never RASTERISED — but it is re-stored losslessly, so what
+    must survive in place is its page content, not its bytes. `--no-lossless` is what still
+    guarantees byte-for-byte."""
     scan = tmp_path / 'scan.pdf'
     pdfs = U.fixture_pdfs('line') or U.fixture_pdfs('photo_gray')
     if not pdfs:
@@ -568,9 +570,20 @@ def test_in_place_overwrites_scan_leaves_others(tmp_path):
     born = tmp_path / 'born.pdf'
     U.make_born_digital_pdf(born, npages=2)
     before = born.read_bytes()
-    res = U.owm.compress_one(str(born), str(born), 200, ocr=False, in_place=True)
+    res = U.owm.compress_one(str(born), str(born), 200, ocr=False, in_place=True,
+                             lossless=False)
     assert res.get('action') == 'born_digital', res
-    assert born.read_bytes() == before, 'born-digital must be left byte-identical in place'
+    assert born.read_bytes() == before, \
+        '--no-lossless must leave a born-digital PDF byte-identical in place'
+
+    # With the lane on, the same file is re-stored — smaller, same pages, still not rasterised.
+    text_before = PdfReader(str(born)).pages[0].extract_text()
+    res = U.owm.compress_one(str(born), str(born), 200, ocr=False, in_place=True,
+                             lossless_min_savings=0.01)
+    assert res.get('reason') == U.owm.REASON_LOSSLESS, res
+    assert born.stat().st_size < len(before)
+    assert PdfReader(str(born)).pages[0].extract_text() == text_before, \
+        'in-place lossless rewrite changed the page text'
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))

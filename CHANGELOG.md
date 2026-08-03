@@ -5,6 +5,112 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — born-digital PDFs are re-stored losslessly instead of just copied (−62% on a 513 MB manual)
+
+A born-digital (vector/text) PDF must never be rasterised, so this tool's whole compression
+pipeline was off-limits to it and it was copied out byte-for-byte. That left real money on the
+table: these files are big because of **how their bytes are stored**, not because of what they
+draw, and storage can be changed without touching a single drawing operator.
+
+Measured on `2020 WRX - WRX STI SERVICE MANUAL G1740BE.pdf` (537,575,830 bytes, 7,376 pages,
+FrameMaker 7.2 → Acrobat Distiller 9, PDF 1.4, 489,674 loose objects):
+
+| | size | time |
+|---|---|---|
+| copied, as before | 537.6 MB | — |
+| Flate the unfiltered streams + `/ObjStm` + level-9 recompress + drop private XMP | **195.1 MB (−62%)** | 3.2 min |
+| …plus `--lossless-zopfli` | ~172 MB | +23 min on 11 cores |
+
+**Half that file — 254.6 MB of 537.6 — was XMP metadata stored with no filter at all.** That is
+deliberate on Adobe's part, not a bug: XMP is meant to be locatable by scanning raw bytes for
+`<?xpacket` in any file format, and it is whitespace-padded so a tool can rewrite it in place
+without reflowing the file. Both properties die under compression. Sound for a file being
+round-tripped between authoring tools; dead weight in a distributed archive. PDF 1.4 also
+predates object streams, so 489,674 object headers sat uncompressed alongside it.
+
+The XMP turned out to be **per-illustration, not per-document**: every drawing was authored in
+Illustrator and placed into a FrameMaker book, and Distiller hung the source artwork's own XMP
+off the marked-content property dictionary for that drawing (`Page /Resources /Properties
+/MC0…`), 44% of it a base64-encoded JPEG *preview thumbnail* of the artwork. The
+document-level packet is kept; only the `/Metadata` key is deleted from each carrier, never the
+carrier dict, since page content streams name those dictionaries via `BDC`.
+
+New flags: `--no-lossless`, `--lossless-keep-xmp`, `--lossless-zopfli`,
+`--lossless-min-savings`. The lane is on by default; zopfli is opt-in and needs
+`pip install zopfli` (the run now fails at startup if the flag is used without it, rather than
+producing thousands of rows that quietly did less than asked). New `reason` value `lossless
+rewrite` — the file is `compressed`, but with no page rendered and no image re-encoded.
+
+**How much it wins depends on the producer, not the size.** The whole opportunity is whether
+that authoring chain wrote its metadata compressed: the 513 MB Subaru manual (Distiller 9,
+7,710 unfiltered packets) gives −62%, while a 236 MB Mitsubishi L200 manual (Distiller 6,
+0 unfiltered, 10,235 already-compressed packets) gives −8%. An 8× spread between two
+comparable manuals, which is why the lane is opportunistic and cheap to refuse.
+
+**`--in-place` is supported.** It is the one place this path overwrites a born-digital
+original, so the ordering is what makes it safe: fingerprint the source, write a temp file next
+to it (same volume → atomic `os.replace`), verify the temp against that fingerprint, and only
+then let it take the original's name. A failure at any step leaves the original byte-identical,
+because nothing has been written over it yet. Rehearsed on a copy of the L200 manual: replaced
+in 1.9 min, then re-fingerprinted from disk against values recorded before the overwrite —
+3,818 pages, 11,349 annotations, 8,004 bookmarks, 4,056 content parts, 729,542,412 decoded
+content bytes, all unchanged. A corrupt-but-repairable born-digital file still refuses in place,
+since repairing changes page content rather than storage.
+
+`--min-compress-mb` (default 5 MB) governs this lane as well. The lane sits before the raster
+path's floor check and initially ignored it, which showed up as an existing test failing: a
+2-page file under the floor was being rewritten in place. The floor is exactly where the user
+already says "below this, don't bother" — a rewrite saves a percentage, so the absolute win on a
+small file is tens of KB against rewriting (and, in place, churning) every born-digital file in
+the archive.
+
+#### Two XMP families, and the check that caught the second one
+
+A first version handled only the 7,711 typed `/Type /Metadata` packets. Page count, annotation
+count, bookmark count and per-page fingerprints **all matched** — and 9,898 further streams
+(28.9 MB) had silently vanished with them: a second, untyped family of XMP describing placed
+`.eps` artwork. What exposed it was the document-wide decoded-content total, which is why the
+guard compares that and not only a page sample. The final content-keyed audit accounts for every
+removed byte: 17,609 XMP packets and one obsolete linearization hint stream, nothing else.
+
+The rewrite's output is discarded — and the original bytes copied instead — unless it beats
+`--lossless-min-savings` **and** matches the source on page/annotation/bookmark/destination
+counts, document-wide decoded content bytes and stream-part count, per-page content and XObject
+fingerprints, and document info plus document XMP. XMP is compared as **parsed fields, not
+bytes**: pikepdf renormalises the packet on save (3,555 → 1,461 bytes here, dropping only
+whitespace padding), so a byte comparison would fail on every single file. If the baseline
+cannot be captured from the source, the rewrite is **skipped, never treated as passed** — the
+same trap the text-survival guard fell into on sources pypdf could not open.
+
+Not preserved: Fast Web View. The source was linearized and the hint stream (~107 KB, a pure
+index) is dropped. Relinearizing costs 6.1 MB and 6× the save time, and only matters for
+byte-range streaming over HTTP.
+
+#### `compress_streams=False` silently ate 80% of the zopfli win
+
+Worth recording because the flag looks obviously correct. Zopfli shrank the manual's streams by
+47.7 MB but the file by only 10.3 MB. Cause: `compress_streams=False` was set to stop qpdf
+recompressing the zopfli bytes — but qpdf also *generates* `/ObjStm` and `/XRef`, and that flag
+made it write them **raw, 45.2 MB instead of 7.5 MB**. The flag was never needed: qpdf compresses
+only streams that are currently uncompressed, so `compress_streams=True` preserves zopfli output
+exactly (measured 175.5 MB before and after) while still compressing the object streams.
+`recompress_flate` is the opposite case — it re-Deflates already-compressed streams, worth ~8.7%
+at level 9, so it is on when zopfli is off and off when zopfli is on.
+
+### Added (`--from-list` can write to a `--dest` tree; `helpers/lossless_candidates.py`)
+
+`--from-list` processed its files in place, and passing `--dest` alongside it was accepted and
+then **silently ignored** — the flag went nowhere. `--from-list --dest DIR` now writes a mirror
+tree under `DIR`, keyed off the listed paths' common base. Both modes are now real choices: in
+place reclaims the space immediately and leaves no second copy to adopt, `--dest` keeps a large
+opportunistic pass non-destructive so the results can be compared before anything is replaced.
+
+`helpers/lossless_candidates.py` builds that list from run reports you already have: every
+born-digital file was reported as such, so the rows are already the inventory. It selects
+`reason = born digital` at or above a size floor (default 50 MB), de-duplicates by real path
+across reports, drops paths no longer on disk, and writes them biggest-first. On this archive's
+five reports: 289,368 born-digital rows → **127 unique files, 17.0 GB**.
+
 ### Removed (`helpers/combine_sections.py`, `helpers/find_split_manuals.py`)
 
 Both were one-time tools for a job that is finished: the split USDM manuals have been

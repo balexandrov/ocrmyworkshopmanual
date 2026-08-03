@@ -30,6 +30,17 @@ min_compress_mb = 5      # don't compress files smaller than this (MB) — the w
                          # hundred KB against a lossy re-encode of every page. They are
                          # still checked for OCR and made searchable. 0 = compress everything
 
+# ── lossless rewrite (born-digital PDFs only) ─────────────────────────────────
+# These files are never rasterised; the rewrite only changes how their bytes are STORED
+# (Flate the unfiltered streams, bundle objects, drop per-illustration authoring XMP) and
+# its output is kept only if it verifies against the source. -62% on a 513 MB Subaru manual.
+# no_lossless = false        # true = copy born-digital files out byte-for-byte instead
+# lossless_keep_xmp = false  # true = compress the per-illustration XMP rather than drop it
+                             # (costs about half the saving; keeps artwork provenance)
+# lossless_zopfli = false    # true = re-Deflate with zopfli: ~12% more, ~700x the CPU.
+                             # Needs `pip install zopfli`. For a one-time archive pass.
+lossless_min_savings = 0.03  # discard the rewrite unless it is at least this much smaller
+
 # ── resilience / large collections ────────────────────────────────────────────
 timeout = 600             # STALL timeout: seconds a step may make NO progress before it is
                           # treated as hung (not a time budget — a slow big file is never

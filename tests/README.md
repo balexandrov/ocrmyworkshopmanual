@@ -15,7 +15,8 @@ tests/
   make_blank_fixture.py synthesize blank pages (corpus has no real blank verso)
   test_classify.py      DETECTION test: classify_page() == folder label
   test_settings_matrix.py  SETTINGS sweep (script) + sanity gates (pytest)
-  test_born_digital.py  SAFETY test: born-digital PDFs detected + copied untouched
+  test_born_digital.py  SAFETY test: born-digital PDFs detected + never rasterised
+  test_lossless.py      LOSSLESS rewrite: shrinks, both XMP families, guard rejects bad output
   test_resilience.py    timeout aborts gracefully / output verify / dry-run preview
 ```
 

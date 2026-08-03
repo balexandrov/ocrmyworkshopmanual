@@ -2765,6 +2765,395 @@ def _resolve_language(src_p: Path, work: Path, language: str, timeout: int = 0) 
     return language, note
 
 
+# ── Lossless rewrite (born-digital) ──────────────────────────────────────────
+#
+# A born-digital PDF must never be rasterised, so this tool's whole compression pipeline is
+# off-limits to it and it was copied out byte-for-byte. That left real money on the table:
+# these files are big because of how their bytes are STORED, not because of what they draw,
+# and storage can be changed without touching a single drawing operator.
+#
+# Measured on 2020 WRX - WRX STI SERVICE MANUAL G1740BE.pdf (537,575,830 bytes, 7,376 pages,
+# FrameMaker 7.2 -> Acrobat Distiller 9, PDF 1.4, 489,674 loose objects):
+#
+#     tier 1  Flate the unfiltered streams, bundle objects into /ObjStm   537.6 -> 329.8 MB
+#     tier 2  drop the per-illustration XMP packets                       329.8 -> 233.5 MB
+#     tier 3  re-Deflate every stream with zopfli                         233.5 -> 185.7 MB
+#
+# -65.4% with every page's decoded content byte-for-byte identical. Where it comes from:
+#
+# TIER 1. Half that file (254.6 MB of 537.6) was XMP metadata stored with NO FILTER AT ALL.
+# That is deliberate on Adobe's part, not a bug: XMP is meant to be locatable by scanning raw
+# bytes for `<?xpacket`, in any file format, and it is whitespace-padded so a tool can rewrite
+# it in place without reflowing the file. Both properties die under compression. For a working
+# file being round-tripped that trade is sound; for a distributed archive it is dead weight.
+# PDF 1.4 also predates object streams, so 489,674 object headers sat uncompressed too.
+#
+# TIER 2. Those XMP packets are per-ILLUSTRATION, not per-document. Each drawing was authored
+# in Illustrator and placed into a FrameMaker book, and Distiller hung the source artwork's own
+# XMP off the marked-content property dictionary for that drawing:
+#     Page /Resources /Properties /MC0..MC7 -> << /Title /Author /Creator /Metadata >>
+# 44% of it is a base64-encoded JPEG *preview thumbnail* of the artwork. Two families exist and
+# both must be handled — this was measured the hard way, after 9,898 streams vanished from an
+# output whose page count, annotation count, outline count and page fingerprints all matched:
+#     7,711 typed   /Type /Metadata /Subtype /XML   unfiltered   254.6 MB  placed .ai files
+#     9,898 untyped  no /Type at all               already Flate  28.9 MB  placed .eps files
+# The document-level packet in /Root /Metadata is KEPT. Only the `/Metadata` key is deleted
+# from each carrier, never the carrier dict itself: the page content stream references those
+# property dicts by name (`/MC0 BDC`), so removing one would break marked content.
+#
+# TIER 3. Distiller's Deflate is weak. Measured over a 300-stream sample: zlib level 6 gets
+# 8.1%, level 9 gets 8.7%, and zopfli 15 iterations gets 19.9%. Zopfli emits an ORDINARY
+# Deflate stream — same format, every reader reads it, decompression speed unchanged — it just
+# spends far more encoder time choosing matches (shortest-path over the real bit cost rather
+# than greedy) and block splits. It is ~700x slower than zlib-9, so it is opt-in.
+#
+# WHAT THIS CANNOT DO, BY CONSTRUCTION: no page is rendered, no image is re-encoded, no
+# drawing operator is touched. Tiers 1 and 3 change only compression, and each recompressed
+# stream is accepted only if it decodes to the identical bytes. Tier 2 is the only tier that
+# alters the object graph, which is why the document-level checks below exist.
+
+LOSSLESS_MIN_SAVINGS = 0.03   # under 3% smaller, keep the original bytes — not worth a rewrite
+ZOPFLI_ITERATIONS = 15        # what the 19.9% was measured at; higher buys little for the time
+_ZOPFLI_BATCH_BYTES = 40 * 1024 * 1024   # decoded bytes in flight per batch, to bound memory
+# qpdf GENERATES these two itself on save, so recompressing them here is thrown away.
+_LOSSLESS_SKIP_TYPES = ('/ObjStm', '/XRef')
+
+
+def _lossless_sample_pages(n: int, want: int = 12) -> list:
+    """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
+    Deterministic so the same file verifies identically on every run."""
+    if n <= 0:
+        return []
+    if n <= want:
+        return list(range(n))
+    idx = {0, 1, n - 1, n - 2}
+    idx.update(round(i * (n - 1) / (want - 1)) for i in range(want))
+    return sorted(i for i in idx if 0 <= i < n)
+
+
+def _lossless_fingerprint(pdf_path: Path) -> dict:
+    """Everything the guard compares, or None if it cannot be read.
+
+    None means SKIP THE REWRITE — never "passed". That distinction is the whole reason this
+    returns None instead of an empty dict: the text-survival guard was silently a no-op on
+    files whose source pypdf could not open, so unreadable files sailed through unguarded.
+
+    `content_decoded` is the document-wide total, not a sample, and it is the check that
+    earns its keep: when 9,898 XMP streams were being removed unnoticed, every count and
+    every sampled page still matched, and this total was what exposed it."""
+    import pikepdf
+    try:
+        with pikepdf.open(str(pdf_path)) as p:
+            fp = {'pages': len(p.pages)}
+            fp['annots'] = sum(len(pg.obj.get('/Annots') or []) for pg in p.pages)
+            with p.open_outline() as ol:
+                def _cnt(items):
+                    return sum(1 + _cnt(i.children) for i in items)
+                fp['outline'] = _cnt(ol.root)
+            fp['dests'] = '/Names' in p.Root
+            fp['docinfo'] = ({str(k): str(v) for k, v in p.docinfo.items()}
+                             if p.trailer.get('/Info') is not None else {})
+            # Parsed FIELDS, never bytes: pikepdf renormalises the packet on save (measured
+            # 3,555 -> 1,461 bytes on the WRX manual, dropping only whitespace padding and
+            # reordering attributes), so a byte comparison fails on every single file.
+            # Is the source's packet even XMP? Measured on 2014_Forester.pdf: /Root /Metadata
+            # holds 3,360 bytes of binary with no xpacket marker at all, so pikepdf discards it
+            # and writes a valid empty packet. Nothing readable is lost — but comparing PARSED
+            # fields cannot see it either (both sides yield zero fields), so the replacement
+            # would go unmentioned. `xmp_ok` exists to put it in the file's note. It is
+            # deliberately NOT one of the keys `_lossless_verify` compares: the output's packet
+            # is valid by construction, so comparing it would fail every such file.
+            #
+            # This MUST run before open_metadata(): on an unparseable packet that call replaces
+            # it IN MEMORY ("Error occurred parsing XMP, replacing with empty XMP"), so asking
+            # afterwards always reports a valid packet and the check silently never fires.
+            fp['xmp_ok'] = True
+            m = p.Root.get('/Metadata')
+            if isinstance(m, pikepdf.Stream):
+                try:
+                    head = m.read_bytes()[:2048]
+                    fp['xmp_ok'] = (b'<?xpacket' in head or b'<x:xmpmeta' in head
+                                    or b'<rdf:RDF' in head)
+                except Exception:
+                    fp['xmp_ok'] = False
+            try:
+                with p.open_metadata() as m:
+                    fp['xmp'] = {k: str(v) for k, v in dict(m).items()}
+            except Exception:
+                fp['xmp'] = None
+            per, total, parts = {}, 0, 0
+            sample = set(_lossless_sample_pages(len(p.pages)))
+            for i, pg in enumerate(p.pages):
+                h = hashlib.sha1() if i in sample else None
+                c = pg.obj.get('/Contents')
+                for s in (c if isinstance(c, pikepdf.Array) else [c]):
+                    if s is None:
+                        continue
+                    b = s.read_bytes()
+                    total += len(b)
+                    parts += 1
+                    if h is not None:
+                        h.update(b)
+                if h is not None:
+                    res = pg.obj.get('/Resources')
+                    xo = res.get('/XObject') if res is not None else None
+                    if xo is not None:
+                        for k in sorted(xo.keys()):
+                            try:
+                                h.update(xo[k].read_bytes())
+                            except Exception:
+                                pass
+                    per[i] = (h.hexdigest(), str(pg.obj.get('/MediaBox')),
+                              str(pg.obj.get('/Rotate', '')))
+            fp['sample'] = per
+            fp['content_parts'] = parts
+            fp['content_decoded'] = total
+            return fp
+    except Exception:
+        return None
+
+
+def _lossless_verify(base: dict, out_p: Path) -> str:
+    """'' if the rewrite is sound, else a short description of WHAT differs (for the report).
+    Cheapest discriminators first, so a broken output costs a page count, not a full re-read."""
+    got = _lossless_fingerprint(out_p)
+    if got is None:
+        return 'output could not be re-opened for verification'
+    for key, what in (('pages', 'page count'), ('annots', 'annotation count'),
+                      ('outline', 'bookmark count'), ('dests', 'named destinations'),
+                      ('content_parts', 'content stream count'),
+                      ('content_decoded', 'decoded content bytes'),
+                      ('docinfo', 'document info'), ('xmp', 'document XMP fields'),
+                      ('sample', 'page content fingerprints')):
+        if got[key] != base[key]:
+            a, b = base[key], got[key]
+            if key in ('sample', 'docinfo', 'xmp'):
+                return f'{what} differ'
+            return f'{what} {a} -> {b}'
+    return ''
+
+
+def _strip_private_xmp(pdf) -> dict:
+    """Delete the `/Metadata` key from every carrier EXCEPT the document catalog. Returns
+    {'typed': n, 'untyped': n} — both families, counted separately because they arrived in
+    the archive from different authoring eras and only one of them is ever large."""
+    import pikepdf
+    keep = pdf.Root.get('/Metadata')
+    keep_id = keep.objgen if keep is not None else None
+    n = {'typed': 0, 'untyped': 0}
+    for o in pdf.objects:
+        if not isinstance(o, (pikepdf.Dictionary, pikepdf.Stream)):
+            continue
+        try:
+            m = o.get('/Metadata')
+        except Exception:
+            continue
+        if m is None or (keep_id is not None and m.objgen == keep_id):
+            continue
+        typed = isinstance(m, pikepdf.Stream) and m.get('/Type') is not None
+        n['typed' if typed else 'untyped'] += 1
+        del o['/Metadata']
+    return n
+
+
+def _zopfli_available() -> bool:
+    try:
+        import zopfli.zlib          # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _zopfli_one(buf: bytes) -> bytes:
+    """Worker body — imports inside so it survives Windows spawn without a global."""
+    import zopfli.zlib
+    return zopfli.zlib.compress(buf, numiterations=ZOPFLI_ITERATIONS)
+
+
+def _zopfli_streams(pdf, workers: int, progress=None) -> dict:
+    """Re-Deflate every single-filter Flate stream with zopfli, in parallel.
+
+    A stream is replaced only when the new bytes are SMALLER and decode to bytes identical
+    to the original's — so this cannot alter what any page draws, and a stream zopfli cannot
+    improve simply keeps what it had. Streams are fed in size-bounded batches because a
+    7,000-page manual holds ~1 GB of decoded content and materialising all of it at once
+    would trade a compression win for an OOM."""
+    import pikepdf
+    import zlib
+    todo = []
+    for o in pdf.objects:
+        if not isinstance(o, pikepdf.Stream):
+            continue
+        # Single /FlateDecode only. A filter CHAIN or an image codec (DCT, JBIG2, CCITT)
+        # is either not ours to re-encode or would need the chain rebuilt.
+        if str(o.get('/Filter')) != '/FlateDecode':
+            continue
+        if str(o.get('/Type') or '') in _LOSSLESS_SKIP_TYPES:
+            continue
+        todo.append(o)
+    stat = {'streams': len(todo), 'shrunk': 0, 'kept': 0, 'before': 0, 'after': 0}
+    if not todo:
+        return stat
+    i = 0
+    with cf.ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+        while i < len(todo):
+            batch, dec, nbytes = [], [], 0
+            while i < len(todo) and nbytes < _ZOPFLI_BATCH_BYTES:
+                o = todo[i]
+                i += 1
+                try:
+                    d = o.read_bytes()
+                except Exception:
+                    continue          # undecodable stream: leave it exactly as it is
+                batch.append(o)
+                dec.append(d)
+                nbytes += len(d)
+            for o, d, new in zip(batch, dec, pool.map(_zopfli_one, dec)):
+                old = o.read_raw_bytes()
+                stat['before'] += len(old)
+                ok = False
+                if len(new) < len(old):
+                    try:
+                        ok = zlib.decompress(new) == d
+                    except Exception:
+                        ok = False
+                if ok:
+                    o.write(new, filter=pikepdf.Name('/FlateDecode'))
+                    stat['after'] += len(new)
+                    stat['shrunk'] += 1
+                else:
+                    stat['after'] += len(old)
+                    stat['kept'] += 1
+            if progress:
+                progress(min(i, len(todo)), len(todo))
+    return stat
+
+
+def lossless_signature(src_p: Path) -> dict:
+    """What a lossless rewrite has to work with, WITHOUT rewriting anything: bytes sitting in
+    unfiltered streams, and bytes of non-catalog XMP. Used by --dry-run so a preview can say
+    which born-digital files are worth a pass, instead of guessing from file size."""
+    import pikepdf
+    sig = {'unfiltered': 0, 'xmp': 0, 'streams': 0}
+    try:
+        with pikepdf.open(str(src_p)) as p:
+            keep = p.Root.get('/Metadata')
+            keep_id = keep.objgen if keep is not None else None
+            xmp_ids = set()
+            for o in p.objects:
+                if not isinstance(o, (pikepdf.Dictionary, pikepdf.Stream)):
+                    continue
+                m = o.get('/Metadata')
+                if (isinstance(m, pikepdf.Stream) and m.objgen != keep_id):
+                    xmp_ids.add(m.objgen)
+            for o in p.objects:
+                if not isinstance(o, pikepdf.Stream):
+                    continue
+                sig['streams'] += 1
+                try:
+                    raw = len(o.read_raw_bytes())
+                except Exception:
+                    continue
+                if o.get('/Filter') is None:
+                    sig['unfiltered'] += raw
+                if o.objgen in xmp_ids:
+                    sig['xmp'] += raw
+    except Exception as ex:
+        sig['error'] = repr(ex)[:120]
+    return sig
+
+
+def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
+                     zopfli: bool = False, workers: int = 1,
+                     min_savings: float = LOSSLESS_MIN_SAVINGS,
+                     progress=None) -> dict:
+    """Rewrite a born-digital PDF smaller without changing what any page draws.
+
+    Returns {'ok': bool, 'new': bytes_or_0, 'note': str, 'skip': str, 'stats': {...}}.
+    `ok` False is a normal, expected outcome — the caller then copies the original bytes.
+    Nothing is written to `out_p` unless the rewrite both verified and beat `min_savings`.
+
+    Never called for an encrypted file (nothing to gain, and re-saving would change the
+    encryption), and never for one whose baseline cannot be captured."""
+    import pikepdf
+    orig = src_p.stat().st_size
+    stats = {}
+    base = _lossless_fingerprint(src_p)
+    if base is None:
+        return {'ok': False, 'new': 0, 'skip': 'baseline unreadable', 'stats': stats,
+                'note': ''}
+    tmp = out_p.with_suffix(out_p.suffix + '.lossless')
+    try:
+        with pikepdf.open(str(src_p)) as p:
+            if p.is_encrypted:
+                return {'ok': False, 'new': 0, 'skip': 'encrypted', 'stats': stats, 'note': ''}
+            if strip_xmp:
+                stats['xmp'] = _strip_private_xmp(p)
+            if zopfli:
+                stats['zopfli'] = _zopfli_streams(p, workers, progress)
+            # compress_streams=True is REQUIRED even after zopfli, and its interaction with
+            # recompress_flate is the whole subtlety of this save:
+            #  * qpdf compresses only streams that are currently UNCOMPRESSED, so our zopfli
+            #    bytes survive it untouched (measured: 175.5 MB before and after).
+            #  * qpdf also generates /ObjStm and /XRef itself. With compress_streams=False
+            #    those are written RAW — 45.2 MB instead of 7.5 MB, which silently ate
+            #    37.7 MB of the 47.7 MB zopfli had just won.
+            #  * recompress_flate=True re-Deflates streams that are ALREADY compressed. That
+            #    is worth ~8.7% at level 9 when zopfli is off, and would UNDO zopfli's work
+            #    when it is on — hence the flag tracks `not zopfli`.
+            if not zopfli:
+                try:
+                    pikepdf.settings.set_flate_compression_level(9)
+                except Exception:
+                    pass
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            p.save(str(tmp), compress_streams=True, recompress_flate=not zopfli,
+                   object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        new = tmp.stat().st_size
+        stats['new'] = new
+        # Order matters: a rewrite that did not pay off is discarded WITHOUT paying for the
+        # verification read (a 500 MB file costs ~40 s to re-fingerprint).
+        if new >= int(orig * (1 - min_savings)):
+            tmp.unlink(missing_ok=True)
+            return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
+                    'skip': f'only {100 * (1 - new / orig):.1f}% smaller'}
+        bad = _lossless_verify(base, tmp)
+        if bad:
+            tmp.unlink(missing_ok=True)
+            return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
+                    'skip': f'verification failed: {bad}'}
+        os.replace(str(tmp), str(out_p))
+        if not base.get('xmp_ok', True):
+            stats['xmp_unparseable'] = True
+        return {'ok': True, 'new': new, 'stats': stats, 'skip': '',
+                'note': _lossless_note(orig, new, stats)}
+    except Exception as ex:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
+                'skip': f'rewrite failed: {repr(ex)[:120]}'}
+
+
+def _lossless_note(orig: int, new: int, stats: dict) -> str:
+    """The per-file note: what the rewrite did, in the terms a reviewer would audit it in."""
+    bits = [f'lossless rewrite: {mb(orig):.2f} -> {mb(new):.2f} MB '
+            f'({100 * (1 - new / orig):.0f}% smaller)']
+    x = stats.get('xmp')
+    if x and (x['typed'] or x['untyped']):
+        bits.append(f'{x["typed"] + x["untyped"]} private XMP packets dropped '
+                    f'({x["typed"]} typed/{x["untyped"]} untyped)')
+    z = stats.get('zopfli')
+    if z and z['streams']:
+        bits.append(f'zopfli {z["shrunk"]}/{z["streams"]} streams '
+                    f'{mb(z["before"]):.1f} -> {mb(z["after"]):.1f} MB')
+    if stats.get('xmp_unparseable'):
+        bits.append("the source's document XMP packet was not valid XMP (no xpacket marker) "
+                    'and was replaced with an empty one')
+    return ' (' + '; '.join(bits) + ')'
+
+
 # ── Report vocabulary ─────────────────────────────────────────────────────────
 # Fixed, machine-groupable values for the report's `reason` and `ocr` columns. The note
 # says the same things in prose, but prose cannot be filtered or tallied without
@@ -2773,6 +3162,7 @@ def _resolve_language(src_p: Path, work: Path, language: str, timeout: int = 0) 
 
 # WHY the file ended up compressed or kept (pairs with the `action` column).
 REASON_BORN = 'born digital'          # vector/text PDF — never rasterised, copied as-is
+REASON_LOSSLESS = 'lossless rewrite'  # born-digital, stored smaller; page content untouched
 REASON_SMALL = 'small size'           # under the compression floor — not worth the work
 REASON_ALREADY = 'already compressed' # re-encoding it would not (or did not) pay off
 REASON_COMPRESSIBLE = 'compressible'  # it did beat the min-savings bar, so we shipped it
@@ -3049,7 +3439,10 @@ def _compress_one(src: str, dest: str, dpi: int,
                   min_savings: float = 0.25,
                   sauvola_k: float = 0.30, photo_descreen: float = 0.6,
                   timeout: int = 0, in_place: bool = False,
-                  min_compress_mb: float = None) -> dict:
+                  min_compress_mb: float = None,
+                  lossless: bool = True, lossless_strip_xmp: bool = True,
+                  lossless_zopfli: bool = False,
+                  lossless_min_savings: float = LOSSLESS_MIN_SAVINGS) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -3079,6 +3472,7 @@ def _compress_one(src: str, dest: str, dpi: int,
             src_pages = len(PdfReader(str(src_p)).pages)
         except Exception:
             src_pages = 0
+        floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
         # SAFETY: never rasterise a born-digital (vector/text) PDF. If the file does
         # not look like a scan, copy it through to dest byte-for-byte, untouched
         # (no render, no binarize, no OCR) — this tool is for scanned/image PDFs only.
@@ -3107,8 +3501,53 @@ def _compress_one(src: str, dest: str, dpi: int,
                             'err': 'born-digital PDF is corrupt (repairable): re-run with '
                                    '--dest to write the repaired copy'}
                 copy_from, rnote = fixed, _repair_note(rstats)
-            if not in_place:   # in-place: leave the original vector PDF exactly as-is
+            lnote, lstats, lskip = '', {}, ''
+            # LOSSLESS REWRITE: the only compression a born-digital file may ever get. It
+            # changes how bytes are STORED, never what a page draws — no render, no image
+            # re-encode, no operator touched — and it must both verify against the source and
+            # beat the savings bar or its output is thrown away. Anything short of that falls
+            # through to the byte-for-byte copy below, which is what this path did
+            # unconditionally before.
+            #
+            # This runs under --in-place TOO. That is deliberate and it is the one place this
+            # path can overwrite an original, so the ordering matters: the source is
+            # fingerprinted, a temp file is written NEXT TO IT (same volume, so the promotion
+            # is an atomic os.replace), the temp is verified against that fingerprint, and only
+            # then does it take the original's name. A failure at any step leaves the original
+            # untouched and byte-identical, because nothing has been written over it yet.
+            # `--no-lossless` opts out; a corrupt-but-repairable source still refuses in place
+            # (above), because THAT rewrite would change page content rather than storage.
+            if not in_place:
                 dest_p.parent.mkdir(parents=True, exist_ok=True)
+            # The SAME size floor the raster path uses (--min-compress-mb). A rewrite saves a
+            # percentage, so on a small file the absolute win is tens of KB — not worth
+            # rewriting every one of the 289,368 born-digital files in an archive, and under
+            # --in-place not worth the churn of replacing them. The floor is where the user
+            # already expresses "below this, don't bother".
+            if lossless and orig < floor:
+                lossless = False
+                lskip = (f'{mb(orig):.2f} MB is under the {mb(floor):.0f} MB floor')
+            if lossless:
+                lres = lossless_rewrite(
+                    copy_from, dest_p, strip_xmp=lossless_strip_xmp,
+                    zopfli=lossless_zopfli,
+                    workers=_ocr_jobs_budget(copy_from, src_pages) if lossless_zopfli else 1,
+                    min_savings=lossless_min_savings)
+                lnote, lstats, lskip = lres['note'], lres['stats'], lres['skip']
+                if lres['ok']:
+                    return {'src': src_p.name, 'orig': orig, 'new': lres['new'],
+                            'pages': bsig.get('sampled'), 'kept': False, 'err': None,
+                            # A lossless rewrite IS a compression — it just did not go
+                            # near the raster pipeline. `reason` is what says which.
+                            'action': 'compressed', 'signals': bsig,
+                            'reason': REASON_LOSSLESS, 'lang': '',
+                            'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
+                            'note': (f' (born-digital: rewritten losslessly'
+                                     f'{" in place" if in_place else ""}; '
+                                     f'scan_frac={bsig.get("scan_frac")})'
+                                     + rnote + lnote),
+                            'lossless': lstats}
+            if not in_place:   # in-place and not rewritten: the original stays exactly as-is
                 tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
                 try:
                     shutil.copyfile(str(copy_from), str(tmp_out))
@@ -3118,6 +3557,10 @@ def _compress_one(src: str, dest: str, dpi: int,
                     raise
             where = 'left untouched' if in_place else ('repaired and copied' if rnote
                                                        else 'copied untouched')
+            # WHY a rewrite was not kept belongs in the row: without it, a reviewer cannot
+            # tell "this file had nothing to gain" from "the guard rejected the output".
+            if lskip:
+                lnote = f' (lossless rewrite not kept: {lskip})'
             return {'src': src_p.name, 'orig': orig,
                     'new': orig if in_place else dest_p.stat().st_size,
                     'pages': bsig.get('sampled'), 'kept': True, 'err': None,
@@ -3126,7 +3569,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                     # Copied byte-for-byte, so whatever text layer it has is preserved
                     # exactly — and one it never had is not created (this path runs no OCR).
                     'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
-                    'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})' + rnote}
+                    'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'
+                            + rnote + lnote}
         # A stamp is worth saying out loud on the rows it changes: without this, a file whose
         # `ocr` column flipped from 'kept existing' to 'new ocr' gives a reviewer no reason
         # why. `signals` is attached ONLY when there is a stamp, so every other row in a
@@ -3139,7 +3583,6 @@ def _compress_one(src: str, dest: str, dpi: int,
             bsignals = {'signals': bsig}
         note0 = ''
         skip_reason = ''
-        floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
         # SIZE FLOOR: a small file is not worth re-imaging (see MIN_COMPRESS_MB). It still
         # goes down the same ship-the-original path, which repairs it if broken and OCRs it
         # if it has no text layer — so "too small to compress" never means "left
@@ -3527,7 +3970,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  jpeg_quality: int, min_savings: float,
                  sauvola_k: float, photo_descreen: float,
                  ocr: bool = True, language: str = 'auto',
-                 min_compress_mb: float = None) -> dict:
+                 min_compress_mb: float = None, lossless: bool = True) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check, the same
@@ -3539,11 +3982,24 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
     try:
         born, bsig = looks_born_digital(src_p)
         if born:
+            # A born-digital row used to predict only "would copy untouched", which is no
+            # longer what the run does. `lossless_signature` measures — without rewriting
+            # anything — the two pools a rewrite actually feeds on, so a preview over a big
+            # archive says WHICH of these files are worth a pass rather than leaving a
+            # reviewer to guess from file size.
+            lsig, lnote = {}, ' (would copy untouched'
+            if lossless:
+                lsig = lossless_signature(src_p)
+                if lsig.get('unfiltered') or lsig.get('xmp'):
+                    lnote = (f' (would attempt a lossless rewrite: '
+                             f'{mb(lsig["unfiltered"]):.1f} MB in unfiltered streams, '
+                             f'{mb(lsig["xmp"]):.1f} MB of private XMP')
             return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
                     'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
                     'reason': REASON_BORN, 'lang': '',
                     'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
-                    'note': f' (would copy untouched; scan_frac={bsig.get("scan_frac")})'}
+                    'lossless': lsig,
+                    'note': lnote + f'; scan_frac={bsig.get("scan_frac")})'}
         ocr_state, language = _predict_ocr(src_p, work, ocr, language)
         rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
         # Same note and same signals the real run reports, so the preview row explains the
@@ -3920,11 +4376,35 @@ def main():
                          '"<name> (COMPRESSED).pdf")')
     ap.add_argument('--in-place', action='store_true',
                     help='OVERWRITE each PDF with its compressed/OCR result IN PLACE (no output '
-                         'tree). Non-PDF files, folder structure, born-digital PDFs and '
-                         'already-optimal files are left untouched; unchanged files are not '
-                         'rewritten. DESTRUCTIVE — back up first. A report is written only '
-                         'where --log says, never among the manuals. Cannot be combined '
-                         'with --dest.')
+                         'tree). Non-PDF files, folder structure and already-optimal files are '
+                         'left untouched; unchanged files are not rewritten. A born-digital PDF '
+                         'is never rasterised, but IS re-stored smaller when the lossless '
+                         'rewrite verifies against it (--no-lossless to leave it alone). '
+                         'DESTRUCTIVE — back up first. A report is written only where --log '
+                         'says, never among the manuals. Cannot be combined with --dest.')
+    ap.add_argument('--no-lossless', action='store_true',
+                    help='do not attempt the lossless rewrite on born-digital PDFs — copy them '
+                         'out byte-for-byte, as this tool did before. The rewrite re-stores a '
+                         'vector/text PDF smaller (Flate its unfiltered streams, bundle its '
+                         'objects, drop per-illustration authoring XMP) without rendering, '
+                         're-encoding or touching one drawing operator, and its output is kept '
+                         'only if it verifies against the source AND beats --lossless-min-savings')
+    ap.add_argument('--lossless-keep-xmp', action='store_true',
+                    help='in the lossless rewrite, compress the per-illustration XMP metadata '
+                         'instead of deleting it. Measured on a 7,376-page Subaru manual: '
+                         'keeping it costs 96 MB (-39%% instead of -57%%). What it buys you is '
+                         'which Illustrator/EPS file each drawing came from, plus its preview '
+                         'thumbnail — provenance for source files an archive does not have')
+    ap.add_argument('--lossless-zopfli', action='store_true',
+                    help='in the lossless rewrite, re-Deflate every stream with zopfli. Output '
+                         'is an ordinary Deflate stream that every reader reads at normal speed; '
+                         'it just costs ~700x more encoder time. Worth ~21%% beyond the rest '
+                         '(233 -> 186 MB on that Subaru manual, 23 min on 11 cores). Intended '
+                         'for a one-time archive pass, not a routine run')
+    ap.add_argument('--lossless-min-savings', type=float, default=LOSSLESS_MIN_SAVINGS,
+                    help=f'discard the lossless rewrite unless it is at least this much smaller '
+                         f'(default {LOSSLESS_MIN_SAVINGS:.2f} = 3%%); the original bytes are '
+                         f'then copied instead')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
     ap.add_argument('--workers', type=int, default=_default_workers(),
                     help='parallel worker processes (default: one per PHYSICAL core — the '
@@ -4019,6 +4499,13 @@ def main():
 
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
+    # Fail HERE, not per-file: a missing optional encoder must not turn into 4,000 rows that
+    # quietly did tier 1+2 while the run was asked for tier 3.
+    if args.lossless_zopfli and not _zopfli_available():
+        print('ERROR: --lossless-zopfli needs the `zopfli` package (pip install zopfli)',
+              file=sys.stderr); sys.exit(1)
+    if args.lossless_zopfli and args.no_lossless:
+        print('ERROR: --lossless-zopfli contradicts --no-lossless', file=sys.stderr); sys.exit(1)
     if args.from_list and args.src:
         print('ERROR: pass EITHER a src OR --from-list, not both', file=sys.stderr); sys.exit(1)
     if not args.from_list and not args.src:
@@ -4026,9 +4513,16 @@ def main():
 
     single_dest = None
     if args.from_list:
-        # GLOBAL-POOL mode: an explicit list of PDFs, each processed IN PLACE. Everything
-        # downstream is the normal in-place path, but the job list spans all folders at once,
+        # GLOBAL-POOL mode: an explicit list of PDFs. The job list spans all folders at once,
         # so the single worker pool parallelises across the whole set (not per-folder).
+        #
+        # WITHOUT --dest each listed file is processed IN PLACE, which is what this mode has
+        # always done. WITH --dest the results are written into a mirror tree under it, keyed
+        # off the listed paths' common base. That combination used to be accepted and then
+        # silently ignored — args.in_place was forced True below and --dest went nowhere.
+        # Both are now real choices: in place reclaims the space immediately and leaves no
+        # second copy to adopt, --dest keeps a big opportunistic pass non-destructive so you
+        # can compare before replacing anything.
         if not args.from_list.exists():
             print(f'ERROR: --from-list file not found: {args.from_list}', file=sys.stderr); sys.exit(1)
         listed = [Path(x.strip()) for x in args.from_list.read_text(encoding='utf-8').splitlines()
@@ -4036,16 +4530,20 @@ def main():
         pdfs = [p for p in listed if p.suffix.lower() == '.pdf' and p.is_file()]
         if not pdfs:
             print(f'ERROR: no existing .pdf paths in {args.from_list}', file=sys.stderr); sys.exit(1)
-        args.in_place = True   # listed files are compressed/OCR'd where they sit
         try:
             rel_base = Path(os.path.commonpath([str(p) for p in pdfs]))
         except ValueError:      # paths on different drives -> no common base
             rel_base = pdfs[0].parent
-        dest_root = rel_base
+        if args.dest:
+            dest_root = args.dest
+        else:
+            args.in_place = True   # listed files are compressed/OCR'd where they sit
+            dest_root = rel_base
         src_root = args.from_list
         miss = len(listed) - len(pdfs)
         print(f'From-list: {len(pdfs)} PDF(s) from {args.from_list.name}'
-              + (f'  ({miss} skipped: missing or non-.pdf)' if miss else ''))
+              + (f'  ({miss} skipped: missing or non-.pdf)' if miss else '')
+              + (f'  -> {dest_root}' if args.dest else '  (in place)'))
     else:
         src_root = args.src
         # SINGLE-FILE mode: src is one .pdf. rel_base is its folder so the report shows just
@@ -4156,7 +4654,10 @@ def main():
         print('*** DRY-RUN: previewing only — nothing will be written. ***\n')
     elif args.in_place:
         print('*** IN-PLACE: source PDFs will be OVERWRITTEN with their compressed/OCR '
-              'result. Non-PDFs, structure, born-digital & already-optimal files untouched. ***\n')
+              'result. Non-PDFs, structure & already-optimal files untouched. A born-digital '
+              'PDF is never rasterised, but IS replaced by a verified smaller re-store of '
+              'itself' + (' — disabled here by --no-lossless' if args.no_lossless else
+                          ' (--no-lossless to leave it alone)') + '. ***\n')
 
     set_below_normal_priority()
     if not args.dry_run:
@@ -4223,6 +4724,7 @@ def main():
                                   args.min_savings, args.sauvola_k, args.photo_descreen,
                                   ocr=not args.no_ocr, language=args.language,
                                   min_compress_mb=args.min_compress_mb,
+                                  lossless=not args.no_lossless,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             else:
@@ -4234,6 +4736,10 @@ def main():
                                   args.photo_descreen,
                                   args.timeout, args.in_place,
                                   min_compress_mb=args.min_compress_mb,
+                                  lossless=not args.no_lossless,
+                                  lossless_strip_xmp=not args.lossless_keep_xmp,
+                                  lossless_zopfli=args.lossless_zopfli,
+                                  lossless_min_savings=args.lossless_min_savings,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             for i, fut in enumerate(cf.as_completed(futs), 1):

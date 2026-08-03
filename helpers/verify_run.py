@@ -179,10 +179,25 @@ def structure(pdf: Path) -> dict:
 def main() -> None:
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    rev = Path(sys.argv[1])
-    before, after = rev / 'before', rev / 'after'
-    if not before.is_dir() or not after.is_dir():
-        sys.exit(f'{rev} must contain before/ and after/ folders with matching filenames')
+    # Two forms. The original one takes a review folder holding before/ and after/. The other
+    # takes the two trees WHERE THEY ALREADY ARE:
+    #     python helpers/verify_run.py --before <SRC_ROOT> --after <OUT_ROOT> [--out <DIR>]
+    # A real run writes its output as a mirror tree beside a source tree of tens of GB, and
+    # requiring a before/ copy meant duplicating all of it just to audit it — enough friction
+    # that the audit gets skipped, which is the one thing it must not be.
+    if '--before' in sys.argv:
+        av = sys.argv
+        before = Path(av[av.index('--before') + 1])
+        after = Path(av[av.index('--after') + 1])
+        rev = Path(av[av.index('--out') + 1]) if '--out' in av else Path.cwd() / 'review'
+        rev.mkdir(parents=True, exist_ok=True)
+        if not before.is_dir() or not after.is_dir():
+            sys.exit(f'--before and --after must both be folders: {before} / {after}')
+    else:
+        rev = Path(sys.argv[1])
+        before, after = rev / 'before', rev / 'after'
+        if not before.is_dir() or not after.is_dir():
+            sys.exit(f'{rev} must contain before/ and after/ folders with matching filenames')
     if not GS:
         print('WARNING: Ghostscript not found — colour cannot be audited', file=sys.stderr)
     origin = {}
@@ -193,11 +208,14 @@ def main() -> None:
     # Pair on the RELATIVE path, not a flat glob: a review corpus may be grouped into
     # subfolders (e.g. by page type) as long as before/ and after/ mirror each other. A flat
     # corpus is the same code path — the relative path is then just the filename.
-    for b in sorted(p for p in before.rglob('*')
+    # Walk the AFTER tree, not the before tree: with --before pointing at a whole archive,
+    # `before` holds hundreds of thousands of files the run never touched, and only the ones
+    # that were actually written have anything to audit.
+    for a in sorted(p for p in after.rglob('*')
                     if p.is_file() and p.suffix.lower() == '.pdf'):
-        rel = b.relative_to(before)
-        a = after / rel
-        if not a.exists():
+        rel = a.relative_to(after)
+        b = before / rel
+        if not b.exists():
             continue
         sb_st, sa_st = structure(b), structure(a)
         tb, ta = text_of(b), text_of(a)

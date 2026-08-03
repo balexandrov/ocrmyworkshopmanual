@@ -110,6 +110,10 @@ The `jbig2topdf.py` wrapper ships in `tools/` — you don't need to find it. If 
 isn't on PATH, point to it with `JBIG2_GS` (Ghostscript) or `JBIG2_BIN` (jbig2).
 `--no-ocr` skips the Tesseract/ocrmypdf requirement.
 
+**Optional:** `pip install zopfli` enables `--lossless-zopfli`. Nothing else needs it, and the
+run [fails at startup](#lossless-rewrite-of-born-digital-pdfs) rather than quietly doing less if
+you ask for the flag without the package.
+
 ---
 
 ## Usage
@@ -135,6 +139,11 @@ python ocrmyworkshopmanual.py SRC --no-ocr
 
 # Multilingual OCR
 python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
+
+# Lossless pass over the big born-digital PDFs a past run copied untouched.
+# Build the list from the reports you already have, then rewrite them into a new tree.
+python helpers/lossless_candidates.py --min-mb 50
+python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr
 ```
 
 ### Options
@@ -149,7 +158,7 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 |---|---|---|
 | `src` (positional) | — | Source folder tree of scanned PDFs (recursed into one global pool). Omit only when using `--from-list` |
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
-| `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure, born-digital & already-optimal files untouched. Destructive — back up first |
+| `--in-place` | off | **Overwrite** each PDF with its result (no output tree); leaves non-PDFs, structure and already-optimal files untouched. A born-digital PDF is never rasterised but *is* replaced by a verified smaller [re-store](#lossless-rewrite-of-born-digital-pdfs) of itself (`--no-lossless` to leave it alone). Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (~native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel (binarize is bandwidth-bound, so hyperthreads add little; falls back to logical, then 4). OCR threads are handed out from the same budget and **follow how many files are still in flight**, so the last file of a batch gets the cores the batch is no longer using |
 | `--language L` | `auto` | Tesseract language(s). The default detects each file's script from the image (Tesseract OSD) and picks the language per file — `Latin`→`eng`, `Cyrillic`→`rus+eng`, CJK→`jpn+eng`. Pass an explicit spec to override, e.g. `eng+fra+spa+deu`; a source whose existing text layer proves another script still gets that pack added, because OCR'ing Cyrillic as English replaces real text with Latin noise |
@@ -162,11 +171,15 @@ python ocrmyworkshopmanual.py SRC --language eng+fra+spa+deu
 | `--photo-dpi N` | `150` | Downsample photo pages to this dpi (`0` = keep render dpi) |
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller; else keep original + OCR |
+| `--no-lossless` | off | Don't attempt the [lossless rewrite](#lossless-rewrite-of-born-digital-pdfs) on born-digital PDFs — copy them out byte-for-byte, as this tool did before |
+| `--lossless-keep-xmp` | off | Compress the per-illustration authoring XMP instead of deleting it. Costs about half the saving (measured: −39% instead of −57%); buys provenance for source artwork files an archive doesn't have |
+| `--lossless-zopfli` | off | Re-Deflate every stream with zopfli. Standard Deflate output, normal read speed, ~700× the encoder time. Worth roughly another 12% beyond the default. For a one-time archive pass, not a routine run. Needs `pip install zopfli` |
+| `--lossless-min-savings F` | `0.03` | Discard the rewrite unless it's at least this much smaller; the original bytes are copied instead |
 | `--min-compress-mb N` | `5` | Don't compress files smaller than this. The absolute win on a small file is a few hundred KB, against a lossy re-encode of every page — so they're passed through untouched and reported `kept original` / `small size`. **OCR is still checked and added** if the file has no text layer: too small to be worth compressing is not too small to be worth making searchable. `0` = compress everything |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `600` | **Stall** timeout, not a time budget: max seconds a step may make **no progress** (no new page rendered, no bytes written) before it's treated as hung, killed, and the file marked FAILED. A slow-but-working file is never killed for being big, however long it takes. OCR is deliberately *not* bounded by it (ocrmypdf emits no usable progress signal, so any bound just killed healthy work). Transient crashes are retried automatically. (`0` = disable) |
 | `--retry-failed CSV` | — | Reprocess **only** the files marked FAILED in a previous run's report `.csv` |
-| `--from-list FILE` | — | Compress+OCR **in place** exactly the PDF paths listed in FILE (one per line), as one global pool. For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
+| `--from-list FILE` | — | Process exactly the PDF paths listed in FILE (one per line), as one global pool. **In place** by default; add `--dest DIR` to write a mirror tree under it instead (keyed off the listed paths' common base). For hand-picking a subset of a huge tree; plain folder mode is already globally concurrent, so most users don't need this |
 | `--min-free-gb N` | `1.0` | Abort before starting if the destination drive has less than N GB free (`0` disables) |
 | `--config PATH` | `./ocrmyworkshopmanual.toml` | TOML file of default option values (CLI flags override it) |
 | `--log [PATH]` | off | Write a run report `.csv` — **one file, and it's what `--retry-failed` reads**. **Omitted = no report file, console only.** Bare `--log` puts a timestamped report in the **current folder**; `--log DIR` puts it in `DIR`; `--log FILE` uses that exact path as `.csv` |
@@ -425,7 +438,10 @@ cheap check (`looks_born_digital`): it samples pages and counts "scan pages" —
 a full-page raster image *and* no real text. A real scan has one on ~every page; a born-digital
 file has none. If that "scan fraction" is below 0.5 (fixed, not a flag — a real file is
 essentially always overwhelmingly one or the other, so this isn't a knob worth exposing),
-the file is **copied to the destination untouched — no render, no binarize, no OCR.**
+the file is **never rasterized — no render, no binarize, no OCR.** It is either copied to the
+destination byte-for-byte or, when that pays off, [re-stored
+losslessly](#lossless-rewrite-of-born-digital-pdfs) — which changes how its bytes are packed
+and nothing about what its pages draw.
 
 The bias is **never damage a file**, not "never skip a scan". Rasterizing vector type is
 damage; failing to compress something only costs savings. Concretely:
@@ -449,6 +465,94 @@ damage; failing to compress something only costs savings. Concretely:
   it's reported as a failure instead, rather than rewriting your original.
 - Always on — there's no flag to force-rasterize a file this check calls born-digital,
   because doing so would defeat the one thing this safety check exists for.
+
+### Lossless rewrite of born-digital PDFs
+
+Being protected from the raster pipeline doesn't mean there's nothing to gain. These files are
+often huge because of **how their bytes are stored**, not because of what they draw — and
+storage can be changed without touching a single drawing operator. So a born-digital file now
+gets one thing done to it before it's copied out:
+
+| tier | what it does | on the file below |
+|---|---|---|
+| 1 | Flate the streams stored **unfiltered**; bundle loose objects into `/ObjStm`; re-Deflate existing streams at level 9 | 537.6 → 195.1 MB |
+| 2 | delete the **per-illustration** authoring XMP (`--lossless-keep-xmp` to keep it) | included above |
+| 3 | re-Deflate everything with **zopfli** (`--lossless-zopfli`, opt-in) | → ~172 MB |
+
+Measured on `2020 WRX - WRX STI SERVICE MANUAL G1740BE.pdf` (537,575,830 bytes, 7,376 pages,
+FrameMaker 7.2 → Acrobat Distiller 9, PDF 1.4, 489,674 loose objects): **−62% in 3.2 minutes**,
+with every page's decoded content byte-for-byte identical.
+
+**Expect the result to vary enormously, and by producer rather than by size.** The whole win
+depends on whether that authoring chain wrote its metadata compressed:
+
+| file | XMP found | result |
+|---|---|---|
+| 513 MB Subaru WRX (Distiller 9) | 7,710 **unfiltered** + 9,898 compressed | **−62%** |
+| 236 MB Mitsubishi L200 (Distiller 6) | 0 unfiltered, 10,235 compressed | **−8%** |
+
+Same page count order of magnitude, same kind of manual, an 8× difference in payoff — because
+Distiller 6 compressed those packets and Distiller 9 did not. This is why the rewrite is
+opportunistic and cheap to refuse: on the L200 there was simply nothing large to reclaim.
+
+**Where the bytes were.** Half that file — 254.6 MB of 537.6 — was XMP metadata stored with
+**no filter at all**. That's deliberate on Adobe's part: XMP is meant to be findable by scanning
+raw bytes for `<?xpacket` in any file format, and it's whitespace-padded so a tool can rewrite
+it in place without reflowing the file. Both properties die under compression. Sound for a file
+being round-tripped between authoring tools; dead weight in a distributed archive.
+
+**What that XMP was.** Not document metadata — *per-illustration* metadata. Every drawing was
+made in Illustrator and placed into a FrameMaker book, and Distiller hung each source artwork's
+own XMP off the marked-content property dictionary for that drawing
+(`Page /Resources /Properties /MC0…`). 44% of it is a base64-encoded **JPEG preview thumbnail**
+of the artwork. Two families exist and both are handled — 7,711 typed `/Type /Metadata` packets
+(254.6 MB, unfiltered, placed `.ai` files) and 9,898 untyped ones (28.9 MB, already compressed,
+placed `.eps` files). The document-level packet in `/Root /Metadata` is **kept**, and only the
+`/Metadata` key is deleted from each carrier — never the carrier itself, since page content
+streams name those property dictionaries (`/MC0 BDC`).
+
+**`--min-compress-mb` applies here too** (default 5 MB). A rewrite saves a *percentage*, so on a
+small file the absolute win is tens of KB — not worth rewriting every one of an archive's
+born-digital files, and under `--in-place` not worth the churn of replacing them. Files under the
+floor are passed through exactly as before, and the row says which floor stopped it.
+
+**Why this can't damage a file.** No page is rendered, no image is re-encoded, no drawing
+operator is touched. Tiers 1 and 3 change only compression, and each recompressed stream is
+accepted only if it decodes to identical bytes. Tier 2 is the only tier that alters the object
+graph. On top of that, the output is thrown away and the original bytes copied instead unless it
+**both** beats `--lossless-min-savings` **and** passes a comparison against the source:
+
+- page count, annotation count, bookmark count, named destinations
+- **document-wide decoded content bytes and stream-part count** — not a sample. This is the
+  check that earns its keep: when an early version was dropping 9,898 XMP streams unnoticed,
+  every count and every sampled page still matched, and this total is what exposed it
+- per-page content-stream + XObject fingerprints on a spread of pages
+- document info dictionary and document XMP, compared as **parsed fields** rather than bytes
+  (pikepdf renormalises the packet on save — 3,555 → 1,461 bytes on that manual, dropping only
+  whitespace padding — so a byte comparison would fail on every file)
+
+If the baseline can't be captured from the source at all, the rewrite is **skipped**, never
+treated as passed. A guard that silently does nothing on unreadable input is worse than no
+guard, because the report still reads like proof.
+
+**What it does not preserve:** Fast Web View. The source was linearized; the rewrite drops the
+linearization hint stream (an index, ~107 KB here, no page depends on it). Relinearizing costs
+6.1 MB and 6× the save time, and only matters for byte-range streaming over HTTP.
+
+**Under `--in-place`** the rewrite replaces the original, and this is the one place this path
+overwrites a born-digital file — so the ordering is what makes it safe: the source is
+fingerprinted, a temp file is written **next to it** (same volume, so promotion is an atomic
+`os.replace`), the temp is verified against that fingerprint, and only then does it take the
+original's name. Any failure — rewrite, savings bar, verification — leaves the original
+untouched and byte-identical, because nothing has been written over it yet. `--no-lossless`
+opts out. One exception stands: a corrupt-but-repairable born-digital file still refuses to be
+rewritten in place and is reported instead, because repairing changes page content rather than
+storage.
+
+Rehearsed on a copy of a 236 MB Mitsubishi L200 manual (3,818 pages): replaced in place in
+1.9 min, and re-fingerprinted afterwards from the file on disk against values recorded before
+the overwrite — 3,818 pages, 11,349 annotations, 8,004 bookmarks, 4,056 content parts,
+729,542,412 decoded content bytes, all unchanged.
 
 ### Stamped watermarks aren't a text layer
 
@@ -504,9 +608,16 @@ per-file record — what happened, **why**, and **what became of its text layer*
   | column | values | answers |
   |---|---|---|
   | `action` | `compressed` · `kept original` · `FAILED` | What was done to the file |
-  | `reason` | `compressible` · `born digital` · `already compressed` · `small size` · `error` | Why that happened |
+  | `reason` | `compressible` · `lossless rewrite` · `born digital` · `already compressed` · `small size` · `error` | Why that happened |
   | `ocr` | `new ocr` · `re-ocr` · `kept existing` · `not requested` · `failed` | What became of the searchable text layer |
   | `language` | e.g. `eng`, `rus+eng` | Which packs OCR actually used (blank when no OCR ran, since until then the value is still the unresolved `auto`) |
+
+  `lossless rewrite` vs `compressible` is the difference that matters most for trust: both
+  are `compressed`, but `lossless rewrite` means the file was re-stored smaller with **no
+  page rendered and no image re-encoded** (see [Lossless
+  rewrite](#lossless-rewrite-of-born-digital-pdfs)), while `compressible` means it went
+  through the raster pipeline. A born-digital file whose rewrite wasn't kept stays
+  `kept original` / `born digital`, and its `note` says why it was dropped.
 
   `re-ocr` vs `new ocr` is the difference between *replacing* a manual's existing text
   layer and giving it its first one — and `kept existing` means ocrmypdf never ran on it.

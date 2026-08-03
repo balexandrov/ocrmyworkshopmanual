@@ -37,11 +37,11 @@ def test_scanned_fixtures_are_not_born_digital(page_type):
 
 
 def test_compress_one_copies_born_digital_untouched(tmp_path):
-    """The whole point: a born-digital file arrives at dest byte-for-byte identical,
-    with no render/OCR done to it."""
+    """The whole point: a born-digital file is never rasterised. With --no-lossless it
+    arrives at dest byte-for-byte identical, with no render/OCR done to it."""
     src = U.make_born_digital_pdf(tmp_path / 'src.pdf', npages=3)
     dest = tmp_path / 'out' / 'src.pdf'
-    res = U.owm.compress_one(str(src), str(dest), 200, ocr=False)
+    res = U.owm.compress_one(str(src), str(dest), 200, ocr=False, lossless=False)
     assert res.get('action') == 'born_digital', res
     assert res.get('err') is None, res
     assert dest.read_bytes() == src.read_bytes(), 'born-digital output is not byte-identical to input'
