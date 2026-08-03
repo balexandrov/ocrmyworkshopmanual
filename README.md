@@ -512,6 +512,39 @@ placed `.eps` files). The document-level packet in `/Root /Metadata` is **kept**
 `/Metadata` key is deleted from each carrier — never the carrier itself, since page content
 streams name those property dictionaries (`/MC0 BDC`).
 
+### Sweeping an archive that was already processed
+
+Every born-digital file a past run touched was reported as `born digital`, so those rows already
+are the inventory — no re-scan needed. Three helpers do the pass:
+
+```bash
+# 1. build the work list from the run reports you already have (writes reports/lossless_list.txt)
+python helpers/lossless_candidates.py --min-mb 50 --sample 8
+
+# 2. rewrite into a staging tree (--dest), not in place, so a "before" copy still exists
+python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr --log reports
+
+# 3. audit the pairs INDEPENDENTLY of the code that produced them
+python helpers/verify_lossless.py --before SRC_ROOT --after OUT --render 3
+
+# 4. replace the originals with the verified outputs
+python helpers/promote_lossless.py --before SRC_ROOT --after OUT --audit reports/lossless_audit.csv --apply
+```
+
+`--in-place` skips steps 2–4 entirely and is fully verified per file, but it leaves **no before
+copy**, so step 3 becomes impossible — no pixel comparison, no reachability check, nothing but
+the tool vouching for itself. On the first band, that independent audit found three bugs (all of
+them in the audit code, none in the rewrite), which is the argument for staging a large pass.
+
+`promote_lossless.py` promotes a file only if its audit row says `ok`, the output is genuinely
+smaller, the page count still matches when re-checked at promotion time, and the copy landing
+beside the original is byte-identical to the output that was audited — then one atomic
+`os.replace`. `--audit` is optional; without it every output found is a candidate, judged by
+those checks and the run's own per-file verification. Files that are **read-only** (mode 444 /
+the Windows `R` attribute — 26 here, copied off a CD/DVD where every file carries it) would
+otherwise fail with `PermissionError`; the flag is cleared to write and **left cleared**, because
+it says nothing about the file and only makes future replacements fail.
+
 ### Is a small file worth rewriting?
 
 **`--min-compress-mb` applies here too** (default 5 MB), and `--lossless-min-mb` overrides it for
@@ -520,23 +553,28 @@ this lane alone. The two floors have to be separable because they price differen
 prices **churn on a file that is merely small**. Lowering the former to reach small born-digital
 files would also let the raster path re-image any small file that reads as a scan.
 
-Whether to lower it is a genuine trade-off, and on this archive the answer is counter-intuitive.
-Measured across the born-digital files in five run reports, sampling real files and rewriting
-them:
+Whether to lower it is a genuine trade-off. Two bands of this archive have now been swept in
+full; the third is a sample estimate:
 
-| band | files | total | measured saving | cost to sweep |
+| band | files | total | saving | cost to sweep |
 |---|---|---|---|---|
-| ≥ 50 MB | 127 | 17.0 GB | **−29%** (4.99 GB) | 27 min |
-| 5–50 MB | 718 | 12.0 GB | **−36%** (≈4.3 GB) | ~30 min |
-| < 5 MB | 282,676 | 19.2 GB | −12% (≈2.3 GB) | **~10 h** |
+| ≥ 50 MB | 127 | 17.0 GB | **−29%** (4.99 GB) — whole band | 27 min |
+| 5–50 MB | 774 | 12.1 GB | **−12%** (1.49 GB) — whole band | 28 min |
+| < 5 MB | 282,676 | 19.2 GB | ≈−12% (≈2.3 GB) — *300-file sample* | **~10 h** |
 
-The sub-5 MB band is the largest pool by both count and bytes, and by far the worst value: those
-files are 10–200 KB parts-catalogue pages where per-file PDF structure dominates, so there is
-little to reclaim. The cost is not CPU — it is **per-file I/O**. Measured on the archive drive:
-28 files/s ceiling regardless of thread count (1, 6, 12 and 24 threads all land there), and
-8.1 files/s end-to-end through the pipeline. Sweeping 718 files yields **more gigabytes than
-sweeping 282,676**, from 400× fewer files, in a twentieth of the time — and without re-dating a
-quarter-million files, which for a hosted archive means re-uploading all of them.
+**Don't trust a small sample here.** A 10-file rewrite of the 5–50 MB band projected −36%; the
+real figure over all 774 was **−12%**, a 3× miss. The distribution is heavily skewed — median
+14%, min 3%, max 94% — and **189 of 774 files had nothing to gain at all** and were kept
+byte-for-byte. Signature scanning mispredicts even worse and in the opposite direction: those
+same files show 0% unfiltered bytes and almost no XMP, which reads as "nothing here" while they
+in fact yield 1.5 GB from object streams and level-9 recompression. Sweep a band, measure it,
+then decide about the next one.
+
+The sub-5 MB band is the largest pool by both count and bytes and the worst value, and its cost
+is **per-file I/O, not CPU**. Measured on the archive drive: a 28 files/s ceiling regardless of
+thread count (1, 6, 12 and 24 threads all land there), and 8.1 files/s end-to-end through the
+pipeline. That is ~10 hours to reclaim ~2.3 GB, and it re-dates a quarter of a million files —
+which for a hosted archive means re-uploading all of them.
 
 **Why this can't damage a file.** No page is rendered, no image is re-encoded, no drawing
 operator is touched. Tiers 1 and 3 change only compression, and each recompressed stream is

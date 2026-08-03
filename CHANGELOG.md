@@ -65,23 +65,40 @@ of every page**, the lossless floor only prices **churn on a file that is merely
 this, reaching small born-digital files meant lowering `--min-compress-mb`, which would also let
 the raster path re-image any small file that read as a scan.
 
-Measured on this archive's born-digital files, by sampling and actually rewriting them:
+Two bands of this archive have now been swept in full; the third is a sample estimate:
 
-| band | files | total | measured saving | cost to sweep |
+| band | files | total | saving | cost to sweep |
 |---|---|---|---|---|
-| ≥ 50 MB | 127 | 17.0 GB | −29% (4.99 GB) | 27 min |
-| 5–50 MB | 718 | 12.0 GB | −36% (≈4.3 GB) | ~30 min |
-| < 5 MB | 282,676 | 19.2 GB | −12% (≈2.3 GB) | ~10 h |
+| ≥ 50 MB | 127 | 17.0 GB | −29% (4.99 GB) — whole band | 27 min |
+| 5–50 MB | 774 | 12.1 GB | −12% (1.49 GB) — whole band | 28 min |
+| < 5 MB | 282,676 | 19.2 GB | ≈−12% (≈2.3 GB) — *300-file sample* | ~10 h |
 
-The 5–50 MB band nearly got dismissed: those files hold **0% unfiltered bytes and almost no
-XMP**, so a metadata signature scan reports nothing to gain — but rewriting ten of them gave
-175.7 → 111.7 MB, entirely from object streams and level-9 recompression of PDF 1.4 files.
-Signature scans mispredict this lane in both directions; only a real rewrite answers it.
+**Samples mispredict this lane badly, in both directions, and the 5–50 MB band demonstrated
+each in turn.** A metadata signature scan says "nothing here" — 0% unfiltered bytes, almost no
+XMP — yet the band yielded 1.49 GB, entirely from object streams and level-9 recompression of
+PDF 1.4 files. Then a 10-file rewrite sample projected **−36%**, and the real figure over all
+774 files was **−12%**: a 3× miss, because the distribution is heavily skewed (median 14%, min
+3%, max 94%) and 189 of 774 files had nothing to gain at all. Sweep a band, measure it, then
+decide about the next one.
 
-The sub-5 MB band is the largest pool and the worst value, and the cost is **I/O, not CPU**:
+The sub-5 MB band is the largest pool and the worst value, and its cost is **I/O, not CPU**:
 the archive drive ceilings at 28 files/s regardless of thread count (1, 6, 12, 24 threads all
-land there) and 8.1 files/s end-to-end. Sweeping 718 files yields more gigabytes than sweeping
-282,676, from 400× fewer files.
+land there) and 8.1 files/s end-to-end, so ~10 hours for ~2.3 GB — plus re-dating a quarter of
+a million files, which for a hosted archive means re-uploading all of them.
+
+### Fixed (`helpers/promote_lossless.py`) — a read-only original made promotion fail
+
+26 of 585 promotions failed with `PermissionError: Access is denied`. Cause: those files are
+mode 444 with the Windows `R` attribute, copied off a CD/DVD where every file carries it, and
+`os.replace` onto a read-only target fails. The failures were clean — every one reported
+`original untouched`, and they were — but 26 files would have been silently left behind in a
+larger run. The flag is now cleared to write and **left cleared**: it is an artifact of the
+medium the files came from, says nothing about the files, and only makes future replacements
+fail. `--audit` also became optional, so a pass can be promoted on the run's own per-file
+verification when an independent second opinion is not wanted.
+
+Archive result across both swept bands: **688 files rewritten, 29.1 GB → 23.7 GB, 6.48 GB
+reclaimed**, with all 901 originals re-read afterwards and byte-matching their outputs.
 
 `--min-compress-mb` (default 5 MB) governs this lane as well. The lane sits before the raster
 path's floor check and initially ignored it, which showed up as an existing test failing: a
