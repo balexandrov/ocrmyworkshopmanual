@@ -175,6 +175,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--lossless-keep-xmp` | off | Compress the per-illustration authoring XMP instead of deleting it. Costs about half the saving (measured: −39% instead of −57%); buys provenance for source artwork files an archive doesn't have |
 | `--lossless-zopfli` | off | Re-Deflate every stream with zopfli. Standard Deflate output, normal read speed, ~700× the encoder time. Worth roughly another 12% beyond the default. For a one-time archive pass, not a routine run. Needs `pip install zopfli` |
 | `--lossless-min-savings F` | `0.03` | Discard the rewrite unless it's at least this much smaller; the original bytes are copied instead |
+| `--lossless-min-mb N` | `--min-compress-mb` | Size floor for the lossless rewrite **alone**. Lower it to sweep small born-digital files without letting the raster path re-image small scans — the two floors price different risks (see [below](#is-a-small-file-worth-rewriting)) |
 | `--min-compress-mb N` | `5` | Don't compress files smaller than this. The absolute win on a small file is a few hundred KB, against a lossy re-encode of every page — so they're passed through untouched and reported `kept original` / `small size`. **OCR is still checked and added** if the file has no text layer: too small to be worth compressing is not too small to be worth making searchable. `0` = compress everything |
 | `--dry-run` | off | Preview only: classify + project each file and report what **would** happen (+ projected savings); write nothing |
 | `--timeout SECS` | `600` | **Stall** timeout, not a time budget: max seconds a step may make **no progress** (no new page rendered, no bytes written) before it's treated as hung, killed, and the file marked FAILED. A slow-but-working file is never killed for being big, however long it takes. OCR is deliberately *not* bounded by it (ocrmypdf emits no usable progress signal, so any bound just killed healthy work). Transient crashes are retried automatically. (`0` = disable) |
@@ -511,10 +512,31 @@ placed `.eps` files). The document-level packet in `/Root /Metadata` is **kept**
 `/Metadata` key is deleted from each carrier — never the carrier itself, since page content
 streams name those property dictionaries (`/MC0 BDC`).
 
-**`--min-compress-mb` applies here too** (default 5 MB). A rewrite saves a *percentage*, so on a
-small file the absolute win is tens of KB — not worth rewriting every one of an archive's
-born-digital files, and under `--in-place` not worth the churn of replacing them. Files under the
-floor are passed through exactly as before, and the row says which floor stopped it.
+### Is a small file worth rewriting?
+
+**`--min-compress-mb` applies here too** (default 5 MB), and `--lossless-min-mb` overrides it for
+this lane alone. The two floors have to be separable because they price different risks:
+`--min-compress-mb` prices a **lossy re-encode of every page**, while the lossless floor only
+prices **churn on a file that is merely small**. Lowering the former to reach small born-digital
+files would also let the raster path re-image any small file that reads as a scan.
+
+Whether to lower it is a genuine trade-off, and on this archive the answer is counter-intuitive.
+Measured across the born-digital files in five run reports, sampling real files and rewriting
+them:
+
+| band | files | total | measured saving | cost to sweep |
+|---|---|---|---|---|
+| ≥ 50 MB | 127 | 17.0 GB | **−29%** (4.99 GB) | 27 min |
+| 5–50 MB | 718 | 12.0 GB | **−36%** (≈4.3 GB) | ~30 min |
+| < 5 MB | 282,676 | 19.2 GB | −12% (≈2.3 GB) | **~10 h** |
+
+The sub-5 MB band is the largest pool by both count and bytes, and by far the worst value: those
+files are 10–200 KB parts-catalogue pages where per-file PDF structure dominates, so there is
+little to reclaim. The cost is not CPU — it is **per-file I/O**. Measured on the archive drive:
+28 files/s ceiling regardless of thread count (1, 6, 12 and 24 threads all land there), and
+8.1 files/s end-to-end through the pipeline. Sweeping 718 files yields **more gigabytes than
+sweeping 282,676**, from 400× fewer files, in a twentieth of the time — and without re-dating a
+quarter-million files, which for a hosted archive means re-uploading all of them.
 
 **Why this can't damage a file.** No page is rendered, no image is re-encoded, no drawing
 operator is touched. Tiers 1 and 3 change only compression, and each recompressed stream is

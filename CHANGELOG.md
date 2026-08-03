@@ -57,6 +57,32 @@ in 1.9 min, then re-fingerprinted from disk against values recorded before the o
 content bytes, all unchanged. A corrupt-but-repairable born-digital file still refuses in place,
 since repairing changes page content rather than storage.
 
+### Added (`--lossless-min-mb`) — and the measurement that says when to use it
+
+A separate size floor for the lossless lane, defaulting to `--min-compress-mb`. The two cannot
+share a knob because they price different risks: `--min-compress-mb` prices a **lossy re-encode
+of every page**, the lossless floor only prices **churn on a file that is merely small**. Before
+this, reaching small born-digital files meant lowering `--min-compress-mb`, which would also let
+the raster path re-image any small file that read as a scan.
+
+Measured on this archive's born-digital files, by sampling and actually rewriting them:
+
+| band | files | total | measured saving | cost to sweep |
+|---|---|---|---|---|
+| ≥ 50 MB | 127 | 17.0 GB | −29% (4.99 GB) | 27 min |
+| 5–50 MB | 718 | 12.0 GB | −36% (≈4.3 GB) | ~30 min |
+| < 5 MB | 282,676 | 19.2 GB | −12% (≈2.3 GB) | ~10 h |
+
+The 5–50 MB band nearly got dismissed: those files hold **0% unfiltered bytes and almost no
+XMP**, so a metadata signature scan reports nothing to gain — but rewriting ten of them gave
+175.7 → 111.7 MB, entirely from object streams and level-9 recompression of PDF 1.4 files.
+Signature scans mispredict this lane in both directions; only a real rewrite answers it.
+
+The sub-5 MB band is the largest pool and the worst value, and the cost is **I/O, not CPU**:
+the archive drive ceilings at 28 files/s regardless of thread count (1, 6, 12, 24 threads all
+land there) and 8.1 files/s end-to-end. Sweeping 718 files yields more gigabytes than sweeping
+282,676, from 400× fewer files.
+
 `--min-compress-mb` (default 5 MB) governs this lane as well. The lane sits before the raster
 path's floor check and initially ignored it, which showed up as an existing test failing: a
 2-page file under the floor was being rewritten in place. The floor is exactly where the user

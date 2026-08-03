@@ -346,7 +346,7 @@ def test_size_floor_governs_the_lane_too(born_xmp, monkeypatch):
                            min_compress_mb=5.0, lossless_min_savings=0.01)
     assert born_xmp.read_bytes() == before, 'a file under the floor was rewritten anyway'
     assert res['action'] == 'born_digital', res
-    assert 'under the 5 MB floor' in res['note'], res['note']
+    assert 'under the 5 MB lossless floor' in res['note'], res['note']
 
 
 def test_unparseable_document_xmp_is_reported_not_hidden(born, tmp_path):
@@ -373,3 +373,14 @@ def test_unparseable_document_xmp_is_reported_not_hidden(born, tmp_path):
     # and a normal file must NOT carry that note
     ok = owm._lossless_fingerprint(born)
     assert ok['xmp_ok'] is True
+
+
+def test_lossless_min_mb_lowers_only_the_lossless_floor(born_xmp):
+    """The point of a separate floor: sweep small born-digital files WITHOUT lowering
+    --min-compress-mb, which would also let the raster path re-image a small scan."""
+    before = born_xmp.read_bytes()
+    res = owm.compress_one(str(born_xmp), str(born_xmp), 200, ocr=False, in_place=True,
+                           min_compress_mb=5.0, lossless_min_mb=0.0,
+                           lossless_min_savings=0.01)
+    assert res['reason'] == owm.REASON_LOSSLESS, res
+    assert born_xmp.stat().st_size < len(before), 'the lowered lossless floor had no effect'

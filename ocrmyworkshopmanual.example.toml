@@ -40,6 +40,11 @@ min_compress_mb = 5      # don't compress files smaller than this (MB) — the w
 # lossless_zopfli = false    # true = re-Deflate with zopfli: ~12% more, ~700x the CPU.
                              # Needs `pip install zopfli`. For a one-time archive pass.
 lossless_min_savings = 0.03  # discard the rewrite unless it is at least this much smaller
+# lossless_min_mb = 5       # size floor for the lossless lane alone (default: min_compress_mb).
+                            # Lower to sweep small born-digital files WITHOUT letting the raster
+                            # path re-image small scans. Measured on this archive: the <5 MB band
+                            # is 282,676 files / 19.2 GB for only -12%, ~10 h (I/O-bound), while
+                            # the 5-50 MB band is 718 files / 12 GB for -36% in ~30 min.
 
 # ── resilience / large collections ────────────────────────────────────────────
 timeout = 600             # STALL timeout: seconds a step may make NO progress before it is
