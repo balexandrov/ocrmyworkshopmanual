@@ -178,12 +178,76 @@ def test_unreadable_baseline_skips_rather_than_passes(tmp_path):
     assert not (tmp_path / 'out.pdf').exists()
 
 
-def test_encrypted_pdf_is_skipped(born, tmp_path):
+def test_empty_user_password_pdf_is_decrypted_not_skipped(born, tmp_path):
+    """An owner-permissions wrapper is not a lock. Measured across the archive's encrypted
+    manuals (RC4-128 from Distiller 4): every one opens with an empty user password, and the
+    encryption carries only extract/modify flags. Refusing them left ~450-650 MB unreachable
+    for no safety gain, so the lane now opens them and writes the output in the clear."""
     enc = tmp_path / 'enc.pdf'
+    out = tmp_path / 'out.pdf'
+    with pikepdf.open(str(born)) as p:
+        p.save(str(enc), encryption=pikepdf.Encryption(
+            owner='o', user='', allow=pikepdf.Permissions(extract=False, modify_other=False)))
+    before = _decoded_pages(enc)
+    res = owm.lossless_rewrite(enc, out, min_savings=0.0)
+    assert res['ok'] is True, res
+    assert res['stats'].get('decrypted') is True, res
+    assert 'DECRYPTED' in res['note'], res['note']
+    with pikepdf.open(str(out)) as p:          # no password argument at all
+        assert p.is_encrypted is False, 'output is still encrypted'
+        assert p.allow.extract is True, 'permission flags were carried over, not dropped'
+    assert _decoded_pages(out) == before, 'decrypting changed what a page draws'
+
+
+def test_decrypted_rewrite_is_kept_even_when_barely_smaller(born, tmp_path):
+    """The size bar does not apply to a file that shed its encryption. Half the archive's
+    encrypted files come back under the 3% default; on the size bar alone they would stay
+    encrypted over a rounding error. Bar for these is only 'not bigger than the source'."""
+    enc = tmp_path / 'enc.pdf'
+    out = tmp_path / 'out.pdf'
     with pikepdf.open(str(born)) as p:
         p.save(str(enc), encryption=pikepdf.Encryption(owner='o', user=''))
+    res = owm.lossless_rewrite(enc, out, min_savings=0.99)   # no rewrite can beat 99%
+    assert res['ok'] is True, res
+    with pikepdf.open(str(out)) as p:
+        assert p.is_encrypted is False
+    # ...while an UNencrypted file under the same bar is still discarded.
+    plain_out = tmp_path / 'plain_out.pdf'
+    res2 = owm.lossless_rewrite(born, plain_out, min_savings=0.99)
+    assert res2['ok'] is False and 'smaller' in res2['skip'], res2
+    assert not plain_out.exists()
+
+
+def test_unknown_password_is_reported_as_encrypted_not_as_corrupt(born, tmp_path):
+    """A genuinely locked file must not be filed under 'baseline unreadable' — that reads as
+    damage and sends you hunting for a corrupt scan that does not exist."""
+    enc = tmp_path / 'locked.pdf'
+    with pikepdf.open(str(born)) as p:
+        p.save(str(enc), encryption=pikepdf.Encryption(owner='o', user='not-in-our-list'))
     res = owm.lossless_rewrite(enc, tmp_path / 'out.pdf', min_savings=0.0)
-    assert res['ok'] is False and res['skip'] == 'encrypted', res
+    assert res['ok'] is False, res
+    assert 'encrypted' in res['skip'] and 'password' in res['skip'], res['skip']
+    assert not (tmp_path / 'out.pdf').exists()
+
+
+def test_vector_password_is_tried(born, tmp_path):
+    """'vector' is the one non-empty password known to be used in this archive."""
+    enc = tmp_path / 'vec.pdf'
+    out = tmp_path / 'out.pdf'
+    with pikepdf.open(str(born)) as p:
+        p.save(str(enc), encryption=pikepdf.Encryption(owner='vector', user='vector'))
+    res = owm.lossless_rewrite(enc, out, min_savings=0.0)
+    assert res['ok'] is True, res
+    with pikepdf.open(str(out)) as p:
+        assert p.is_encrypted is False
+
+
+def test_lossless_floor_label_does_not_round_a_fractional_floor_to_zero(born, tmp_path):
+    """The gate was right and the label was wrong: a 0.1 MB floor printed as "under the 0 MB
+    lossless floor", which reads as a broken comparison rather than a rounded number."""
+    res = owm.compress_one(str(born), str(tmp_path / 'out.pdf'), 200, ocr=False,
+                           min_compress_mb=5.0, lossless_min_mb=0.1)
+    assert '0.1 MB lossless floor' in res['note'], res['note']
 
 
 # ── Zopfli tier ──────────────────────────────────────────────────────────────

@@ -2819,6 +2819,41 @@ _ZOPFLI_BATCH_BYTES = 40 * 1024 * 1024   # decoded bytes in flight per batch, to
 _LOSSLESS_SKIP_TYPES = ('/ObjStm', '/XRef')
 
 
+# Passwords tried, in order, when a source PDF turns out to be encrypted.
+#
+# Measured across the archive's encrypted PDFs (Toyota/Lexus service manuals, RC4-128 R3/V2
+# written by Acrobat Distiller 4.05): every single one opens with an EMPTY user password. The
+# encryption is not there to keep anyone out — it carries only owner PERMISSION FLAGS
+# (extract off, modify off, printing allowed). '' covers those; 'vector' is the one non-empty
+# password known to be used in this archive.
+#
+# Whatever the source carried, the rewrite saves DECRYPTED: the permission flags are dropped
+# on purpose, not preserved. That is a deliberate semantic change to the file and the only
+# thing in this lane that is not byte-faithful to the original's container, so every such
+# file says so in its note and in the report's `note` column. Page content is still untouched
+# and still verified — dropping a permission flag cannot change what a page draws.
+_LOSSLESS_PASSWORDS = ('', 'vector')
+
+
+def _open_pdf(pdf_path: Path, **kw):
+    """pikepdf.open, trying each known password in turn.
+
+    Both the fingerprint and the rewrite must open a file the SAME way, or the guard compares
+    a file it could read against one it could not and reports a spurious failure — hence one
+    helper rather than a password argument threaded through two call sites.
+
+    Raises the last PasswordError if none of them fit, so a genuinely locked file is skipped
+    with a real reason instead of being silently treated as unreadable."""
+    import pikepdf
+    last = None
+    for pw in _LOSSLESS_PASSWORDS:
+        try:
+            return pikepdf.open(str(pdf_path), password=pw, **kw)
+        except pikepdf.PasswordError as ex:
+            last = ex
+    raise last
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -2843,7 +2878,7 @@ def _lossless_fingerprint(pdf_path: Path) -> dict:
     every sampled page still matched, and this total was what exposed it."""
     import pikepdf
     try:
-        with pikepdf.open(str(pdf_path)) as p:
+        with _open_pdf(pdf_path) as p:
             fp = {'pages': len(p.pages)}
             fp['annots'] = sum(len(pg.obj.get('/Annots') or []) for pg in p.pages)
             with p.open_outline() as ol:
@@ -3073,20 +3108,34 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
     `ok` False is a normal, expected outcome — the caller then copies the original bytes.
     Nothing is written to `out_p` unless the rewrite both verified and beat `min_savings`.
 
-    Never called for an encrypted file (nothing to gain, and re-saving would change the
-    encryption), and never for one whose baseline cannot be captured."""
+    An ENCRYPTED source is handled, not refused: it is opened with one of _LOSSLESS_PASSWORDS
+    and saved DECRYPTED, dropping the owner permission flags. Never called for one whose
+    baseline cannot be captured."""
     import pikepdf
     orig = src_p.stat().st_size
     stats = {}
     base = _lossless_fingerprint(src_p)
     if base is None:
-        return {'ok': False, 'new': 0, 'skip': 'baseline unreadable', 'stats': stats,
-                'note': ''}
+        # Distinguish "locked" from "corrupt": both fail the fingerprint, but only one of them
+        # is fixable by knowing a password, and a report that calls them the same thing sends
+        # you looking for damage that is not there. The extra open costs nothing on the normal
+        # path — it only runs on a file that has already failed.
+        skip = 'baseline unreadable'
+        try:
+            _open_pdf(src_p).close()
+        except pikepdf.PasswordError:
+            skip = 'encrypted: none of the known passwords fit'
+        except Exception:
+            pass
+        return {'ok': False, 'new': 0, 'skip': skip, 'stats': stats, 'note': ''}
     tmp = out_p.with_suffix(out_p.suffix + '.lossless')
     try:
-        with pikepdf.open(str(src_p)) as p:
+        with _open_pdf(src_p) as p:
+            # No `encryption=` on the save below, so qpdf writes the output in the clear. The
+            # flag is recorded for the note: this is the one thing the lane changes about a
+            # file besides how its bytes are stored, and it must never happen silently.
             if p.is_encrypted:
-                return {'ok': False, 'new': 0, 'skip': 'encrypted', 'stats': stats, 'note': ''}
+                stats['decrypted'] = True
             if strip_xmp:
                 stats['xmp'] = _strip_private_xmp(p)
             if zopfli:
@@ -3113,10 +3162,20 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
         stats['new'] = new
         # Order matters: a rewrite that did not pay off is discarded WITHOUT paying for the
         # verification read (a 500 MB file costs ~40 s to re-fingerprint).
-        if new >= int(orig * (1 - min_savings)):
+        #
+        # A DECRYPTED file is judged on a different bar, because bytes are not what it bought.
+        # Measured on 26 encrypted manuals: median 3.6% smaller, and 11 of them under the 3%
+        # default — on the size bar alone half the archive would stay encrypted for the sake
+        # of a rounding error. So the bar becomes "not bigger than the source": the file still
+        # has to verify, and it still has to not cost anything, but shedding the encryption
+        # counts as the win on its own.
+        bar = orig if stats.get('decrypted') else int(orig * (1 - min_savings))
+        if new >= bar:
             tmp.unlink(missing_ok=True)
+            pct = f'only {100 * (1 - new / orig):.1f}% smaller'
             return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
-                    'skip': f'only {100 * (1 - new / orig):.1f}% smaller'}
+                    'skip': f'{pct} and no smaller once decrypted' if stats.get('decrypted')
+                            else pct}
         bad = _lossless_verify(base, tmp)
         if bad:
             tmp.unlink(missing_ok=True)
@@ -3140,6 +3199,9 @@ def _lossless_note(orig: int, new: int, stats: dict) -> str:
     """The per-file note: what the rewrite did, in the terms a reviewer would audit it in."""
     bits = [f'lossless rewrite: {mb(orig):.2f} -> {mb(new):.2f} MB '
             f'({100 * (1 - new / orig):.0f}% smaller)']
+    if stats.get('decrypted'):
+        bits.append('source was encrypted; output is DECRYPTED and its owner permission '
+                    'flags are dropped (page content unchanged and still verified)')
     x = stats.get('xmp')
     if x and (x['typed'] or x['untyped']):
         bits.append(f'{x["typed"] + x["untyped"]} private XMP packets dropped '
@@ -3535,8 +3597,11 @@ def _compress_one(src: str, dest: str, dpi: int,
             lfloor = floor if lossless_min_mb is None else int(lossless_min_mb * 1048576)
             if lossless and orig < lfloor:
                 lossless = False
-                lskip = (f'{mb(orig):.2f} MB is under the {mb(lfloor):.0f} MB '
-                         f'lossless floor')
+                # Trailing zeros trimmed rather than a fixed precision: '.0f' printed a 0.1 MB
+                # floor as "under the 0 MB lossless floor", which reads as a bug in the gate
+                # instead of a rounded label. Integer floors still render as "5 MB".
+                fl = f'{mb(lfloor):.2f}'.rstrip('0').rstrip('.') or '0'
+                lskip = f'{mb(orig):.2f} MB is under the {fl} MB lossless floor'
             if lossless:
                 lres = lossless_rewrite(
                     copy_from, dest_p, strip_xmp=lossless_strip_xmp,

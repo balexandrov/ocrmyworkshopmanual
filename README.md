@@ -260,6 +260,20 @@ still refuses in place, since repairing changes content rather than storage.
 **Not preserved:** Fast Web View. The linearization hint stream (a pure index) is dropped;
 relinearizing costs ~6 MB and 6× the save time and only matters for byte-range HTTP streaming.
 
+**Not preserved: encryption.** An encrypted born-digital PDF is opened and re-stored
+**decrypted**, and its owner permission flags (`extract`, `modify_*`) are dropped. Measured across
+this archive's encrypted service manuals — RC4-128 from Acrobat Distiller 4 — every one opens with
+an **empty user password**: the encryption holds permission flags, not a lock, and refusing those
+files bought no safety. Passwords tried are `''` and `vector`; a file that fits neither is skipped
+and reported as `encrypted: none of the known passwords fit`, never as unreadable or damaged.
+
+This is the one thing the lane changes about a file besides how its bytes are stored, so it is
+recorded per file in the report's `note` column. Page content is untouched and verified as above —
+a permission flag cannot change what a page draws. Because bytes are not what these files buy,
+they are also exempt from `--lossless-min-savings`: the bar is only *not bigger than the source*.
+On a 26-file measurement the median was 3.6% smaller with 11 under the 3% default, so a size bar
+would have left half of them encrypted for a rounding error.
+
 ### Text-layer decisions
 
 **A text layer says something different on every page; a stamp says the same thing.** Text

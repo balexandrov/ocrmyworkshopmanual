@@ -5,6 +5,46 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — an encrypted PDF is now decrypted and re-stored, not refused (521 MB freed, 3,934 files)
+
+The lossless lane used to `return` the moment `is_encrypted` was true. The stated reason was that
+re-saving would change the encryption — true, but it made the wrong trade: **none of these files
+were actually locked.** Measured across the archive's encrypted PDFs (Toyota/Lexus/Subaru/Nissan
+service manuals, RC4-128 R3/V2 from Acrobat Distiller 4.05), every single one opens with an
+**empty user password**. The encryption carries only owner permission flags — `extract` off,
+`modify_*` off, printing allowed. It was never keeping anyone out; it was costing us the file.
+
+The lane now opens such a file (`_LOSSLESS_PASSWORDS = ('', 'vector')`) and saves it **decrypted**,
+dropping the permission flags. That is a deliberate semantic change and the only thing in this
+lane that is not faithful to the source's container, so every affected file says so in its note
+and in the report's `note` column. Page content is untouched and still fully verified — dropping
+a permission flag cannot change what a page draws.
+
+**The size bar does not apply to a decrypted file.** This mattered more than the plumbing: on a
+26-file measurement the median encrypted file came back only 3.6% smaller and 11 of 26 fell under
+the 3% `--lossless-min-savings` default, so on bytes alone half the archive would have stayed
+encrypted over a rounding error. For a file that shed its encryption the bar becomes *not bigger
+than the source* — shedding the encryption is the win.
+
+A genuinely locked file (no known password) now reports `encrypted: none of the known passwords
+fit` instead of `baseline unreadable`. Both used to fail the fingerprint identically, and calling
+a locked file unreadable sends a reviewer hunting for damage that does not exist.
+
+Archive result, both runs in place with `--no-ocr`:
+
+| tree | files | before → after | saved | decrypted |
+|---|---|---|---|---|
+| `Japan\Lexus` | 13,752 | 1,893 → 1,693 MB | −200 MB (−10.6%) | 1,795 |
+| Mazda + Mitsubishi + Nissan + Subaru (468 folders) | 2,908 | 2,457 → 2,136 MB | −321 MB (−13.1%) | 2,139 |
+
+Zero damaged originals across both. Yield is *per producer*, not per size: Lexus is 13,392
+born-digital files with a 60 KB median (part diagrams — little to win), while the four brands are
+large vector manuals that came back 38–61% smaller individually.
+
+Also fixed: a fractional `--lossless-min-mb` printed as `0.09 MB is under the 0 MB lossless
+floor`, which reads as a broken comparison rather than a rounded label. Integer floors still
+render as `5 MB`.
+
 ### Added — born-digital PDFs are re-stored losslessly instead of just copied (−62% on a 513 MB manual)
 
 A born-digital (vector/text) PDF must never be rasterised, so this tool's whole compression
