@@ -1,0 +1,41 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Explorer right-click menu: "Compress + OCR this folder (in place)" on a
+;  folder.
+;
+;  Double-click this file to install, then confirm the prompt. No admin rights
+;  are needed: everything goes under HKEY_CURRENT_USER, which Explorer merges
+;  into HKEY_CLASSES_ROOT for your account only. Log out/in or restart Explorer
+;  if the entry does not appear immediately.
+;
+;  On Windows 11 the entry lives under "Show more options" (Shift+F10 opens
+;  that menu directly).
+;
+;  WHAT IT DOES: runs the tool over the folder with default settings and
+;  --in-place. Subfolders are always included -- pointing the tool at a folder
+;  walks the whole tree. Each scanned PDF is OVERWRITTEN with its compressed,
+;  searchable version; non-PDF files, the folder structure, born-digital PDFs
+;  that cannot be improved, and files that are already optimal are left alone.
+;  This is DESTRUCTIVE to the scans themselves, so the .cmd behind this entry
+;  asks you to type YES before it starts.
+;
+;  No log: the command passes no --log, so nothing is written to disk except the
+;  PDFs, and the run reports to the console window only. Add --log to the
+;  command line below if you want a report kept (it lands in the current
+;  folder), or --log "D:\some\dir" to place it -- never inside the manuals.
+;
+;  IF YOU MOVE THE REPO: change the one path below
+;      S:\Projects\Home\ocrmyworkshopmanual\tools\compress_folder_here.cmd
+;  (keep the doubled backslashes) and re-import. The .cmd finds the script and
+;  the virtualenv relative to its own location, so nothing else needs editing.
+;
+;  To remove: run compress-folder-context-menu-uninstall.reg.
+; ============================================================================
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CompressPDFFolder]
+"MUIVerb"="Compress + OCR this folder (in place)"
+"Icon"="shell32.dll,-16826"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\CompressPDFFolder\command]
+@="\"S:\\Projects\\Home\\ocrmyworkshopmanual\\tools\\compress_folder_here.cmd\" \"%V\""

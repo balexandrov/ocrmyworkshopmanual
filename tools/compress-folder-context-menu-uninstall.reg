@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+;  Removes the "Compress + OCR this folder (in place)" folder context menu
+;  installed by compress-folder-context-menu.reg.
+;
+;  The leading "-" on the key name means DELETE THAT KEY AND EVERYTHING UNDER
+;  IT. Only this one verb is removed -- other folder entries, including
+;  "Combine PDF", are untouched. No files are affected.
+; ============================================================================
+
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\CompressPDFFolder]
