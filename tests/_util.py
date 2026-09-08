@@ -525,6 +525,25 @@ def make_acroform_array_contents_pdf(path: Path, npages: int = 2, widget: bool =
     return path
 
 
+def encrypt_pdf_in_place(path: Path, owner: str = 'owner', user: str = '',
+                         allow_extract: bool = False) -> Path:
+    """Re-save `path` encrypted the way the real publications are: RC4-128 (/V 2 /R 3) with
+    an EMPTY user password and owner permission flags that withhold text extraction and
+    accessibility. Nothing is actually protected — the file opens with no password — but
+    ocrmypdf refuses such input outright, so the scan ships unsearchable unless the tool
+    decrypts it first. `user=''` is what makes it openable-but-restricted."""
+    import pikepdf
+    tmp = path.with_suffix('.enc.pdf')
+    with pikepdf.open(str(path)) as pdf:
+        # metadata=False is REQUIRED at R=3: qpdf refuses to encrypt metadata below R4
+        # ("Cannot encrypt metadata when R < 4"), and the real files are R3 too.
+        pdf.save(str(tmp), encryption=pikepdf.Encryption(
+            owner=owner, user=user, R=3, aes=False, metadata=False,
+            allow=pikepdf.Permissions(extract=allow_extract, accessibility=False)))
+    tmp.replace(path)
+    return path
+
+
 def make_striped_scan_pdf(path: Path, dpi: int = 300, strips: int = 10,
                           page_in=(8.5, 11.0)) -> Path:
     """A scan stored as N FULL-WIDTH horizontal strips instead of one page-sized image.

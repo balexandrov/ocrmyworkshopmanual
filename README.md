@@ -260,8 +260,14 @@ still refuses in place, since repairing changes content rather than storage.
 **Not preserved:** Fast Web View. The linearization hint stream (a pure index) is dropped;
 relinearizing costs ~6 MB and 6× the save time and only matters for byte-range HTTP streaming.
 
-**Not preserved: encryption.** An encrypted born-digital PDF is opened and re-stored
-**decrypted**, and its owner permission flags (`extract`, `modify_*`) are dropped. Measured across
+**Not preserved: encryption.** Any encrypted PDF is re-stored **decrypted**, and its owner
+permission flags (`extract`, `modify_*`) are dropped — on **every** lane, not just this one
+(`--no-decrypt` opts out). It is done once, up front, because the lanes did not agree: anything
+that re-saves the PDF through qpdf or ocrmypdf dropped the encryption as a side effect, while the
+byte-copy paths — a born-digital PDF copied untouched, a lossless rewrite under its floor, an
+in-place file left as-is — preserved it and shipped a file with text extraction and accessibility
+still withheld. Whether a file stays locked should not depend on which lane it happened to take.
+Measured across
 this archive's encrypted service manuals — RC4-128 from Acrobat Distiller 4 — every one opens with
 an **empty user password**: the encryption holds permission flags, not a lock, and refusing those
 files bought no safety. Passwords tried are `''` and `vector`; a file that fits neither is skipped

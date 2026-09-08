@@ -41,6 +41,9 @@ Page-type router: classify_page() sorts each page into a PageType (PT_LINE/PT_BL
 Tuning notes (learned on Toyota FSM scans):
   OCR (default on) adds a searchable text layer via ocrmypdf; --no-ocr to skip.
                    Needs Tesseract on PATH and ocrmypdf installed.
+  DECRYPT (default on) an encrypted PDF is re-stored decrypted, dropping its owner
+                   permission flags (which withhold text extraction); --no-decrypt to
+                   leave such files exactly as they are. Reported per file.
   GENERIC JBIG2 only: each page is a self-contained JBIG2 stream (no shared glyph
                    dictionary), so it renders everywhere — PDFium (Chrome/Edge)
                    renders a shared dictionary as BLANK pages, so that mode isn't offered.
@@ -2970,6 +2973,66 @@ def _open_pdf(pdf_path: Path, **kw):
     raise last
 
 
+def _decrypt_source(src_p: Path, work: Path) -> tuple:
+    """(path_to_read, did_decrypt, error). Returns `src_p` untouched when the file is not
+    encrypted, so this is free on the normal path and safe to re-run over a done tree.
+
+    Why every lane needs this, not just the lossless one — MEASURED, because the obvious
+    guess is wrong. ocrmypdf does raise `EncryptedPdfError`, but only when it cannot
+    decrypt; these files carry an EMPTY user password, so it opens them happily and its
+    save drops the encryption anyway. Every lane that re-saves through qpdf or ocrmypdf is
+    therefore already fine. The BYTE-COPY paths are the real gap: a born-digital PDF copied
+    untouched, a lossless rewrite that missed its floor, an in-place file left as-is. On an
+    encrypted born-digital fixture the output came out still encrypted, with extraction and
+    accessibility still withheld — a locked file in a searchable archive.
+
+    What the encryption on these files actually is (measured across the archive's
+    encrypted publications — RC4-128 `/V 2 /R 3`, Acrobat Distiller): an EMPTY user
+    password plus owner permission flags such as `/P -1340`, which withhold text
+    extraction and accessibility while letting the file open. Nothing is protected; the
+    flags only inconvenience a reader and anything that wants to index the text — which
+    includes this tool.
+
+    **This drops those permission flags deliberately**, and that is a real semantic change
+    to the file, so it is never silent: every such file says so in its note and in the
+    report. Page content is untouched and still audited — dropping a permission flag
+    cannot change what a page draws.
+
+    Two guards, because this feeds a bulk rewrite of the only copy of the document, and
+    they are the same two the sister project's standalone decrypter uses:
+      * the output is reopened and must have the SAME page count, and
+      * it must no longer be encrypted,
+    or the file is failed with a reason instead of being processed from a bad copy."""
+    import pikepdf
+    try:
+        with pikepdf.open(str(src_p)) as p:
+            if not p.is_encrypted:
+                return src_p, False, None
+            pages_in = len(p.pages)
+    except pikepdf.PasswordError:
+        pass                        # encrypted with a password we have to go looking for
+    except Exception:
+        return src_p, False, None   # unreadable: the repair path reports this far better
+    # Same name in a scratch dir, so `src_p.name` still reads correctly in every report.
+    out = work / 'decrypted' / src_p.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _open_pdf(src_p) as p:         # tries the known passwords in turn
+            pages_in = len(p.pages)
+            p.save(str(out))                # no `encryption=`, so qpdf writes it in clear
+        with pikepdf.open(str(out)) as chk:
+            if chk.is_encrypted:
+                return src_p, False, 'decrypt failed: output is still encrypted'
+            if len(chk.pages) != pages_in:
+                return (src_p, False, f'decrypt failed: page count {pages_in} -> '
+                                      f'{len(chk.pages)}')
+    except pikepdf.PasswordError:
+        return src_p, False, 'encrypted: none of the known passwords fit'
+    except Exception as ex:
+        return src_p, False, f'decrypt failed: {ex}'
+    return out, True, None
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -3217,7 +3280,7 @@ def lossless_signature(src_p: Path) -> dict:
 def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
                      zopfli: bool = False, workers: int = 1,
                      min_savings: float = LOSSLESS_MIN_SAVINGS,
-                     progress=None) -> dict:
+                     progress=None, decrypt: bool = True) -> dict:
     """Rewrite a born-digital PDF smaller without changing what any page draws.
 
     Returns {'ok': bool, 'new': bytes_or_0, 'note': str, 'skip': str, 'stats': {...}}.
@@ -3251,6 +3314,14 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
             # flag is recorded for the note: this is the one thing the lane changes about a
             # file besides how its bytes are stored, and it must never happen silently.
             if p.is_encrypted:
+                if not decrypt:
+                    # The save below writes in the clear unconditionally, so this lane
+                    # CANNOT run without decrypting. --no-decrypt has to mean the file is
+                    # left alone, not "left alone unless a lane happens to unlock it", so
+                    # skip the rewrite and let the byte-for-byte copy keep it as it is.
+                    p.close()
+                    return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
+                            'skip': 'encrypted and --no-decrypt given'}
                 stats['decrypted'] = True
             if strip_xmp:
                 stats['xmp'] = _strip_private_xmp(p)
@@ -3621,7 +3692,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless: bool = True, lossless_strip_xmp: bool = True,
                   lossless_zopfli: bool = False,
                   lossless_min_savings: float = LOSSLESS_MIN_SAVINGS,
-                  lossless_min_mb: float = None) -> dict:
+                  lossless_min_mb: float = None,
+                  decrypt: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -3641,7 +3713,29 @@ def _compress_one(src: str, dest: str, dpi: int,
     src_p, dest_p = Path(src), Path(dest)
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jb_'))
+    decrypted = False
     try:
+        # DECRYPT FIRST, before anything else looks at the file. `dest_p` is a separate
+        # path (it equals the ORIGINAL src for --in-place), so rebinding src_p to the
+        # decrypted copy changes only what we READ, never where we write.
+        #
+        # Doing it HERE rather than per-lane is the whole point, and the reason is measured,
+        # not assumed. Every lane that re-saves through qpdf or ocrmypdf already drops the
+        # encryption as a side effect, so those files were fine. The BYTE-COPY paths are not:
+        # a born-digital PDF copied untouched, a lossless rewrite that did not beat its
+        # floor, and an in-place file left as-is all ship the source bytes verbatim —
+        # measured on an encrypted born-digital fixture, the output came out still encrypted
+        # with text extraction and accessibility still withheld. A restricted file in a
+        # searchable archive defeats the point of the archive, and which lane a file happens
+        # to take is no reason for it to stay locked.
+        if decrypt:
+            src_p, decrypted, derr = _decrypt_source(src_p, work)
+            if derr:
+                return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': derr}
+        # Dropping the permission flags is the one semantic change this tool makes to a
+        # file beyond its images, so it is stated on every path that ships one. A run must
+        # never silently hand back a file whose restrictions it removed.
+        dnote = ' (decrypted: owner permission flags dropped)' if decrypted else ''
         # How many pages the SOURCE has. Everything downstream is verified against this,
         # never against the rendered count: on a corrupt PDF, rendering (or the repair
         # fallback) can silently yield fewer pages, and verifying the output against that
@@ -3723,7 +3817,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                     copy_from, dest_p, strip_xmp=lossless_strip_xmp,
                     zopfli=lossless_zopfli,
                     workers=_ocr_jobs_budget(copy_from, src_pages) if lossless_zopfli else 1,
-                    min_savings=lossless_min_savings)
+                    min_savings=lossless_min_savings, decrypt=decrypt)
                 lnote, lstats, lskip = lres['note'], lres['stats'], lres['skip']
                 if lres['ok']:
                     return {'src': src_p.name, 'orig': orig, 'new': lres['new'],
@@ -3736,7 +3830,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                             'note': (f' (born-digital: rewritten losslessly'
                                      f'{" in place" if in_place else ""}; '
                                      f'scan_frac={bsig.get("scan_frac")})'
-                                     + rnote + lnote),
+                                     + rnote + lnote + dnote),
                             'lossless': lstats}
             if not in_place:   # in-place and not rewritten: the original stays exactly as-is
                 tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
@@ -3761,7 +3855,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                     # exactly — and one it never had is not created (this path runs no OCR).
                     'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
                     'note': f' (born-digital: {where}; scan_frac={bsig.get("scan_frac")})'
-                            + rnote + lnote}
+                            + rnote + lnote + dnote}
         # A stamp is worth saying out loud on the rows it changes: without this, a file whose
         # `ocr` column flipped from 'kept existing' to 'new ocr' gives a reviewer no reason
         # why. `signals` is attached ONLY when there is a stamp, so every other row in a
@@ -3802,7 +3896,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
                                  src_pages or len(PdfReader(str(base)).pages), True,
-                                 note0 + bnote + snote, timeout, in_place,
+                                 note0 + bnote + snote + dnote, timeout, in_place,
                                  already_ocred=_ocr_layer_added(ocr_state),
                                  ocr_state=ocr_state)
             res['action'] = 'kept_original'
@@ -4057,7 +4151,8 @@ def _compress_one(src: str, dest: str, dpi: int,
         colour_pages = {k for k, c in enumerate(classes)
                         if c.type in (PT_COLOR_LINE, PT_PHOTO_COLOR)}
         res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
-                             src_pages or len(pngs), kept_original, note, timeout, in_place,
+                             src_pages or len(pngs), kept_original, note + dnote,
+                             timeout, in_place,
                              colour_pages=None if kept_original else colour_pages,
                              already_ocred=(kept_ocred if kept_original else True),
                              was_repaired=did_repair, ocr_state=ocr_state)
@@ -4573,6 +4668,18 @@ def main():
                          'rewrite verifies against it (--no-lossless to leave it alone). '
                          'DESTRUCTIVE — back up first. A report is written only where --log '
                          'says, never among the manuals. Cannot be combined with --dest.')
+    ap.add_argument('--no-decrypt', action='store_true',
+                    help='do not decrypt encrypted PDFs; process them as-is. Decryption is ON '
+                         'by default so that a file is not left locked just because of which '
+                         'lane it took: any lane that re-saves the PDF already drops the '
+                         'encryption, but the byte-copy paths (born-digital copied untouched, a '
+                         'lossless rewrite under its floor, in-place left as-is) preserved it, '
+                         'so those shipped with text extraction and accessibility still '
+                         'withheld. These publications carry an EMPTY user password and only '
+                         'owner permission flags, so nothing protected is being unlocked — but '
+                         'the flags ARE dropped, which is a real change to the file, so every '
+                         'decrypted file says so in its note and in the report. Page content is '
+                         'untouched and still audited')
     ap.add_argument('--no-lossless', action='store_true',
                     help='do not attempt the lossless rewrite on born-digital PDFs — copy them '
                          'out byte-for-byte, as this tool did before. The rewrite re-stores a '
@@ -4939,6 +5046,7 @@ def main():
                                   lossless_zopfli=args.lossless_zopfli,
                                   lossless_min_savings=args.lossless_min_savings,
                                   lossless_min_mb=args.lossless_min_mb,
+                                  decrypt=not args.no_decrypt,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             for i, fut in enumerate(cf.as_completed(futs), 1):
