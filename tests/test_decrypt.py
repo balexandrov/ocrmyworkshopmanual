@@ -24,15 +24,32 @@ def _enc_state(path):
 
 # -- the fixture really is shaped like the real publications ------------------
 
-def test_fixture_is_openable_but_restricted(tmp_path):
-    """RC4-128 /V 2 /R 3, empty user password: it opens with no password at all, and the
-    only thing the encryption does is withhold extraction. That is the real shape."""
+@pytest.mark.parametrize('R,V', [(2, 1), (3, 2)])
+def test_fixture_is_openable_but_restricted(tmp_path, R, V):
+    """Empty user password: it opens with no password at all, and the only thing the
+    encryption does is withhold extraction. Both revisions are real -- probing one file per
+    folder over two brands found 14 R2/V1 (RC4-40) against 1 R3/V2, so R2 is the COMMON
+    case here and the R3 fixture alone would have tested the rarer one."""
     p = U.make_born_digital_pdf(tmp_path / 'v.pdf', npages=2)
-    U.encrypt_pdf_in_place(p)
+    U.encrypt_pdf_in_place(p, R=R)
     with pikepdf.open(str(p)) as pdf:          # no password argument -> opens
         assert pdf.is_encrypted
-        assert pdf.encryption.R == 3 and pdf.encryption.V == 2
+        assert pdf.encryption.R == R and pdf.encryption.V == V
         assert not pdf.allow.extract and not pdf.allow.accessibility
+
+
+@pytest.mark.parametrize('R', [2, 3])
+def test_decrypt_source_handles_both_rc4_revisions(tmp_path, R):
+    """RC4-40 and RC4-128 are different paths in qpdf; the archive holds both."""
+    p = U.make_born_digital_pdf(tmp_path / f'r{R}.pdf', npages=3)
+    U.encrypt_pdf_in_place(p, R=R)
+    work = tmp_path / 'work'
+    work.mkdir()
+    out, did, err = owm._decrypt_source(p, work)
+    assert did is True and err is None
+    assert _enc_state(out) == (False, True)
+    with pikepdf.open(str(out)) as pdf:
+        assert len(pdf.pages) == 3
 
 
 # -- the unit ----------------------------------------------------------------

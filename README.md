@@ -267,10 +267,11 @@ that re-saves the PDF through qpdf or ocrmypdf dropped the encryption as a side 
 byte-copy paths — a born-digital PDF copied untouched, a lossless rewrite under its floor, an
 in-place file left as-is — preserved it and shipped a file with text extraction and accessibility
 still withheld. Whether a file stays locked should not depend on which lane it happened to take.
-Measured across
-this archive's encrypted service manuals — RC4-128 from Acrobat Distiller 4 — every one opens with
-an **empty user password**: the encryption holds permission flags, not a lock, and refusing those
-files bought no safety. Passwords tried are `''` and `vector`; a file that fits neither is skipped
+Measured by probing one file
+per folder across two brands (2,393 folders, 15 encrypted): **every one opens with an empty user
+password**, so the encryption holds permission flags, not a lock, and refusing those files bought
+no safety. Revisions found were 14 × RC4-40 (`/V 1 /R 2`) and 1 × RC4-128 (`/V 2 /R 3`) — RC4-40
+is the common case here, and 10 of the 15 did not even withhold extraction. Passwords tried are `''` and `vector`; a file that fits neither is skipped
 and reported as `encrypted: none of the known passwords fit`, never as unreadable or damaged.
 
 This is the one thing the lane changes about a file besides how its bytes are stored, so it is

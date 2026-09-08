@@ -526,19 +526,22 @@ def make_acroform_array_contents_pdf(path: Path, npages: int = 2, widget: bool =
 
 
 def encrypt_pdf_in_place(path: Path, owner: str = 'owner', user: str = '',
-                         allow_extract: bool = False) -> Path:
-    """Re-save `path` encrypted the way the real publications are: RC4-128 (/V 2 /R 3) with
-    an EMPTY user password and owner permission flags that withhold text extraction and
-    accessibility. Nothing is actually protected — the file opens with no password — but
-    ocrmypdf refuses such input outright, so the scan ships unsearchable unless the tool
-    decrypts it first. `user=''` is what makes it openable-but-restricted."""
+                         allow_extract: bool = False, R: int = 3) -> Path:
+    """Re-save `path` encrypted the way the real publications are: RC4 with an EMPTY user
+    password and owner permission flags. `user=''` is what makes it openable-but-restricted
+    — nothing is actually protected, the flags only withhold extraction/accessibility.
+
+    `R` picks the revision, and BOTH real ones matter. Measured by probing one file per
+    folder across two brands (2,393 folders, 15 encrypted): 14 were **R2/V1 (RC4-40)** and
+    only 1 was R3/V2, so R2 is the common case in this archive, not the exotic one. Both
+    are covered by the tests because they are different code paths in qpdf."""
     import pikepdf
     tmp = path.with_suffix('.enc.pdf')
     with pikepdf.open(str(path)) as pdf:
         # metadata=False is REQUIRED at R=3: qpdf refuses to encrypt metadata below R4
         # ("Cannot encrypt metadata when R < 4"), and the real files are R3 too.
         pdf.save(str(tmp), encryption=pikepdf.Encryption(
-            owner=owner, user=user, R=3, aes=False, metadata=False,
+            owner=owner, user=user, R=R, aes=False, metadata=False,
             allow=pikepdf.Permissions(extract=allow_extract, accessibility=False)))
     tmp.replace(path)
     return path
