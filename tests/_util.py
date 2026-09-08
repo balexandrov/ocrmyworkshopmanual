@@ -547,6 +547,55 @@ def encrypt_pdf_in_place(path: Path, owner: str = 'owner', user: str = '',
     return path
 
 
+def make_mrc_pdf(path: Path, npages: int = 2, img_px: int = 600) -> Path:
+    """A page shaped like a real MRC scan: 8-bit DCT tiles PLUS a 1-bit mask on the SAME
+    page, so its bit depths are {8, 1}.
+
+    That mix is the whole point. A guard asking "is there a 1-bit image on this page"
+    cannot tell an MRC page apart from a colour page someone binarised, and these are the
+    files scanners like the 2008 OpticBook produce -- measured on Nissan 300ZX manuals,
+    where a passed-through MRC mask was reported as the tool's own damage."""
+    import zlib
+
+    import pikepdf
+    from PIL import Image
+    pdf = pikepdf.Pdf.new()
+    h = round(img_px * 11 / 8.5)
+
+    # the 1-bit mask, packed 8 pixels per byte
+    row = bytes([0xFF] * ((img_px + 7) // 8))
+    dark = bytes([0x00] * len(row))
+    mask = pikepdf.Stream(pdf, zlib.compress(
+        b''.join(dark if 40 < y < 80 else row for y in range(h))))
+    mask.Type, mask.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+    mask.Width, mask.Height = img_px, h
+    mask.ColorSpace, mask.BitsPerComponent = pikepdf.Name.DeviceGray, 1
+    mask.Filter = pikepdf.Name.FlateDecode
+    mask = pdf.make_indirect(mask)
+
+    # an 8-bit colour tile, JPEG-compressed like a real MRC background
+    import io as _io
+    buf = _io.BytesIO()
+    Image.new('RGB', (img_px // 2, h // 4), (200, 60, 40)).save(buf, 'JPEG', quality=60)
+    tile = pikepdf.Stream(pdf, buf.getvalue())
+    tile.Type, tile.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+    tile.Width, tile.Height = img_px // 2, h // 4
+    tile.ColorSpace, tile.BitsPerComponent = pikepdf.Name.DeviceRGB, 8
+    tile.Filter = pikepdf.Name.DCTDecode
+    tile = pdf.make_indirect(tile)
+
+    for _i in range(npages):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pikepdf.Stream(pdf, (
+            b'q 612 0 0 792 0 0 cm /Msk Do Q\n'          # the bilevel mask, full page
+            b'q 300 0 0 190 20 300 cm /Tile Do Q\n'))    # an 8-bit tile over it
+        page.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Msk=mask, Tile=tile))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf.save(str(path))
+    return path
+
+
 def make_striped_scan_pdf(path: Path, dpi: int = 300, strips: int = 10,
                           page_in=(8.5, 11.0)) -> Path:
     """A scan stored as N FULL-WIDTH horizontal strips instead of one page-sized image.

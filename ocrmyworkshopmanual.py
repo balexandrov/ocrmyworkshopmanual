@@ -2574,9 +2574,10 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
     affordable on a 100k-file archive:
 
       * opens, and has exactly the source's page count       -> fatal
-      * a page classified as COLOUR is not 1-bit in the output -> fatal (the failure that
-        silently destroyed colour wiring diagrams archive-wide), UNLESS that page's source
-        raster was already 1-bit, in which case we cannot be the one who binarised it
+      * a page classified as COLOUR has not COLLAPSED to 1-bit -> fatal (the failure that
+        silently destroyed colour wiring diagrams archive-wide). Collapse, not the presence
+        of a 1-bit image: an already-bilevel source cannot have been binarised by us, and
+        an MRC page legitimately carries a 1-bit mask beside its 8-bit tiles
       * nothing the content stream still paints has been dropped (`Do` on an XObject the
         resources no longer define)                           -> fatal
       * font /Widths arrays match their own /FirstChar../LastChar range — wrong advances
@@ -2618,15 +2619,29 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
     # is genuine, PT_COLOR_LINE passes the original page through losslessly to preserve
     # it — exactly the right outcome — and the old check then read the passed-through
     # source image as our own damage and FAILED the whole file, OCR included.
+    # The test is COLLAPSE, not the mere presence of a 1-bit image: fatal only when the
+    # output page is bilevel AND the source page was not. Asking "is there a 1-bit image
+    # here" fails an MRC page, which is a mosaic of 8-bit DCT tiles PLUS a 1-bit JBIG2
+    # mask — bpcs {8, 1} in the source AND in the output, so nothing was binarised and the
+    # mask we passed through was read as our own damage. Measured on 2008 OpticBook scans
+    # (`Z31 Z32 300ZX\1989 300ZX Z31\{BF,EM,EL,HA}.pdf`): page 1 has genuine colour, the
+    # router sends it to PT_COLOR_LINE, that copies the ORIGINAL page through untouched —
+    # and this check then failed the file, so it never got OCR'd either.
+    #
+    # Collapse still catches every real loss, including on an MRC page: binarising one
+    # takes {8, 1} to {1}, which trips it. Do NOT relax this to `1 in bpcs(src)` — that
+    # would let exactly that case through.
     for i in sorted(colour_pages or ())[:sample]:
+        try:
+            out_bpcs = _page_image_bpcs(r.pages[i])
+        except Exception:
+            continue
+        if out_bpcs != {1}:
+            continue        # still carries depth -> nothing collapsed
         sp = _src_page(i)
         if sp is not None and _page_image_bpcs(sp) == {1}:
             continue        # source was already bilevel -> nothing here was ours to lose
-        try:
-            if 1 in _page_image_bpcs(r.pages[i]):
-                return f'colour page {i + 1} was binarised to 1-bit', ''
-        except Exception:
-            pass
+        return f'colour page {i + 1} was binarised to 1-bit', ''
     idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
     # nothing still painted may have been dropped, and glyph metrics must be self-consistent.
     #

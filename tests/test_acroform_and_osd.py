@@ -93,6 +93,31 @@ def test_mixed_source_page_is_still_checked(tmp_path):
     assert fatal and 'binarised' in fatal
 
 
+def test_mrc_page_passed_through_is_not_called_binarised(tmp_path):
+    """An MRC page is 8-bit tiles PLUS a 1-bit mask, so bpcs are {8, 1} in the source AND
+    the output. Asking "is there a 1-bit image here" failed the file and cost it its OCR --
+    measured on 2008 OpticBook Nissan 300ZX scans, where PT_COLOR_LINE correctly passed the
+    original page through and the guard read our own passed-through mask as damage."""
+    src = U.make_mrc_pdf(tmp_path / 'mrc.pdf', npages=2)
+    out = tmp_path / 'out.pdf'
+    shutil.copyfile(src, out)
+    assert owm._page_image_bpcs(PdfReader(str(src)).pages[0]) == {8, 1}
+    fatal, _warn = owm._audit_output(out, 2, src_p=src, colour_pages={0})
+    assert not fatal
+
+
+def test_binarising_an_mrc_page_is_still_fatal(tmp_path):
+    """The relaxation must not go one step further. Flattening an MRC page takes {8, 1} to
+    {1}, which is real colour loss and must still fail -- which is why the test is COLLAPSE
+    (`out == {1}` while `src != {1}`) and not `1 in bpcs(src)`."""
+    src = U.make_mrc_pdf(tmp_path / 'mrc.pdf', npages=2)
+    flat = U.make_acroform_array_contents_pdf(tmp_path / 'flat.pdf', npages=2,
+                                              widget=False, nbookmarks=0)
+    assert owm._page_image_bpcs(PdfReader(str(flat)).pages[0]) == {1}
+    fatal, _warn = owm._audit_output(flat, 2, src_p=src, colour_pages={0})
+    assert fatal and 'binarised' in fatal
+
+
 # -- the graft survives a /Contents ARRAY -------------------------------------
 
 def _add_ocr_layer(src: Path, out: Path) -> Path:
