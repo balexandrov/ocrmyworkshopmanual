@@ -1375,6 +1375,145 @@ def _has_acroform(p: Path) -> bool:
         return False
 
 
+# PIL refuses an image over 500 megapixels as a possible decompression bomb, and ocrmypdf
+# hits that limit on pages whose declared size is absurd rather than large. Budget below it,
+# with headroom for the RGB copy ocrmypdf makes alongside.
+_OCR_RASTER_BUDGET_MP = 400.0
+
+
+def _page_geometry(page) -> tuple:
+    """(width_in, height_in, largest_image_px_w, largest_image_px_h) for one source page."""
+    try:
+        mb = [float(v) for v in page['/MediaBox']]
+        w_in, h_in = abs(mb[2] - mb[0]) / 72.0, abs(mb[3] - mb[1]) / 72.0
+    except Exception:
+        return 0.0, 0.0, 0, 0
+    best, bw, bh = 0, 0, 0
+    try:
+        xo = page['/Resources']['/XObject'].get_object()
+        for nm in xo.keys():
+            o = xo[nm].get_object()
+            if o.get('/Subtype') != '/Image':
+                continue
+            pw, ph = int(o.get('/Width', 0)), int(o.get('/Height', 0))
+            if pw * ph > best:
+                best, bw, bh = pw * ph, pw, ph
+    except Exception:
+        pass
+    return w_in, h_in, bw, bh
+
+
+def _ocrmypdf_raster_mp(src_p: Path, sample: int = 40) -> tuple:
+    """(worst_megapixels, page_no, native_dpi) that ocrmypdf would rasterise for OCR.
+
+    It rasterises at `max(image dpi, 400 if the page has text or vector content)` — see
+    `get_page_square_dpi` in its `_pipeline`. So a page whose declared size does not match
+    its raster gets blown up by whatever ratio separates the two, and the 400 is a FLOOR
+    that no CLI option lowers.
+
+    Measured on `180SX_SR20DET.pdf`: its producer laid every image out at one pixel per
+    POINT, so 92 of 101 pages declare 70.78 x 97.19 in while holding ~29 MP of scan — a
+    native ~60 dpi. At the forced 400 that is 28311 x 38878 = 1,100,675,058 px, which is
+    exactly the number PIL refused, and 40x more pixels than the page actually contains.
+    Nothing is corrupt: the page box is a unit mistake, not a giant sheet."""
+    worst, worst_pg, worst_native = 0.0, 0, 0.0
+    try:
+        r = PdfReader(str(src_p))
+    except Exception:
+        return 0.0, 0, 0.0
+    n = len(r.pages)
+    idxs = range(n) if n <= sample else sorted(
+        {round(i * (n - 1) / (sample - 1)) for i in range(sample)})
+    for i in idxs:
+        try:
+            w_in, h_in, bw, bh = _page_geometry(r.pages[i])
+        except Exception:
+            continue
+        if w_in <= 0 or h_in <= 0:
+            continue
+        native = max(bw / w_in, bh / h_in) if bw and bh else 0.0
+        dpi = max(native, 400.0)               # 400 is ocrmypdf's floor, not a choice
+        mp = (w_in * dpi) * (h_in * dpi) / 1e6
+        if mp > worst:
+            worst, worst_pg, worst_native = mp, i + 1, native
+    return worst, worst_pg, worst_native
+
+
+def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
+                           jobs: int) -> tuple:
+    """OCR a render made at each page's OWN native dpi, and return (donor_pdf, note).
+
+    For pages ocrmypdf would blow up on. It rasterises at a 400 dpi floor whenever a page
+    carries text or vector content, and that floor is not adjustable — so the only way to
+    OCR at the resolution the page actually holds is to do the rasterising here and hand
+    ocrmypdf a plain image PDF. The render carries no text by construction, so --skip-text
+    OCRs every page, and the caller grafts the text onto the untouched original.
+
+    Rendering at NATIVE dpi is the point: it produces exactly the pixels the page has, so
+    OCR sees no less detail than the source holds while the raster stays sane (~29 MP
+    instead of 1,101 MP on the file this was written for)."""
+    try:
+        r = PdfReader(str(src_p))
+        n = len(r.pages)
+    except Exception as ex:
+        return None, f' (native-render OCR failed: unreadable source: {ex})'
+    pages = []
+    for i in range(n):
+        w_in, h_in, bw, bh = _page_geometry(r.pages[i])
+        if w_in <= 0 or h_in <= 0:
+            continue
+        native = max(bw / w_in, bh / h_in) if bw and bh else 0.0
+        # Clamped: below 72 there is nothing for OCR to read, and above 300 a page with a
+        # genuinely huge box would put us back where we started.
+        dpi = int(max(72.0, min(native or 200.0, 300.0)))
+        while (w_in * dpi) * (h_in * dpi) / 1e6 > _OCR_RASTER_BUDGET_MP and dpi > 72:
+            dpi = max(72, int(dpi * 0.75))
+        png = work / f'nat_{i:05d}.png'
+        png.unlink(missing_ok=True)
+        try:
+            subprocess.run([GS, '-sDEVICE=pnggray', f'-r{dpi}', '-dNOPAUSE', '-dBATCH',
+                            '-dQUIET', f'-dFirstPage={i + 1}', f'-dLastPage={i + 1}',
+                            _GS_INTERPOLATE, '-sOutputFile=' + str(png),
+                            win_long(src_p)], capture_output=True, timeout=timeout or 600)
+        except Exception:
+            continue
+        if not png.exists() or not png.stat().st_size:
+            continue
+        one = work / f'natin_{i:05d}.pdf'
+        try:
+            with open(one, 'wb') as f:
+                f.write(img2pdf.convert(str(png), dpi=dpi))
+            pages.append(one)
+        except Exception:
+            pass
+        finally:
+            png.unlink(missing_ok=True)
+    if len(pages) != n:
+        return None, (f' (native-render OCR failed: rendered {len(pages)} of {n} pages)')
+    merged = work / 'native_render.pdf'
+    try:
+        w = PdfWriter()
+        for one in pages:
+            w.append(str(one))
+        with open(merged, 'wb') as f:
+            w.write(f)
+    except Exception as ex:
+        return None, f' (native-render OCR failed: merge: {ex})'
+    out = work / 'native_ocr.pdf'
+    r2, _tries = _run_retry(lambda: subprocess.run(
+        OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
+                    '--skip-text', '--quiet', '--jobs', str(jobs), str(merged), str(out)],
+        capture_output=True, text=True))
+    if r2 is None or r2.returncode != 0 or not out.exists() or not out.stat().st_size:
+        tail = ''
+        if r2 is not None:
+            lines = [x.strip() for x in ((r2.stderr or '') + (r2.stdout or '')).splitlines()
+                     if x.strip()]
+            tail = f': {lines[-1][:160]}' if lines else ''
+        return None, f' (native-render OCR failed{tail})'
+    return out, ''
+
+
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                 timeout: int = 0, preserve_images: bool = False, pages: int = 0,
                 lang_src: Path = None) -> tuple:
@@ -1432,6 +1571,29 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     else:
         mode = '--force-ocr'                  # images will be replaced by compressed ones
     out = work / 'src_ocr.pdf'
+    # A page whose declared size does not match its raster makes ocrmypdf rasterise at a
+    # ratio, not a resolution: it uses a 400 dpi FLOOR whenever a page has text or vector
+    # content, and no CLI option lowers it. Past PIL's 500 MP bomb guard that is not a
+    # slow OCR, it is a hard failure and no text layer at all. So rasterise HERE instead,
+    # at each page's own native dpi, and graft the text onto the untouched original.
+    if preserve_images or has_vector:
+        worst_mp, worst_pg, native = _ocrmypdf_raster_mp(src_p)
+        if worst_mp > _OCR_RASTER_BUDGET_MP:
+            with _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
+                got, nnote = _ocr_donor_from_render(src_p, work, language, timeout, jobs)
+            if got is None:
+                return None, language, nnote
+            shipped = work / 'src_ocr_native.pdf'
+            try:
+                shutil.copyfile(str(src_p), str(shipped))
+                _graft_into_source(src_p, shipped, got,
+                                   {k: k for k in range(_page_count(got))})
+            except Exception as ex:
+                return None, language, (' (OCR FAILED - native-render graft onto the'
+                                        ' untouched source failed: ' + repr(ex) + ')')
+            return shipped, language, (
+                f' (lang:{language}, OCR at native ~{native:.0f} dpi: page {worst_pg}'
+                f' declares a box ocrmypdf would rasterise to {worst_mp:.0f} MP)')
     # Budget from THIS file's page count, held for the whole call. `--jobs` cannot be changed
     # on a running process, so a number sampled from queue state here is frozen for however
     # long the file takes — hours, on the manuals that need the threads most.
