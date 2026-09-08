@@ -450,6 +450,81 @@ def make_form_wrapped_pdf(path: Path, with_text: bool = True, img_px: int = 1200
     return path
 
 
+def make_acroform_array_contents_pdf(path: Path, npages: int = 2, widget: bool = True,
+                                     nbookmarks: int = 3, img_px: int = 900) -> Path:
+    """A 1-bit scan shaped like the Nissan R50/R51 `fwd.pdf` that broke three guards at once:
+
+      * every page's /Contents is an ARRAY of two streams, not a single stream (legal, and
+        the graft's `read_bytes()` raised 'operation for stream attempted on object of
+        type array' on it, aborting the graft and with it every link and bookmark);
+      * the page raster is ALREADY 1-bit, while the only colour on the page lives in an
+        AcroForm /Widget appearance stream — so a colour-classified page is legitimately
+        1-bit in the output and the binarisation guard cried damage;
+      * a fillable form makes ocrmypdf refuse --redo-ocr outright.
+
+    Bookmarks point at OTHER FILES (/URI to a sibling PDF), like a real manual's
+    inter-file TOC, so nothing can 'preserve' them by renumbering pages."""
+    import zlib
+
+    import pikepdf
+    pdf = pikepdf.Pdf.new()
+    h = round(img_px * 11 / 8.5)
+    # a 1-bit image: mostly white with a few black rows, packed 8 pixels per byte
+    row = bytes([0xFF] * ((img_px + 7) // 8))
+    dark = bytes([0x00] * len(row))
+    raw = b''.join(dark if 100 < y < 140 else row for y in range(h))
+    img = pikepdf.Stream(pdf, zlib.compress(raw))
+    img.Type, img.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+    img.Width, img.Height = img_px, h
+    img.ColorSpace, img.BitsPerComponent = pikepdf.Name.DeviceGray, 1
+    img.Filter = pikepdf.Name.FlateDecode
+    img = pdf.make_indirect(img)
+    font = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+        BaseFont=pikepdf.Name.Helvetica, Encoding=pikepdf.Name.WinAnsiEncoding))
+    for _i in range(npages):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        # the defining detail: /Contents as an ARRAY of two streams
+        page.Contents = pikepdf.Array([
+            pdf.make_indirect(pikepdf.Stream(pdf, b'q 612 0 0 792 0 0 cm /Im0 Do Q\n')),
+            pdf.make_indirect(pikepdf.Stream(pdf, b'BT /F1 9 Tf 300 12 Td (7)Tj ET\n')),
+        ])
+        page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=img),
+                                            Font=pikepdf.Dictionary(F1=font))
+    if widget:
+        # BLUE text in a widget appearance stream: real colour the 1-bit raster cannot hold
+        ap = pikepdf.Stream(pdf, b'0 0 1 rg BT /F1 24 Tf 4 40 Td '
+                                 b'(NOTE: see supplement manual)Tj ET\n')
+        ap.Type, ap.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        ap.BBox = pikepdf.Array([0, 0, 340, 90])
+        ap.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        w = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget, FT=pikepdf.Name.Btn,
+            T='note', Rect=pikepdf.Array([60, 400, 400, 490]),
+            F=4, AP=pikepdf.Dictionary(N=ap)))
+        pdf.pages[0].Annots = pikepdf.Array([w])
+        pdf.Root.AcroForm = pikepdf.Dictionary(
+            Fields=pikepdf.Array([w]), DA=pikepdf.String('/Helv 0 Tf 0 g'),
+            DR=pikepdf.Dictionary(Font=pikepdf.Dictionary(Helv=font)))
+    if nbookmarks:
+        items = [pdf.make_indirect(pikepdf.Dictionary(
+            Title=f'Section {k}',
+            A=pikepdf.Dictionary(S=pikepdf.Name.URI, Type=pikepdf.Name.Action,
+                                 URI=pikepdf.String(f'sec{k}.pdf#page=1'))))
+            for k in range(nbookmarks)]
+        for k, it in enumerate(items):
+            if k:
+                it.Prev = items[k - 1]
+            if k + 1 < len(items):
+                it.Next = items[k + 1]
+        pdf.Root.Outlines = pikepdf.Dictionary(
+            Type=pikepdf.Name.Outlines, Count=len(items),
+            First=items[0], Last=items[-1])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf.save(str(path))
+    return path
+
+
 def make_striped_scan_pdf(path: Path, dpi: int = 300, strips: int = 10,
                           page_in=(8.5, 11.0)) -> Path:
     """A scan stored as N FULL-WIDTH horizontal strips instead of one page-sized image.

@@ -1351,6 +1351,27 @@ def _page_count(p: Path) -> int:
         return 0
 
 
+def _has_acroform(p: Path) -> bool:
+    """True if the PDF carries a fillable form. ocrmypdf REFUSES --redo-ocr outright on
+    these (InputFileError: 'This PDF has a user fillable form'), which is how a scanned
+    manual whose only form field is a stamped note ends up with no text layer at all.
+
+    The test mirrors ocrmypdf's own (pdfinfo/info.py): /AcroForm present AND either a
+    non-empty /Fields or an /XFA. Matching it exactly matters — guessing wider would send
+    files down the slower donor path for nothing, guessing narrower would still fail."""
+    try:
+        root = PdfReader(str(p)).trailer['/Root']
+        af = root.get('/AcroForm')
+        if af is None:
+            return False
+        af = af.get_object()
+        fields = af.get('/Fields')
+        fields = fields.get_object() if fields is not None else []
+        return bool(len(fields)) or '/XFA' in af
+    except Exception:
+        return False
+
+
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                 timeout: int = 0, preserve_images: bool = False, pages: int = 0,
                 lang_src: Path = None) -> tuple:
@@ -1388,10 +1409,23 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     # ship: it re-encoded a 41 MB Lexus manual into 616 MB, and blew small colour diagrams
     # up 4-9x. So callers that keep the source images pass preserve_images=True and get
     # --redo-ocr, which refreshes the text layer without touching the images.
+    donor = False
     if has_vector:
         mode = '--skip-text'                  # never re-OCR on top of real vector text
     elif preserve_images:
         mode = '--redo-ocr'                   # images are the output — must not rasterise
+        # ...except that ocrmypdf REFUSES --redo-ocr on a PDF with a fillable form, so on
+        # those this path produced no text layer at all. Reaching the text a different way:
+        # run --force-ocr purely as a TEXT DONOR and graft its /OCR-* Form XObjects onto an
+        # untouched copy of the source, exactly as the compress path already does. The
+        # donor's rasterised images are discarded, so the shipped file keeps the originals
+        # and only gains text. Measured on Nissan R50/R51 `fwd.pdf` (4 pages, one blue
+        # stamped note in a /Widget): --redo-ocr failed outright; the donor graft leaves all
+        # four images the source's own 1-bit CCITTFax, keeps 25 bookmarks and 21 link
+        # annotations, and takes the pages from ~1 char to 750-3302 for +14% bytes - against
+        # the 5.05x this file grows if --force-ocr's own output is shipped instead.
+        if _has_acroform(src_p):
+            mode, donor = '--force-ocr', True
     else:
         mode = '--force-ocr'                  # images will be replaced by compressed ones
     out = work / 'src_ocr.pdf'
@@ -1414,8 +1448,37 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     note += f', retried x{tries - 1}' if tries > 1 else ''
     note += ')'
     if r is not None and r.returncode == 0 and out.exists() and out.stat().st_size > 0:
-        return out, language, note
-    return None, language, ' (OCR FAILED)'
+        if not donor:
+            return out, language, note
+        # Harvest the donor's text onto the UNTOUCHED source. On any failure the file is
+        # reported as OCR-failed rather than shipping the donor: its images are rasterised,
+        # and quietly shipping those is the 5x blow-up this whole path exists to avoid.
+        shipped = work / 'src_ocr_form.pdf'
+        try:
+            shutil.copyfile(str(src_p), str(shipped))
+            _graft_into_source(src_p, shipped, out, {n: n for n in range(_page_count(out))})
+        except Exception as ex:
+            return None, language, (' (OCR FAILED - fillable form: text graft onto'
+                                    ' the untouched source failed: ' + repr(ex) + ')')
+        return shipped, language, note + ' (fillable form: text grafted, images untouched)'
+    # WHY it failed, not just that it did. A bare '(OCR FAILED)' threw ocrmypdf's own
+    # stderr away, so the report named no cause and the only way to learn one was to
+    # re-run the command by hand outside the tool. ocrmypdf explains itself well; the
+    # last non-empty stderr line is almost always the actual reason.
+    why = ''
+    if r is None:
+        why = 'ocrmypdf did not run (crashed or stalled past the timeout)'
+    else:
+        tail = [x.strip() for x in ((r.stderr or '') + '\n' + (r.stdout or '')).splitlines()
+                if x.strip()]
+        why = f'exit {r.returncode}'
+        if tail:
+            why += ': ' + tail[-1][:200]
+        if not out.exists():
+            why += ' (no output file)'
+        elif not out.stat().st_size:
+            why += ' (empty output file)'
+    return None, language, f' (OCR FAILED - {why})'
 
 
 _TEXT_SHOW = re.compile(rb"(?<![A-Za-z0-9])(Tj|TJ|'|\")(?![A-Za-z0-9])")
@@ -1712,8 +1775,16 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
                     for name, xobj in ocr_xo.items():
                         res['/XObject'][name] = xobj
                         draw.append(f'q {name} Do Q'.encode())
-                    body = bytes(sp.obj.Contents.read_bytes()) + b'\n' + b'\n'.join(draw) + b'\n'
-                    sp.Contents = s.make_stream(body)
+                    # /Contents is legally EITHER one stream OR an array of them, and
+                    # read_bytes() on an array raises 'operation for stream attempted on
+                    # object of type array'. That aborted the whole graft, and the caller's
+                    # fallback rebuild carries no navigation — so a page shape this common
+                    # cost the file every bookmark and link it had. Measured on Nissan
+                    # R50/R51 `fwd.pdf`: all 4 pages ship a 2-element /Contents array, and
+                    # its 25 cross-file /GoToR + /URI bookmarks (the manual's whole
+                    # inter-file TOC) were reported lost 25->0. contents_add appends to
+                    # either shape, and leaves the original streams untouched.
+                    sp.contents_add(b'\n' + b'\n'.join(draw) + b'\n')
                 if '/MediaBox' in fp.keys():
                     sp['/MediaBox'] = fp['/MediaBox']
                 # /Rotate must be SET, not copied-if-present. Ghostscript BAKES the source
@@ -2472,6 +2543,22 @@ def _width_signatures(bad_widths) -> set:
     return {s.split(' ', 1)[-1] for s in bad_widths}
 
 
+def _page_image_bpcs(page) -> set:
+    """BitsPerComponent of every image this page's own /Resources define. Empty when the
+    page has no images or cannot be read. Used to tell OUR binarisation apart from a
+    source raster that was already bilevel."""
+    out = set()
+    try:
+        xo = page['/Resources']['/XObject'].get_object()
+        for _n, o in xo.items():
+            oo = o.get_object()
+            if oo.get('/Subtype') == '/Image':
+                out.add(int(oo.get('/BitsPerComponent', 8)))
+    except Exception:
+        pass
+    return out
+
+
 def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
                   colour_pages=None, sample: int = 6) -> tuple:
     """Self-check the result against the SOURCE before anything is overwritten.
@@ -2485,7 +2572,8 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
 
       * opens, and has exactly the source's page count       -> fatal
       * a page classified as COLOUR is not 1-bit in the output -> fatal (the failure that
-        silently destroyed colour wiring diagrams archive-wide)
+        silently destroyed colour wiring diagrams archive-wide), UNLESS that page's source
+        raster was already 1-bit, in which case we cannot be the one who binarised it
       * nothing the content stream still paints has been dropped (`Do` on an XObject the
         resources no longer define)                           -> fatal
       * font /Widths arrays match their own /FirstChar../LastChar range — wrong advances
@@ -2504,26 +2592,6 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
         return f'output has {got} pages, expected {expect_pages}', ''
 
     warn = []
-    # colour pages must not have been binarised
-    for i in sorted(colour_pages or ())[:sample]:
-        try:
-            xo = r.pages[i]['/Resources']['/XObject'].get_object()
-            for _n, o in xo.items():
-                oo = o.get_object()
-                if oo.get('/Subtype') == '/Image' and int(oo.get('/BitsPerComponent', 8)) == 1:
-                    return f'colour page {i + 1} was binarised to 1-bit', ''
-        except Exception:
-            pass
-    idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
-    # nothing still painted may have been dropped, and glyph metrics must be self-consistent.
-    #
-    # DIFFERENTIAL, like every other check here: a defect the SOURCE already carries is not
-    # damage this run did, and refusing the result over it throws away a good output and
-    # leaves the file unsearchable for a fault we faithfully preserved. Measured on a Nissan
-    # Primera folder where every page-1 /dgp0 font ships 256 widths for a 224-slot range:
-    # 18 of 20 files were reported FAILED with the originals kept — correct in that nothing
-    # was damaged, useless in that nothing was OCR'd either. Unlike page count, colour, text
-    # and links, these two conditions can pre-exist, so they are the two that need it.
     rsrc = None
     if src_p is not None and src_p.exists():
         try:
@@ -2537,6 +2605,36 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
         except Exception:
             return None
 
+    # A colour page must not have been binarised BY THIS RUN. DIFFERENTIAL, like the
+    # checks below: a page whose source raster was ALREADY 1-bit cannot have been
+    # binarised by us, and failing the file over it keeps a bilevel original that no
+    # amount of re-running will ever get past this guard. That combination is real, not
+    # theoretical — a page can be classified colour on content the raster does not hold:
+    # measured on Nissan R50/R51 `fwd.pdf`, whose page 1 is a 1-bit CCITTFax scan with a
+    # blue "See supplement manual" note living in a /Widget appearance stream. The colour
+    # is genuine, PT_COLOR_LINE passes the original page through losslessly to preserve
+    # it — exactly the right outcome — and the old check then read the passed-through
+    # source image as our own damage and FAILED the whole file, OCR included.
+    for i in sorted(colour_pages or ())[:sample]:
+        sp = _src_page(i)
+        if sp is not None and _page_image_bpcs(sp) == {1}:
+            continue        # source was already bilevel -> nothing here was ours to lose
+        try:
+            if 1 in _page_image_bpcs(r.pages[i]):
+                return f'colour page {i + 1} was binarised to 1-bit', ''
+        except Exception:
+            pass
+    idxs = sorted({round(i * (got - 1) / max(1, sample - 1)) for i in range(min(sample, got))})
+    # nothing still painted may have been dropped, and glyph metrics must be self-consistent.
+    #
+    # DIFFERENTIAL, like every other check here: a defect the SOURCE already carries is not
+    # damage this run did, and refusing the result over it throws away a good output and
+    # leaves the file unsearchable for a fault we faithfully preserved. Measured on a Nissan
+    # Primera folder where every page-1 /dgp0 font ships 256 widths for a 224-slot range:
+    # 18 of 20 files were reported FAILED with the originals kept — correct in that nothing
+    # was damaged, useless in that nothing was OCR'd either. Unlike page count, text and
+    # links, these conditions can pre-exist, which is why they are compared and not asserted
+    # (the colour check above needs it for its own reason: an already-bilevel source page).
     def _inherited(bad, source_bad) -> bool:
         """Was this defect already in the source? Font names are compared on the METRIC
         signature only ('256!=224'), not the name — a rebuild may legitimately rename
@@ -2664,6 +2762,7 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
     k = min(4, n)
     idxs = sorted({1 + round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
     scores: dict = {}
+    every: dict = {}      # EVERY vote, including sub-floor ones: counter-evidence
     for pageno in idxs:
         png = work / f'osd_{pageno}.png'
         try:
@@ -2693,13 +2792,30 @@ def _detect_language(pdf: Path, work: Path, timeout: int = 0) -> str:
                     conf = float(s.split(':', 1)[1].strip())
                 except ValueError:
                     conf = 0.0
+        if not script:
+            continue
+        every[script] = every.get(script, 0.0) + conf
         # Only trust a CONFIDENT script vote — sparse pages emit low-confidence noise
         # (often a spurious 'Cyrillic') that otherwise accumulates into a wrong language.
-        if script and conf >= MIN_OSD_SCRIPT_CONF:
+        if conf >= MIN_OSD_SCRIPT_CONF:
             scores[script] = scores.get(script, 0.0) + conf
     if not scores:
         return 'eng'                       # no confident page -> safe default
-    return _available_ocr_lang(_SCRIPT_LANG.get(max(scores, key=scores.get), 'eng'))
+    best = max(scores, key=scores.get)
+    # A non-Latin verdict REPLACES the safe default with a different Tesseract model, so it
+    # has to outweigh the Latin evidence — not merely scrape over the noise floor. The floor
+    # alone DISCARDS the sub-floor votes, and agreement across several weak pages then loses
+    # to a single marginal outlier. Measured on Nissan R50/R51 `fwd.pdf`, an English manual:
+    # pages 1-2 voted Latin at 2.19 and 1.54, page 3 Katakana at 3.21, page 4 Cyrillic at
+    # 0.70. Only Katakana cleared 3.0, so it won alone and the file OCR'd as jpn+eng —
+    # 'MAINTENANCE' came out 'WAMMTENANEE' and the leader dots became katakana. Summed, the
+    # Latin evidence (3.73) is the stronger claim, and 3.21 is noise anyway: the floor's own
+    # measurements put genuine dense pages at ~15-20. Sub-floor votes still cannot WIN a
+    # file (a spurious Cyrillic at 0.6 elects nothing); they only argue against a marginal
+    # non-Latin winner, and losing that argument falls back to the documented safe default.
+    if best != 'Latin' and every.get('Latin', 0.0) > scores[best]:
+        return 'eng'
+    return _available_ocr_lang(_SCRIPT_LANG.get(best, 'eng'))
 
 
 # Script -> the Unicode ranges that prove it, for the text-layer guard below.

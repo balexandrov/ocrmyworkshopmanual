@@ -10,7 +10,7 @@ text layer.
 
 Run it per folder, manually:
 
-  python combine_manual.py "M:\Auto\Backup\Auto\Japan\Honda\--Engines--\Haynes_ZC_Manual"
+  python combine_manual.py "D:\manuals\Honda\--Engines--\Haynes_ZC_Manual"
       -> writes  ...\--Engines--\Haynes_ZC_Manual.pdf  (combined, then compressed+OCR'd)
 
   python combine_manual.py FOLDER --dry-run      # just show the page order, write nothing

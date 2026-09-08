@@ -1,3 +1,7 @@
+# Local, machine-specific context. THIS REPO IS PUBLIC: local drive paths, private
+# project names, hostnames and credentials belong in CLAUDE.local.md, never in CLAUDE.md.
+CLAUDE.local.md
+
 # Python
 __pycache__/
 *.pyc
