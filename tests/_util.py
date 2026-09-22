@@ -821,3 +821,44 @@ def make_gotor_manual(folder: Path) -> Path:
     pdf.save(str(out))
     pdf.close()
     return out
+
+
+def make_rotated_stamped_pdf(path: Path, npages: int = 4, rotate: int = 270,
+                             stamp: str = 'GETtheMANUALS.org') -> Path:
+    """A manual whose pages are /Rotate'd, with the stamp in the margin THE READER SEES.
+
+    The shape of a 346-page JK body-repair manual: MediaBox 612x792, every page
+    /Rotate 270 (some spelled -90), and the stamp drawn from a Form XObject at content
+    (13.3, 473.8) — 60% of the way up the content box, so a band test done in content
+    coordinates finds nothing, while the reader sees it 2% up the bottom of the paper.
+
+    `rotate=0` gives the control: the same operators on an unrotated page really are in
+    mid-page, and must NOT be detected.
+    """
+    import pikepdf
+    pdf = pikepdf.Pdf.new()
+    for k in range(npages):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        if rotate:
+            # alternating 270 / -90: the real file spells one rotation both ways
+            page.obj['/Rotate'] = rotate if k % 2 == 0 else rotate - 360
+        res = _sub_dict(page.obj, '/Resources')
+        _add_font(pdf, res, '/NxF0')
+        body = (f' q BT /NxF0 11 Tf 1 0 0 1 200 300 Tm '
+                f'(Section {k + 1}: torque the bolt to {40 + k} Nm.) Tj ET Q\n'
+                ).encode('latin1')
+        page.contents_add(pikepdf.Stream(pdf, body), prepend=False)
+
+        form = pdf.make_indirect(pikepdf.Stream(pdf, (
+            f' q BT /NxF0 8 Tf 0 1 -1 0 13.3 473.8 Tm ({stamp}) Tj ET Q\n'
+        ).encode('latin1')))
+        form['/Type'] = pikepdf.Name('/XObject')
+        form['/Subtype'] = pikepdf.Name('/Form')
+        form['/BBox'] = pikepdf.Array([0, 0, 612, 792])
+        fres = _sub_dict(form, '/Resources')
+        _add_font(pdf, fres, '/NxF0')
+        _sub_dict(res, '/XObject')['/NxWm'] = form
+        page.contents_add(pikepdf.Stream(pdf, b' q /NxWm Do Q\n'), prepend=False)
+    pdf.save(str(path))
+    pdf.close()
+    return path
