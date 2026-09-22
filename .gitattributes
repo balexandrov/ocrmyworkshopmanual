@@ -1,4 +1,20 @@
-# Windows-only artifacts: cmd.exe can mis-parse goto/labels in an LF-only .cmd,
-# and regedit expects CRLF. Everything else in this repo stays LF.
+# LINE ENDINGS: LF in the repository, for every file. This is the decision; the rest of
+# this file is the two exceptions to it.
+#
+# It is written as a rule rather than left to each machine's git config because without
+# one, git stores whatever bytes an editor happened to write. That is how this repo ended
+# up with 39 files stored LF and 9 stored CRLF -- including the main module -- and why a
+# 133-line documentation change once arrived as a 3,700-line diff that hid the real work.
+# `eol=lf` also means the checkout is LF on Windows, which Python, git and every editor
+# here handle; nothing in the toolchain wants CRLF.
+* text=auto eol=lf
+
+# Windows-only artifacts, checked out CRLF: cmd.exe can mis-parse goto/labels in an
+# LF-only .cmd, and regedit expects CRLF. Both are still stored LF in the repository.
 *.cmd text eol=crlf
 *.reg text eol=crlf
+
+# Vendored from jbig2enc and kept byte-for-byte, so a re-vendor is a clean diff and the
+# licence text is exactly the one that was shipped. Not ours to normalise.
+tools/jbig2topdf.py -text
+tools/jbig2enc-LICENSE.txt -text
