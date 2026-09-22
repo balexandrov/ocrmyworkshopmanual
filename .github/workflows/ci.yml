@@ -63,7 +63,7 @@ jobs:
           pip install pytest
 
       - name: Compile-check
-        run: python -m py_compile ocrmyworkshopmanual.py scan_candidates.py
+        run: python -m py_compile *.py
 
       - name: Run tests
         run: pytest tests/ -v

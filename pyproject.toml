@@ -42,7 +42,8 @@ scan-candidates = "scan_candidates:main"
 combine-manual = "combine_manual:main"
 
 [tool.setuptools]
-py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual"]
+py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual",
+              "pdflinks", "pdfwatermark"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ocrmyworkshopmanual.__version__" }
