@@ -9,6 +9,22 @@
 # here handle; nothing in the toolchain wants CRLF.
 * text=auto eol=lf
 
+# Binary, never converted either way. `text=auto` above decides what is binary by looking
+# for a NUL byte near the start of the file, and the test corpus is PDFs: one whose header
+# and first object happen to carry no NUL would be taken for text and have every CRLF in
+# its streams rewritten on checkout -- a silently corrupted fixture, which is the exact
+# failure this repo exists to prevent. Not a guess worth relying on, so it is stated.
+# Verified when this was introduced: all 25 binary fixtures byte-identical across the
+# renormalise.
+*.pdf -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.tif -text
+*.zip -text
+*.exe -text
+*.ico -text
+
 # Windows-only artifacts, checked out CRLF: cmd.exe can mis-parse goto/labels in an
 # LF-only .cmd, and regedit expects CRLF. Both are still stored LF in the repository.
 *.cmd text eol=crlf
