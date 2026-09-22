@@ -2735,6 +2735,33 @@ def _page_image_bpcs(page) -> set:
     return out
 
 
+def _page_count(p: Path) -> int:
+    """How many pages `p` has, or 0 if nothing here can tell. ASK BOTH READERS.
+
+    Every downstream guard is conditioned on this number being known, so a reader that
+    gives up takes the guards down with it. Measured on a 1,904-page ABBYY FineReader 9.0
+    manual (1987 Wrangler YJ): pypdf raises AttributeError("'NullObject' object has no
+    attribute 'get'") while pikepdf opens it and counts 1,904. That zero skipped the
+    page-loss check, made `expect_pages` fall back to the rendered count, and let
+    `_audit_output` compare a collapsed 1-page output against a 1 derived from the same
+    collapsed render -- so the run destroyed the file and reported "saved 56 MB, failed 0".
+
+    pikepdf is the more tolerant of the two and is already a hard dependency, so it is
+    worth the second open on the rare file that needs it; pypdf stays first because it is
+    the cheaper read and succeeds on almost everything.
+    """
+    import pikepdf                       # imported lazily here as everywhere else in this
+    try:                                  # module -- a module-level name would be a
+        return len(PdfReader(str(p)).pages)   # NameError swallowed by the except below,
+    except Exception:                     # which is the very bug this function exists for
+        pass
+    try:
+        with pikepdf.open(str(p)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
 def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
                   colour_pages=None, sample: int = 6) -> tuple:
     """Self-check the result against the SOURCE before anything is overwritten.
@@ -2765,7 +2792,13 @@ def _audit_output(out_p: Path, expect_pages, src_p: Path = None,
         got = len(r.pages)
     except Exception as ex:
         return f'output failed to open: {ex}', ''
-    if expect_pages and got != expect_pages:
+    if not expect_pages:
+        # FAIL CLOSED. An unknown expected count used to mean "skip the check", and the
+        # callers helpfully supplied the RENDERED page count instead -- which is the one
+        # number that cannot detect page loss, because it comes from the same step that
+        # lost the pages. Unverifiable is not the same as fine.
+        return 'source page count unknown — cannot verify the output', ''
+    if got != expect_pages:
         return f'output has {got} pages, expected {expect_pages}', ''
 
     warn = []
@@ -4018,10 +4051,7 @@ def _compress_one(src: str, dest: str, dpi: int,
         # fallback) can silently yield fewer pages, and verifying the output against that
         # same reduced count happily passes — which is how a 21-page manual was replaced
         # by a 1-page file. 0 = unknown (unreadable source); then we can't cross-check.
-        try:
-            src_pages = len(PdfReader(str(src_p)).pages)
-        except Exception:
-            src_pages = 0
+        src_pages = _page_count(src_p)
         floor = int((MIN_COMPRESS_MB if min_compress_mb is None else min_compress_mb) * 1048576)
         # SAFETY: never rasterise a born-digital (vector/text) PDF. If the file does
         # not look like a scan, copy it through to dest byte-for-byte, untouched
@@ -4176,7 +4206,7 @@ def _compress_one(src: str, dest: str, dpi: int,
             if err:
                 return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': err}
             res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
-                                 src_pages or len(PdfReader(str(base)).pages), True,
+                                 src_pages, True,
                                  note0 + bnote + snote + dnote, timeout, in_place,
                                  already_ocred=_ocr_layer_added(ocr_state),
                                  was_dewatermarked=dewatermarked, ocr_state=ocr_state)
@@ -4222,7 +4252,13 @@ def _compress_one(src: str, dest: str, dpi: int,
         # A render that produced FEWER pages than the source is page loss, not success —
         # typically a corrupt PDF whose repair salvaged only part of it. Fail the file and
         # keep the original rather than silently shipping a truncated manual.
-        if src_pages and len(pngs) != src_pages:
+        if not src_pages:
+            # Neither reader could count the source, so nothing downstream can prove this
+            # render did not drop pages. Stop here rather than ship on trust.
+            return {'src': src_p.name, 'orig': orig, 'new': 0,
+                    'err': 'source page count unknown (no reader could open it) — '
+                           'cannot verify the render, original kept'}
+        if len(pngs) != src_pages:
             return {'src': src_p.name, 'orig': orig, 'new': 0,
                     'err': f'page loss: source has {src_pages} page(s) but only '
                            f'{len(pngs)} rendered' + (' (after repair)' if did_repair else '')
@@ -4432,7 +4468,7 @@ def _compress_one(src: str, dest: str, dpi: int,
         colour_pages = {k for k, c in enumerate(classes)
                         if c.type in (PT_COLOR_LINE, PT_PHOTO_COLOR)}
         res = _ocr_and_place(base, dest_p, src_p, orig, work, False, language,
-                             src_pages or len(pngs), kept_original, note + dnote,
+                             src_pages, kept_original, note + dnote,
                              timeout, in_place,
                              colour_pages=None if kept_original else colour_pages,
                              already_ocred=(kept_ocred if kept_original else True),
@@ -5005,9 +5041,10 @@ def main():
                     help='leave a re-distributor stamp in place. Removing it is ON by '
                          'default and costs a page sample on a file that has none. What '
                          'counts as one: text that looks like a link (a URL or a bare '
-                         'host), drawn in a page margin, repeating at the same place on '
-                         'most pages — all three, because each alone matches something a '
-                         'manual legitimately contains. It is removed by deleting the '
+                         'host) that repeats character for character, from the same '
+                         'operator, on consecutive pages — both, because either alone '
+                         'matches something a manual legitimately contains. It is '
+                         'removed by deleting the '
                          'operator that draws it, on the SOURCE, before any page is '
                          'rendered: after a render the stamp is pixels, and before OCR it '
                          'would otherwise be typed into the text layer on every page. The '
