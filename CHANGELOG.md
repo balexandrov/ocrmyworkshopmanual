@@ -5,6 +5,60 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — cross-file links are rewritten so a browser can follow them (on by default)
+
+These manuals navigate file-to-file through `/GoToR` ("go to a remote file") and `/Launch`
+actions, and **no browser follows either one** — Chrome's PDFium ignores them and Firefox's
+pdf.js won't follow them to a local file, both deliberately. A contents page built entirely from
+them looks perfectly normal and does nothing. New `pdflinks.py` rewrites them to the relative
+`/URI` a browser does follow, with `#page=N`; `--no-fix-links` opts out.
+
+It runs as the last stage on the shipped file, which is deliberate and was the one thing easy to
+get wrong: `_compress_one` has eight ways out, and the files that carry these links almost all
+leave through the **born-digital** ones — copied untouched or losslessly rewritten, never near
+the raster pipeline. Wired into the compress path alone this would have been a no-op on exactly
+the files that need it. Consequences: an in-place file that needed no compression no longer
+reports `unchanged; left in place` when its links did change, and its reported size is the new
+one.
+
+Handled, each because it silently broke something in the wild: the `/Outlines` tree as well as
+page `/Annots` (they are separate objects, so fixing only annotations leaves the sidebar menu
+dead beside a working page); symbolic destinations (`/D (E.B0010439)`) resolved through the
+target's own name tree, since a URL fragment cannot carry a name and without this every such
+link lands on page 1 of a 400-page section; filename **case** read off the real directory listing,
+because these were authored on Windows where `FWD.pdf` opens `fwd.pdf` and the URL then 404s on
+a Linux origin; `<code>-<description>.pdf` renames where the links still say `GI.pdf`; and page
+numbers clamped into the target's length, since `#page=7` of 6 makes Chrome drop the fragment and
+open page 1. Internal `/GoTo` and existing `/URI` are untouched, so a re-run is a no-op.
+
+**A target that is not beside the linking file is left as `/GoToR` and counted** — the tree is
+never searched for a same-named file. That is measured, not cautious: sampling 1,200 of a
+347,821-file archive (31 files carrying such links, 370 links), 273 resolved as plain siblings
+and 2 at the relative path the link itself gives, while walking up the tree added **0 correct
+resolutions and 5 links into another car's manual**. On one brand's tree the walk produced 767
+unique hits of which all 767 were cross-model — a 2001 Prius EWD's
+`../../../../ewdsourc/2001/01priuse/electric/parts.pdf` resolving into the 2000 Land Cruiser
+EWD. Under one brand, `gi.pdf` names 436 different files, and only 0.1% of files have a
+same-named rival in their *own* folder against 88.8% one level up. A "96% of non-sibling links
+resolve to a unique file" figure is a **uniqueness** rate, not a correctness rate. No audit can
+recover from this — a wrong-car link points at a file that really exists — so the only defence
+is refusing to guess.
+
+Everything that *is* written gets verified before it replaces anything: the result must open,
+keep every page and every link, and every URL must resolve **case-sensitively** against the real
+directory listing with its `#page=` inside the target's page count. Any failure leaves the file
+byte-identical and reports the reason on its row rather than failing the file — the output is
+already audited and correct, it simply still has the links it arrived with.
+
+Two new report columns, `links fixed` and `links left`, blank (not `0`) on a file that has no
+such links at all — a `0` there would mean "has them, fixed none", which is a much more
+interesting file. `--dry-run` predicts both without writing. `pdflinks.py` also runs standalone.
+
+Fixed while porting the logic: `'/D' in <pikepdf.Array>` raises `TypeError`, and inside a
+`try/except Exception` that discarded the **entire target file's** name tree — every symbolic
+destination in it silently unresolved and every link to it written with no `#page=` at all. The
+type is now tested instead of `hasattr(dest, 'get')`, which an Array answers `True` to.
+
 ### Changed — an encrypted PDF is now decrypted and re-stored, not refused (521 MB freed, 3,934 files)
 
 The lossless lane used to `return` the moment `is_encrypted` was true. The stated reason was that

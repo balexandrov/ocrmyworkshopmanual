@@ -44,6 +44,14 @@ Tuning notes (learned on Toyota FSM scans):
   DECRYPT (default on) an encrypted PDF is re-stored decrypted, dropping its owner
                    permission flags (which withhold text extraction); --no-decrypt to
                    leave such files exactly as they are. Reported per file.
+  FIX LINKS (default on) cross-file `/GoToR` and `/Launch` link actions are rewritten to
+                   the relative `/URI` a browser follows, in page annotations AND in the
+                   bookmark tree — no browser follows either original, so a contents page
+                   built from them looks fine and does nothing. Internal `/GoTo` links
+                   already work and are never touched, so a re-run is a no-op; a target is
+                   only linked when it is beside the linking file, and the result is
+                   verified case-sensitively before it is kept. --no-fix-links to skip.
+                   See pdflinks.py, which is also runnable on its own.
   GENERIC JBIG2 only: each page is a self-contained JBIG2 stream (no shared glyph
                    dictionary), so it renders everywhere — PDFium (Chrome/Edge)
                    renders a shared dictionary as BLANK pages, so that mode isn't offered.
@@ -94,6 +102,9 @@ import img2pdf
 import numpy as np
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+
+import pdflinks
+import pdfwatermark
 from scipy import ndimage
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
@@ -3210,6 +3221,38 @@ def _decrypt_source(src_p: Path, work: Path) -> tuple:
     return out, True, None
 
 
+def _dewatermark_source(src_p: Path, work: Path) -> tuple:
+    """(path_to_read, result, error). Returns `src_p` untouched when the file carries no
+    re-distributor stamp, so this costs one page-sample on the normal path.
+
+    WHY THIS RUNS ON THE SOURCE, before anything else reads it, and not on the output the
+    way the link fix does. A stamp is drawn by a content-stream operator, and deleting the
+    operator is exact. But the raster lane RENDERS each page to an image: after that the
+    stamp is part of the pixels, and no operator-level removal is possible any more -- the
+    only remaining option would be repainting a region of a scan, which this tool will not
+    do. Cleaning the source first means every lane ships a clean file for free, including
+    the two that copy bytes (born-digital, and an in-place file nothing else touched).
+
+    It also has to run before OCR, or the text layer gets the stamp typed into it on every
+    page -- a phrase repeated 15,504 times in one manual, which is exactly the kind of
+    per-page boilerplate `_boilerplate_lines` exists to discount.
+
+    A FAILURE HERE IS NOT A FILE FAILURE. If the audit inside `clean_file` rejects the
+    rewrite, the source is used unchanged: the file is still compressed, still OCR'd, still
+    shipped, and the row says the stamp was found and left. Failing the file instead would
+    trade a good compression for a cosmetic one, against the rule that a missed improvement
+    is fine and damage is not."""
+    out = work / 'dewatermarked' / src_p.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        res = pdfwatermark.clean_file(src_p, out)
+    except Exception as ex:
+        return src_p, None, f'{ex.__class__.__name__}: {ex}'
+    if not res['found'] or res['err'] or not out.exists():
+        return src_p, res, res['err']
+    return out, res, None
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -3625,6 +3668,7 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                    ocr: bool, language: str, pages: int, kept: bool, note: str,
                    timeout: int = 0, in_place: bool = False, colour_pages=None,
                    already_ocred: bool = False, was_repaired: bool = False,
+                   was_dewatermarked: bool = False,
                    ocr_state: str = OCR_NA) -> dict:
     """Add an OCR text layer to `base` (only if it has none), then atomically place
     it at dest. Shared by the compress path and the keep-original path. `timeout` (secs,
@@ -3683,8 +3727,12 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
     # `was_repaired` likewise: a corrupt source that we could repair must be WRITTEN even
     # when compression was not worthwhile — leaving the broken original in place discards
     # a readable version of a file that currently opens nowhere.
+    # `was_dewatermarked` is the same trap once more: `base` descends from a source whose
+    # stamp was already deleted, so "nothing changed" is false and leaving the original in
+    # place would throw the removal away on exactly the files that needed no compression.
     rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
-    if in_place and kept and not ocr_added and not already_ocred and not was_repaired:
+    if (in_place and kept and not ocr_added and not already_ocred and not was_repaired
+            and not was_dewatermarked):
         return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': pages,
                 'note': note + ' (unchanged; left in place)', 'kept': True, 'err': None,
                 **rep}
@@ -3844,14 +3892,56 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
     return ocred, language, note, (OCR_REDO if had_text else OCR_NEW), None
 
 
-def compress_one(src: str, dest: str, *a, verbose: bool = False, **kw) -> dict:
-    """Run `_compress_one` with library logging captured and attached to THIS file's result.
+def _fix_links_stage(src_p: Path, out_p: Path, res: dict) -> None:
+    """Rewrite the OUTPUT's browser-dead cross-file links, and record what happened.
+
+    Runs LAST, on the file that was actually shipped, which is why it is here and not in one
+    of `_compress_one`'s lanes: there are eight ways out of that function and the files that
+    carry these links overwhelmingly take the born-digital ones — copied untouched or
+    losslessly rewritten, never near the raster pipeline. Wiring this into the compress path
+    alone would have made it a no-op on almost every file that needs it.
+
+    Targets resolve against the SOURCE folder (`src_p.parent`), not the output's: the tree
+    is mirrored, so the relative URL is the same either way, but only the source folder is
+    guaranteed to hold the siblings at the moment we look.
+
+    A failure here is NOT a file failure. The output is already audited, placed and correct;
+    it simply still has the links it arrived with, which work in every desktop reader. So it
+    is reported on the row and the run carries on — never converted into a FAILED file, which
+    would throw away a good compression and OCR over a link rewrite."""
+    if not out_p.exists():
+        return
+    stats, err = pdflinks.fix_links_file(out_p, folder=src_p.parent)
+    if err:
+        res['note'] = (res.get('note') or '') + f' (link fix skipped: {err})'
+        return
+    res['links'] = stats
+    if not stats.converted:
+        # nothing was written; only say something when there was something to say
+        res['note'] = (res.get('note') or '') + pdflinks.note_for(stats)
+        return
+    note = (res.get('note') or '')
+    # the in-place no-op row can no longer claim the file is untouched — it just changed
+    note = note.replace(' (unchanged; left in place)', ' (links fixed in place)')
+    res['note'] = note + pdflinks.note_for(stats)
+    try:
+        res['new'] = out_p.stat().st_size
+    except OSError:
+        pass
+
+
+def compress_one(src: str, dest: str, *a, verbose: bool = False,
+                 fix_links: bool = True, **kw) -> dict:
+    """Run `_compress_one` with library logging captured and attached to THIS file's result,
+    then rewrite the output's cross-file links for browsers (`fix_links`, default on).
 
     A thin wrapper rather than in-body plumbing because the work has many return paths and
     every one of them must carry the warnings. Without this the warnings reach stderr
     unprefixed from six concurrent processes and cannot afterwards be tied to a file."""
     with _lib_logs(Path(src).name, verbose) as warns:
         res = _compress_one(src, dest, *a, **kw)
+        if fix_links and isinstance(res, dict) and not res.get('err'):
+            _fix_links_stage(Path(src), Path(dest), res)
     if isinstance(res, dict) and warns:
         res['warns'] = warns
     return res
@@ -3870,7 +3960,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless_zopfli: bool = False,
                   lossless_min_savings: float = LOSSLESS_MIN_SAVINGS,
                   lossless_min_mb: float = None,
-                  decrypt: bool = True) -> dict:
+                  decrypt: bool = True, dewatermark: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -3913,6 +4003,16 @@ def _compress_one(src: str, dest: str, dpi: int,
         # file beyond its images, so it is stated on every path that ships one. A run must
         # never silently hand back a file whose restrictions it removed.
         dnote = ' (decrypted: owner permission flags dropped)' if decrypted else ''
+        # THEN de-watermark, for the reasons in `_dewatermark_source` — chiefly that the
+        # raster lane is about to turn these pages into images, after which the stamp is
+        # pixels. Like the decrypt above it only rebinds what we READ.
+        wm_res = None
+        if dewatermark:
+            src_p, wm_res, werr = _dewatermark_source(src_p, work)
+            if werr and wm_res is None:
+                dnote += f' (watermark scan skipped: {werr})'
+        dewatermarked = bool(wm_res and wm_res.get('pages'))
+        dnote += pdfwatermark.note_for(wm_res)
         # How many pages the SOURCE has. Everything downstream is verified against this,
         # never against the rendered count: on a corrupt PDF, rendering (or the repair
         # fallback) can silently yield fewer pages, and verifying the output against that
@@ -4009,7 +4109,10 @@ def _compress_one(src: str, dest: str, dpi: int,
                                      f'scan_frac={bsig.get("scan_frac")})'
                                      + rnote + lnote + dnote),
                             'lossless': lstats}
-            if not in_place:   # in-place and not rewritten: the original stays exactly as-is
+            # `dewatermarked` forces the write: the bytes on disk still carry a stamp
+            # that this run removed from the copy we are holding, so "the original stays
+            # exactly as-is" would silently discard the removal.
+            if not in_place or dewatermarked:
                 tmp_out = dest_p.with_suffix(dest_p.suffix + '.part')
                 try:
                     shutil.copyfile(str(copy_from), str(tmp_out))
@@ -4017,14 +4120,15 @@ def _compress_one(src: str, dest: str, dpi: int,
                 except Exception:
                     tmp_out.unlink(missing_ok=True)
                     raise
-            where = 'left untouched' if in_place else ('repaired and copied' if rnote
-                                                       else 'copied untouched')
+            where = ('rewritten in place' if dewatermarked else 'left untouched') \
+                if in_place else ('repaired and copied' if rnote else 'copied untouched')
             # WHY a rewrite was not kept belongs in the row: without it, a reviewer cannot
             # tell "this file had nothing to gain" from "the guard rejected the output".
             if lskip:
                 lnote = f' (lossless rewrite not kept: {lskip})'
             return {'src': src_p.name, 'orig': orig,
-                    'new': orig if in_place else dest_p.stat().st_size,
+                    'new': (orig if (in_place and not dewatermarked)
+                            else dest_p.stat().st_size),
                     'pages': bsig.get('sampled'), 'kept': True, 'err': None,
                     'action': 'born_digital', 'signals': bsig,
                     'reason': REASON_BORN, 'lang': '',
@@ -4075,7 +4179,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                                  src_pages or len(PdfReader(str(base)).pages), True,
                                  note0 + bnote + snote + dnote, timeout, in_place,
                                  already_ocred=_ocr_layer_added(ocr_state),
-                                 ocr_state=ocr_state)
+                                 was_dewatermarked=dewatermarked, ocr_state=ocr_state)
             res['action'] = 'kept_original'
             res['reason'] = skip_reason
             res.update(bsignals)
@@ -4332,7 +4436,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                              timeout, in_place,
                              colour_pages=None if kept_original else colour_pages,
                              already_ocred=(kept_ocred if kept_original else True),
-                             was_repaired=did_repair, ocr_state=ocr_state)
+                             was_repaired=did_repair,
+                             was_dewatermarked=dewatermarked, ocr_state=ocr_state)
         res['action'] = 'kept_original' if kept_original else 'compressed'
         res['reason'] = REASON_ALREADY if kept_original else REASON_COMPRESSIBLE
         # Machine-readable page-type tally. The note says the same thing in English, but
@@ -4400,10 +4505,20 @@ def _default_workers() -> int:
 
 # ── Dry-run preview (runs in a worker process) ────────────────────────────────
 
-def preview_one(src: str, *a, verbose: bool = False, **kw) -> dict:
+def preview_one(src: str, *a, verbose: bool = False, fix_links: bool = True, **kw) -> dict:
     """`_preview_one` with library logging captured — see `compress_one`."""
     with _lib_logs(Path(src).name, verbose) as warns:
         res = _preview_one(src, *a, **kw)
+        if fix_links and isinstance(res, dict) and not res.get('err'):
+            # Predicted on the SOURCE and read-only, so a --dry-run over an archive answers
+            # "how many of these links would become followable" before anything is written.
+            stats, lerr = pdflinks.predict(src)
+            if lerr:
+                res['note'] = (res.get('note') or '') + f' (link fix would skip: {lerr})'
+            else:
+                res['links'] = stats
+                res['note'] = (res.get('note') or '') + (
+                    pdflinks.note_for(stats).replace(' -> /URI', ' would become /URI'))
     if isinstance(res, dict) and warns:
         res['warns'] = warns
     return res
@@ -4433,7 +4548,8 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  jpeg_quality: int, min_savings: float,
                  sauvola_k: float, photo_descreen: float,
                  ocr: bool = True, language: str = 'auto',
-                 min_compress_mb: float = None, lossless: bool = True) -> dict:
+                 min_compress_mb: float = None, lossless: bool = True,
+                 dewatermark: bool = True) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check, the same
@@ -4442,7 +4558,21 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
     src_p = Path(src)
     orig = src_p.stat().st_size
     work = Path(tempfile.mkdtemp(prefix='jbprev_'))
+    wnote = ''
     try:
+        if dewatermark:
+            # Detection only — `detect` reads a page sample and writes nothing, which is
+            # the whole contract of a preview. A dry run over an archive is how a reviewer
+            # finds out which manuals carry a stamp before any of them is rewritten.
+            try:
+                import pikepdf as _pike
+                with _pike.open(str(src_p)) as _p:
+                    _hits, _ = pdfwatermark.detect(_p)
+                if _hits:
+                    wnote = (' (would remove watermark '
+                             + ', '.join(repr(c.label()) for c in _hits) + ')')
+            except Exception as ex:
+                wnote = f' (watermark scan skipped: {ex.__class__.__name__})'
         born, bsig = looks_born_digital(src_p)
         if born:
             # A born-digital row used to predict only "would copy untouched", which is no
@@ -4462,7 +4592,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     'reason': REASON_BORN, 'lang': '',
                     'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
                     'lossless': lsig,
-                    'note': lnote + f'; scan_frac={bsig.get("scan_frac")})'}
+                    'note': lnote + f'; scan_frac={bsig.get("scan_frac")})' + wnote}
         ocr_state, language = _predict_ocr(src_p, work, ocr, language)
         rep = {'ocr_state': ocr_state, 'lang': _lang_for(ocr_state, language)}
         # Same note and same signals the real run reports, so the preview row explains the
@@ -4480,7 +4610,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     'kept': True, 'err': None, 'action': 'kept_original',
                     'reason': REASON_SMALL, **rep,
                     'note': f' (would skip compression: {mb(orig):.2f} MB is under the '
-                            f'{mb(floor):.0f} MB floor — OCR only)' + bnote}
+                            f'{mb(floor):.0f} MB floor — OCR only)' + bnote + wnote}
         proj = sample_projection(src_p, work, dpi, despeckle, min_size,
                                  photo_thresh, photo_dpi, jpeg_quality,
                                  sauvola_k, photo_descreen,
@@ -4502,7 +4632,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
             psig['boiler'] = bsig['boiler']
         return {'src': src_p.name, 'orig': orig, 'new': est_new, 'pages': None,
                 'kept': action != 'compressed', 'err': None, 'action': action,
-                'note': note + bnote, 'reason': reason, **rep, 'signals': psig}
+                'note': note + bnote + wnote, 'reason': reason, **rep, 'signals': psig}
     except Exception as ex:
         return {'src': src_p.name, 'orig': orig, 'new': 0, 'err': repr(ex)}
     finally:
@@ -4635,7 +4765,17 @@ def _csv_row(fields: list) -> str:
 REPORT_COLUMNS = ['file', 'action', 'reason', 'ocr', 'language',
                   'orig size (MB)', 'new size (MB)', '%',
                   'duplicate of', 'page types', 'scan signals',
-                  'note', 'warnings', 'error']
+                  'links fixed', 'links left', 'note', 'warnings', 'error']
+
+
+def _links_text(stats) -> list:
+    """(links fixed, links left) for the report — blank, not 0, on a file that had none.
+
+    A blank says "this file has no cross-file links"; a 0 would say "it has some and none
+    were fixed", which is a different and much more interesting file."""
+    if not stats or not (stats.converted or stats.unresolved):
+        return ['', '']
+    return [stats.converted or '', stats.unresolved or '']
 
 
 def _types_text(types) -> str:
@@ -4682,6 +4822,10 @@ def _report_row(r: dict) -> list:
             f'{n / 1048576:.2f}' if (not err and n) else '',
             pct, r.get('duplicate_of', ''), _types_text(r.get('types')),
             _signals_text(r.get('signals')),
+            # Two columns, not one number: "fixed" is what a browser can now follow and
+            # "left" is what it still cannot, and the second is the one worth chasing — it
+            # names a manual whose sections are filed away from the file that links them.
+            *_links_text(r.get('links')),
             (r.get('note') or '').strip(), _warns_text(r.get('warns')), err or '']
 
 
@@ -4857,6 +5001,36 @@ def main():
                          'the flags ARE dropped, which is a real change to the file, so every '
                          'decrypted file says so in its note and in the report. Page content is '
                          'untouched and still audited')
+    ap.add_argument('--no-dewatermark', action='store_true',
+                    help='leave a re-distributor stamp in place. Removing it is ON by '
+                         'default and costs a page sample on a file that has none. What '
+                         'counts as one: text that looks like a link (a URL or a bare '
+                         'host), drawn in a page margin, repeating at the same place on '
+                         'most pages — all three, because each alone matches something a '
+                         'manual legitimately contains. It is removed by deleting the '
+                         'operator that draws it, on the SOURCE, before any page is '
+                         'rendered: after a render the stamp is pixels, and before OCR it '
+                         'would otherwise be typed into the text layer on every page. The '
+                         'rewrite is audited against the source (page, bookmark and '
+                         'annotation counts, every token that vanished, and rendered ink '
+                         'on a sample of pages) and dropped if any check fails, in which '
+                         'case the file is still compressed and the row says the stamp was '
+                         'found and left')
+    ap.add_argument('--no-fix-links', action='store_true',
+                    help='leave cross-file /GoToR and /Launch links as they are. Fixing them is '
+                         'ON by default: no browser follows either action, so a contents page '
+                         'built from them looks fine and does nothing, and they are rewritten to '
+                         'the relative /URI a browser does follow (with #page=N, resolving the '
+                         'symbolic destination most of them carry). Internal /GoTo links already '
+                         'work in a browser and are never touched, nor is an existing /URI, so a '
+                         're-run is a no-op. A target is only linked when it is beside the '
+                         'linking file or at the relative path the link itself gives; anything '
+                         'else stays /GoToR and is counted, because a same-named file found by '
+                         'searching the tree is usually another vehicle (measured: 0 correct '
+                         'and 5 wrong-car hits in a 370-link sample). The rewrite is verified '
+                         'case-sensitively against the real directory listing before it is '
+                         'kept — a URL that opens on Windows and 404s on a Linux server is '
+                         'worse than the inert link it replaced')
     ap.add_argument('--no-lossless', action='store_true',
                     help='do not attempt the lossless rewrite on born-digital PDFs — copy them '
                          'out byte-for-byte, as this tool did before. The rewrite re-stores a '
@@ -5122,7 +5296,9 @@ def main():
     print(f'{len(pdfs)} PDFs found, {skipped} already done, {len(jobs)} to process '
           f'@ {args.dpi} dpi, {args.workers} workers, generic mode, {bin_desc}, '
           f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
-          f'{photo_desc}, {ocr_desc}, {bd_desc}')
+          f'{photo_desc}, {ocr_desc}, {bd_desc}, '
+          f'{"fix-links" if not args.no_fix_links else "links as-is"}, '
+          f'{"de-watermark" if not args.no_dewatermark else "watermarks as-is"}')
     # The thresholds that decide compress-vs-keep. They used to be recorded only in the
     # report .log header; with the report being a per-file table, the console is where the
     # run's settings live, so print all of them rather than most of them.
@@ -5207,6 +5383,8 @@ def main():
                                   ocr=not args.no_ocr, language=args.language,
                                   min_compress_mb=args.min_compress_mb,
                                   lossless=not args.no_lossless,
+                                  dewatermark=not args.no_dewatermark,
+                                  fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             else:
@@ -5224,6 +5402,8 @@ def main():
                                   lossless_min_savings=args.lossless_min_savings,
                                   lossless_min_mb=args.lossless_min_mb,
                                   decrypt=not args.no_decrypt,
+                                  dewatermark=not args.no_dewatermark,
+                                  fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
             for i, fut in enumerate(cf.as_completed(futs), 1):
@@ -5335,6 +5515,20 @@ def main():
     ocrs = Counter(_ocr_label(r) for r in results if _ocr_label(r) and not r.get('err'))
     if ocrs:
         _say('  OCR: ' + ', '.join(f'{n} {state}' for state, n in ocrs.most_common()))
+    # Cross-file links, tallied over the run. `left` is reported even when it is the only
+    # number, because a folder whose sections link to files filed elsewhere produces nothing
+    # but `left` — and that is a finding about the collection's layout, not a silent zero.
+    lnk = [r['links'] for r in results if r.get('links')]
+    if lnk:
+        tot = functools.reduce(pdflinks.add, lnk)
+        if tot.converted or tot.unresolved:
+            done_word = 'would be rewritten' if args.dry_run else 'rewritten'
+            _say(f'  cross-file links: {tot.converted} {done_word} to /URI in '
+                 f'{sum(1 for s in lnk if s.converted)} file(s)'
+                 + (f' ({tot.named} named destinations resolved to a page)' if tot.named else '')
+                 + (f', {tot.clamped} page number(s) clamped into range' if tot.clamped else '')
+                 + (f'; {tot.unresolved} left as /GoToR — target not beside the linking file'
+                    if tot.unresolved else ''))
     if tot_orig:
         word = 'Projected' if args.dry_run else 'Total'
         saved = 'would save' if args.dry_run else 'saved'

@@ -733,3 +733,91 @@ def link_report(pdf: Path) -> dict:
     return dict(pages=len(pages), goto=goto, uri=uri, unresolved=unresolved,
                 goto_targets=targets, bookmarks=bookmarks,
                 toc_filters=filters(0), last_filters=filters(len(pages) - 1))
+
+
+def make_gotor_manual(folder: Path) -> Path:
+    """A miniature multi-file manual carrying every cross-file link shape that matters.
+
+    Reproduces the SHAPE of the real thing rather than shipping a private file. Written to
+    `folder`; returns the contents file. What each link is for:
+
+      1. `/GoToR SEC.pdf` with `/D [1 ...]`  — wrong CASE (the file is `sec.pdf`) and a
+         0-based remote page index, so the URL must say `sec.pdf#page=2`
+      2. `/Launch Fwd.PDF`                   — no destination at all, and again miscased
+      3. `/GoToR sec.pdf` with `/D (ANCHOR)` — a symbolic destination that only the TARGET's
+         name tree can resolve (to page 3)
+      4. `/GoToR sec.pdf` with `/D [99 ...]` — past the end of a 4-page file; must clamp
+      5. `/GoToR GI.pdf`                     — the file is `gi-general_information.pdf`
+      6. `/GoToR nowhere.pdf`                — resolves to nothing; must stay /GoToR
+      7. `/GoTo` (internal) and 8. `/URI`    — already work in a browser; must be untouched
+      9. a `null` in the `/Annots` array     — one of these once cost a whole file its links
+
+    Plus a bookmark whose action is `/GoToR SEC.pdf`: links live in the outline tree as well
+    as on the page, and a fix that misses the menu leaves it dead beside a working page.
+    """
+    import pikepdf
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    def blank(path: Path, pages: int, anchor_page: int = 0) -> Path:
+        pdf = pikepdf.Pdf.new()
+        for _ in range(pages):
+            pdf.add_blank_page(page_size=(300, 400))
+        if anchor_page:
+            # /Names /Dests, the modern name tree: one leaf holding ANCHOR -> that page
+            pdf.Root.Names = pdf.make_indirect(pikepdf.Dictionary(
+                Dests=pikepdf.Dictionary(Names=pikepdf.Array([
+                    pikepdf.String('ANCHOR'),
+                    pikepdf.Array([pdf.pages[anchor_page - 1].obj, pikepdf.Name.Fit])]))))
+        pdf.save(str(path))
+        pdf.close()
+        return path
+
+    blank(folder / 'sec.pdf', 4, anchor_page=3)
+    blank(folder / 'fwd.pdf', 1)
+    blank(folder / 'gi-general_information.pdf', 2)
+
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(300, 400))
+    pdf.add_blank_page(page_size=(300, 400))        # an internal /GoTo needs somewhere to go
+
+    def remote(name, dest=None, kind='/GoToR'):
+        d = pikepdf.Dictionary(Type=pikepdf.Name.Action, S=pikepdf.Name(kind),
+                               F=pikepdf.Dictionary(Type=pikepdf.Name.Filespec,
+                                                    F=pikepdf.String(name)))
+        if dest is not None:
+            d['/D'] = dest
+        return d
+
+    def link(action, y=10.0):
+        return pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Link,
+            Rect=pikepdf.Array([10, y, 200, y + 12]), A=action))
+
+    actions = [
+        remote('SEC.pdf', pikepdf.Array([1, pikepdf.Name.FitH, 700])),
+        remote('Fwd.PDF', kind='/Launch'),
+        remote('sec.pdf', pikepdf.String('ANCHOR')),
+        remote('sec.pdf', pikepdf.Array([99, pikepdf.Name.FitH, 700])),
+        remote('GI.pdf'),
+        remote('nowhere.pdf'),
+        pikepdf.Dictionary(Type=pikepdf.Name.Action, S=pikepdf.Name.GoTo,
+                           D=pikepdf.Array([pdf.pages[1].obj, pikepdf.Name.Fit])),
+        pikepdf.Dictionary(Type=pikepdf.Name.Action, S=pikepdf.Name.URI,
+                           URI=pikepdf.String('https://example.invalid/already')),
+    ]
+    annots = pikepdf.Array([link(a, 10.0 + 20 * i) for i, a in enumerate(actions)])
+    annots.append(None)                              # the null that used to abandon the file
+    page.obj['/Annots'] = annots
+
+    item = pdf.make_indirect(pikepdf.Dictionary(
+        Title=pikepdf.String('Section'), A=remote('SEC.pdf')))
+    outlines = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.Outlines, First=item, Last=item, Count=1))
+    item['/Parent'] = outlines
+    pdf.Root.Outlines = outlines
+
+    out = folder / 'contents.pdf'
+    pdf.save(str(out))
+    pdf.close()
+    return out
