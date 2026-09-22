@@ -1072,7 +1072,22 @@ def _page_render_dpis(src_p: Path, base_dpi: int, cap: int = MAX_RENDER_DPI) -> 
             out.append(int(max(base_dpi, min(round(d) or base_dpi, cap))))
         return out
     except Exception:
-        return []
+        pass
+    # THE LIST IS THE RENDER PLAN, so returning [] here does not mean "no opinion about
+    # resolution" -- it means NO PAGES. `_render_windows` then makes one window of zero
+    # pages, `_render_jobs` produces no bands, and Ghostscript is never called at all.
+    # Measured on the 1,904-page Wrangler YJ, which pypdf cannot open: 0 render jobs
+    # planned, 0 pages rendered, and what shipped was the repair fallback's 1-page
+    # salvage. Ghostscript itself renders that file perfectly -- pages 1-5 and 1500-1503
+    # both come out correct -- so nothing was wrong with the rendering, only with the plan.
+    #
+    # Fall back to the page count from `_page_count`, which asks pikepdf too. Every page
+    # then renders at `base_dpi` rather than at its own: the per-page native-dpi read is an
+    # optimisation, and losing it on a file no second reader can measure costs some
+    # sharpness on a >base_dpi scan. Rendering the whole document slightly coarse beats
+    # rendering none of it.
+    n = _page_count(src_p)
+    return [base_dpi] * n
 
 
 RENDER_SHARD_MIN_PAGES = 50
@@ -1359,8 +1374,28 @@ def _ocr_render_pdf(work: Path, pngs, page_dpi: dict, base_dpi: int,
 
 
 def _page_count(p: Path) -> int:
+    """How many pages `p` has, or 0 if nothing here can tell. ASK BOTH READERS.
+
+    Every downstream guard is conditioned on this number being known, so a reader that
+    gives up takes the guards down with it. Measured on a 1,904-page ABBYY FineReader 9.0
+    manual (1987 Wrangler YJ): pypdf raises AttributeError("'NullObject' object has no
+    attribute 'get'") while pikepdf opens it and counts 1,904. That zero skipped the
+    page-loss check, made `expect_pages` fall back to the rendered count, and let
+    `_audit_output` compare a collapsed 1-page output against a 1 derived from the same
+    collapsed render -- so the run destroyed the file and reported "saved 56 MB, failed 0".
+
+    pikepdf is the more tolerant of the two and is already a hard dependency, so it is
+    worth the second open on the rare file that needs it; pypdf stays first because it is
+    the cheaper read and succeeds on almost everything.
+    """
+    import pikepdf                       # imported lazily here as everywhere else in this
+    try:                                  # module -- a module-level name would be a
+        return len(PdfReader(str(p)).pages)   # NameError swallowed by the except below,
+    except Exception:                     # which is the very bug this function exists for
+        pass
     try:
-        return len(PdfReader(str(p)).pages)
+        with pikepdf.open(str(p)) as pdf:
+            return len(pdf.pages)
     except Exception:
         return 0
 
@@ -2542,7 +2577,7 @@ def _repair_pdf(src_p: Path, work: Path, expect_pages: int = 0, timeout: int = 0
             continue
         if expect_pages:
             try:
-                if len(PdfReader(str(out)).pages) < expect_pages:
+                if _page_count(out) < expect_pages:
                     continue                     # partial salvage -> keep looking
             except Exception:
                 continue
@@ -2733,33 +2768,6 @@ def _page_image_bpcs(page) -> set:
     except Exception:
         pass
     return out
-
-
-def _page_count(p: Path) -> int:
-    """How many pages `p` has, or 0 if nothing here can tell. ASK BOTH READERS.
-
-    Every downstream guard is conditioned on this number being known, so a reader that
-    gives up takes the guards down with it. Measured on a 1,904-page ABBYY FineReader 9.0
-    manual (1987 Wrangler YJ): pypdf raises AttributeError("'NullObject' object has no
-    attribute 'get'") while pikepdf opens it and counts 1,904. That zero skipped the
-    page-loss check, made `expect_pages` fall back to the rendered count, and let
-    `_audit_output` compare a collapsed 1-page output against a 1 derived from the same
-    collapsed render -- so the run destroyed the file and reported "saved 56 MB, failed 0".
-
-    pikepdf is the more tolerant of the two and is already a hard dependency, so it is
-    worth the second open on the rare file that needs it; pypdf stays first because it is
-    the cheaper read and succeeds on almost everything.
-    """
-    import pikepdf                       # imported lazily here as everywhere else in this
-    try:                                  # module -- a module-level name would be a
-        return len(PdfReader(str(p)).pages)   # NameError swallowed by the except below,
-    except Exception:                     # which is the very bug this function exists for
-        pass
-    try:
-        with pikepdf.open(str(p)) as pdf:
-            return len(pdf.pages)
-    except Exception:
-        return 0
 
 
 def _audit_output(out_p: Path, expect_pages, src_p: Path = None,

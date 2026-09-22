@@ -57,3 +57,39 @@ def test_a_matching_output_passes(tmp_path):
     ok = U.make_scan_pdf(tmp_path / 'ok.pdf', npages=4, dpi=72)
     fatal, _warn = owm._audit_output(ok, 4)
     assert not fatal
+
+
+# ── the render plan is sized by the same number ───────────────────────────────
+
+def test_the_render_plan_covers_every_page_when_pypdf_gives_up(tmp_path, monkeypatch):
+    """THE SECOND HALF OF THE SAME BUG, and the more expensive one.
+
+    `_page_render_dpis` returns one dpi per page, and that list IS the render plan: its
+    LENGTH decides how many pages Ghostscript is asked for. Returning [] on an unreadable
+    source therefore did not mean "no opinion about resolution", it meant "no pages" --
+    `_render_windows` made one window of zero pages, `_render_jobs` produced no bands, and
+    gs was never invoked at all. Measured on the 1,904-page Wrangler YJ: 0 render jobs
+    planned, and what shipped was the repair fallback's 1-page salvage.
+
+    Ghostscript renders that file perfectly (pages 1-5 and 1500-1503 both come out right),
+    so nothing was ever wrong with the rendering -- only with the plan.
+    """
+    f = U.make_scan_pdf(tmp_path / 'scan.pdf', npages=7, dpi=72)
+    assert len(owm._page_render_dpis(f, 200)) == 7
+
+    class Dead:
+        def __init__(self, *a, **k):
+            raise AttributeError("'NullObject' object has no attribute 'get'")
+
+    monkeypatch.setattr(owm, 'PdfReader', Dead)
+    dpis = owm._page_render_dpis(f, 200)
+    assert len(dpis) == 7, 'a page the plan omits is a page that never renders'
+    assert set(dpis) == {200}, 'the fallback renders at the base dpi'
+
+
+def test_an_empty_plan_really_would_render_nothing(tmp_path):
+    """Why the length matters, pinned so the consequence is not re-learned the hard way."""
+    f = U.make_scan_pdf(tmp_path / 'scan.pdf', npages=5, dpi=72)
+    assert owm._render_jobs(owm._render_windows(f, tmp_path, 0), [], 6) == []
+    assert owm._render_jobs(owm._render_windows(f, tmp_path, 5),
+                            owm._page_render_dpis(f, 200), 6) != []
