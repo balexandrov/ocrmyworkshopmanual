@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — box-shaped spaces fixed on the way in (on by default)
+
+Some converters subset their TrueType fonts at `/FirstChar 37`, so every literal space maps to
+`.notdef` and a strict viewer draws a box at each word gap — measured in 4,991 of 21,524 files of
+one make's tree. New `pdfspaces.py` routes code 32 to the font's own empty glyph 32 (three edits
+per font, one byte of font data, no layout change) and audits its rewrite: page count, every
+content stream byte-identical, font count, none still faulty. It runs on the source right after
+de-watermarking, so the born-digital and in-place lanes, which copy bytes and are where these
+files live, ship the fix too; a rewrite forces the write there as a removed stamp does.
+`--no-fix-spaces` opts out. Fonts inside Form XObjects are covered.
+
 ### Added — cross-file links are rewritten so a browser can follow them (on by default)
 
 These manuals navigate file-to-file through `/GoToR` ("go to a remote file") and `/Launch`

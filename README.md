@@ -47,6 +47,11 @@ any tree of scanned documents. For each page it decides the right treatment, com
   file, because [that link is usually the wrong car](#browser-links)
 - Verified case-sensitively off the real directory listing before it is kept
 
+**Readable text**
+- **[Box-shaped spaces fixed](#box-spaces)** (default on) — a converter's TrueType subsets that
+  draw a box at every word gap get their space routed back to the font's own empty glyph: three
+  edits per font, one byte of font data, no layout change, audited
+
 **Safety**
 - **[Born-digital detection](#born-digital-safety)** — always on, no flag to defeat it
 - **[Output verification](#verification)** — always on: page count, colour depth, font metrics,
@@ -152,6 +157,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller |
 | `--min-compress-mb N` | `5` | Don't re-image files smaller than this; they're passed through and reported `small size`. **OCR is still added** if missing. `0` = compress everything. See [the trade-off](#the-size-floors) |
+| `--no-fix-spaces` | off | Leave [box-shaped spaces](#box-spaces) as they are. The fix is on by default and costs one font walk on a file without the fault |
 | `--no-fix-links` | off | Don't [rewrite browser-dead cross-file links](#browser-links). The rewrite is on by default: `/GoToR` and `/Launch` become relative `/URI`, in annotations and bookmarks. Internal `/GoTo` is never touched, so re-runs are no-ops |
 | `--no-lossless` | off | Don't [re-store](#lossless-rewrite) born-digital PDFs — copy them byte-for-byte |
 | `--lossless-keep-xmp` | off | Compress the per-illustration authoring XMP instead of deleting it (costs about half the saving; keeps artwork provenance) |
@@ -359,6 +365,31 @@ leaves the file exactly as it was and says why.
 
 `pdflinks.py` is also runnable on its own — `python pdflinks.py <file-or-dir>` to report,
 `--apply` to rewrite.
+
+### Box spaces
+
+Some Interleaf-era converters subset their TrueType fonts at `/FirstChar 37`, so the subset's
+cmaps stop above code 32: every **literal** space maps to glyph 0, `.notdef`, and a strict viewer
+draws a box at each word gap. The same page can be clean where the converter emitted a kerned
+array and boxed where it drew each word separately with `( )Tj` between them, so the fault looks
+random. Over one make's tree of such manuals it was in 4,991 of 21,524 files.
+
+`pdfspaces.py` (also runnable on its own) makes three edits per affected font: descriptor
+`/Flags` Symbolic instead of Nonsymbolic, `/Encoding` dropped, and the embedded font's `(1,0)`
+format-0 cmap entry for code 32 set to glyph 32 — which is already present and **empty**, so it
+draws nothing. Steps 1–2 alone change nothing; step 3 is one byte and no table length. Code 32
+is outside `/FirstChar..LastChar`, so its width was and stays `/MissingWidth` (0) and all the
+spacing still comes from the `Tw` the converter emitted: the layout cannot move.
+
+Only a font with exactly the fault is touched (simple `/TrueType`, `/FirstChar > 32`, embedded
+`/FontFile2`, a format-0 cmap, glyph 32 present, empty and unmapped), in page resources and in
+Form XObjects. It runs on the **source**, before anything renders it, like de-watermarking, and a
+rewrite forces the write on the byte-copy lanes. The rewrite is audited — page count, every page's
+content stream byte-identical, font count, no font still faulty — and dropped if any check fails.
+
+After the fix a whole-page text extraction reads those gaps as spaces, but a *clipped* one
+(PyMuPDF's `get_textbox`) returns U+FFFD for them; code that parses text inside a rectangle should
+treat U+FFFD as a gap.
 
 ### Text-layer decisions
 

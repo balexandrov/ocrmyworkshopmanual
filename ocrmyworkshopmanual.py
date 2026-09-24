@@ -104,6 +104,7 @@ from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
 import pdflinks
+import pdfspaces
 import pdfwatermark
 from scipy import ndimage
 
@@ -3294,6 +3295,30 @@ def _dewatermark_source(src_p: Path, work: Path) -> tuple:
     return out, res, None
 
 
+def _fixspaces_source(src_p: Path, work: Path) -> tuple:
+    """(path_to_read, result, error). Returns `src_p` untouched when no font shows the
+    box-space fault (see pdfspaces.py), so this costs one font walk on the normal path.
+
+    WHY ON THE SOURCE, for the same reason as `_dewatermark_source`: the fix is exact at the
+    font level (three edits, one byte of font data), but once the raster lane has rendered a
+    page the boxes are pixels. Fixed first, every lane ships spaces -- including the two that
+    copy bytes (born-digital, and an in-place file nothing else touched), which is where
+    these files mostly are: the fault lives in born-digital converter output.
+
+    A FAILURE HERE IS NOT A FILE FAILURE: `clean_file` audits its rewrite (page count, every
+    content stream byte-identical, font count, no font still faulty) and, if that fails, the
+    source is used unchanged and the row says so."""
+    out = work / 'spacesfixed' / src_p.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        res = pdfspaces.clean_file(src_p, out)
+    except Exception as ex:
+        return src_p, None, f'{ex.__class__.__name__}: {ex}'
+    if not res['found'] or res['err'] or not out.exists():
+        return src_p, res, res['err']
+    return out, res, None
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -4001,7 +4026,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless_zopfli: bool = False,
                   lossless_min_savings: float = LOSSLESS_MIN_SAVINGS,
                   lossless_min_mb: float = None,
-                  decrypt: bool = True, dewatermark: bool = True) -> dict:
+                  decrypt: bool = True, dewatermark: bool = True,
+                  fix_spaces: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -4054,6 +4080,17 @@ def _compress_one(src: str, dest: str, dpi: int,
                 dnote += f' (watermark scan skipped: {werr})'
         dewatermarked = bool(wm_res and wm_res.get('pages'))
         dnote += pdfwatermark.note_for(wm_res)
+        # THEN the box spaces, for the reasons in `_fixspaces_source`. Same contract: it only
+        # rebinds what we READ, and a rewrite it made forces the write below exactly as a
+        # removed stamp does -- so `dewatermarked` from here on means "the source we hold is
+        # not the bytes on disk", whichever of the two made it so.
+        sp_res = None
+        if fix_spaces:
+            src_p, sp_res, serr = _fixspaces_source(src_p, work)
+            if serr and sp_res is None:
+                dnote += f' (space-fix scan skipped: {serr})'
+        dnote += pdfspaces.note_for(sp_res)
+        dewatermarked = dewatermarked or bool(sp_res and sp_res.get('found') and not sp_res.get('err'))
         # How many pages the SOURCE has. Everything downstream is verified against this,
         # never against the rendered count: on a corrupt PDF, rendering (or the repair
         # fallback) can silently yield fewer pages, and verifying the output against that
@@ -4593,7 +4630,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  sauvola_k: float, photo_descreen: float,
                  ocr: bool = True, language: str = 'auto',
                  min_compress_mb: float = None, lossless: bool = True,
-                 dewatermark: bool = True) -> dict:
+                 dewatermark: bool = True, fix_spaces: bool = True) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check, the same
@@ -4617,6 +4654,15 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                              + ', '.join(repr(c.label()) for c in _hits) + ')')
             except Exception as ex:
                 wnote = f' (watermark scan skipped: {ex.__class__.__name__})'
+        if fix_spaces:
+            try:
+                import pikepdf as _pike
+                with _pike.open(str(src_p)) as _p:
+                    _bad = pdfspaces.detect(_p)
+                if _bad:
+                    wnote += f' (would fix box spaces in {len(_bad)} font(s))'
+            except Exception as ex:
+                wnote += f' (space-fix scan skipped: {ex.__class__.__name__})'
         born, bsig = looks_born_digital(src_p)
         if born:
             # A born-digital row used to predict only "would copy untouched", which is no
@@ -5045,6 +5091,16 @@ def main():
                          'the flags ARE dropped, which is a real change to the file, so every '
                          'decrypted file says so in its note and in the report. Page content is '
                          'untouched and still audited')
+    ap.add_argument('--no-fix-spaces', action='store_true',
+                    help='leave box-shaped spaces as they are. Fixing them is ON by default '
+                         'and costs a font walk on a file that has none. The fault: a '
+                         'converter subset its TrueType fonts above code 32, so every literal '
+                         'space draws .notdef -- a box at each word gap in a strict viewer. The '
+                         'fix routes code 32 to the font\'s own empty glyph 32 (three edits per '
+                         'font, one byte of font data, no layout change), on the SOURCE before '
+                         'anything renders it. The rewrite is audited (page count, every content '
+                         'stream byte-identical, font count) and dropped if any check fails. '
+                         'See pdfspaces.py')
     ap.add_argument('--no-dewatermark', action='store_true',
                     help='leave a re-distributor stamp in place. Removing it is ON by '
                          'default and costs a page sample on a file that has none. What '
@@ -5343,7 +5399,8 @@ def main():
           f'{"despeckle" if not args.no_despeckle else "no despeckle"}, '
           f'{photo_desc}, {ocr_desc}, {bd_desc}, '
           f'{"fix-links" if not args.no_fix_links else "links as-is"}, '
-          f'{"de-watermark" if not args.no_dewatermark else "watermarks as-is"}')
+          f'{"de-watermark" if not args.no_dewatermark else "watermarks as-is"}, '
+          f'{"fix-spaces" if not args.no_fix_spaces else "spaces as-is"}')
     # The thresholds that decide compress-vs-keep. They used to be recorded only in the
     # report .log header; with the report being a per-file table, the console is where the
     # run's settings live, so print all of them rather than most of them.
@@ -5429,6 +5486,7 @@ def main():
                                   min_compress_mb=args.min_compress_mb,
                                   lossless=not args.no_lossless,
                                   dewatermark=not args.no_dewatermark,
+                                  fix_spaces=not args.no_fix_spaces,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
@@ -5448,6 +5506,7 @@ def main():
                                   lossless_min_mb=args.lossless_min_mb,
                                   decrypt=not args.no_decrypt,
                                   dewatermark=not args.no_dewatermark,
+                                  fix_spaces=not args.no_fix_spaces,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
