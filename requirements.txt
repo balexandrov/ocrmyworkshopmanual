@@ -4,3 +4,4 @@ Pillow
 ocrmypdf
 pypdf
 img2pdf
+fonttools

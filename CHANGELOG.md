@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `pdffonts.py`: per-page subsets of one TrueType face merged back into one font
+
+A producer that embeds a fresh subset of the same face on every page spends most of the file on
+fonts: measured on a 1,449-page chapter, 733 simple TrueType fonts from 4 faces were 18.3 MB of
+29.3 MB. New `pdffonts.py` merges each face's subsets (29.3 → 11.1 MB there) and keeps the result
+only if the file shrank, every page's extracted text is identical and a spread of pages renders
+pixel-identical. It runs in the main pass on the source, after the box-space fix and under the
+same contract (only what is read is rebound, a rewrite forces the write on the byte-copy lanes, a
+failure leaves the source as it was); `--no-merge-fonts` opts out. Two traps are pinned by tests:
+the subsets name only the glyph slots they fill, so merging by name appended duplicates past glyph
+ID 255 (which the Mac format-0 cmap cannot hold) — the merge is by glyph ID; and fontTools writes a
+cmap subtable that was never decoded back from its original bytes, so the merged font silently kept
+one member's codes and every quote mark drawn through another member vanished — the render audit
+caught it before anything was written.
+
+### Added — `pdfwatermark.py --strip-line`: remove lines the caller names
+
+For additions no detector can recognise because they carry no marker: a printout service's running
+header and its "Courtesy of …" credit lines, measured on a 23,970-page manual. Only whole displayed
+lines are ever removed (a baseline whose entire text matches a rule, one or more copies), optionally
+within `--band top:F` / `bottom:F`, through the existing operator-level removal. The audit re-derives
+from the source's own runs that each removed line matches a rule and that no run was left standing
+on a removed baseline — a test showed that without it a mislabelled body line passed every other
+check — then compares every touched page's text and a rendered sample, where any changed pixel
+outside the removed lines fails the file. `--band-graphics` removes the vector frame such a header
+leaves behind (paths wholly inside the band, never one reaching the side margins or a clip).
+
+### Changed — the text walker advances the text position
+
+`_walk` now moves the text position by each string's advance (font `/Widths`, or a Type0
+descendant's `/W`/`/DW`, plus `Tc`, `Tw`, `Tz` and `TJ` offsets), and each run records where it
+ends. Before, every piece after the first in one `BT` block was reported at the block's start:
+measured, a header's last piece ended 1.5 pt past where its line was thought to end.
+
 ### Added — box-shaped spaces fixed on the way in (on by default)
 
 Some converters subset their TrueType fonts at `/FirstChar 37`, so every literal space maps to

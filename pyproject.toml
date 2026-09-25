@@ -27,6 +27,7 @@ dependencies = [
     "ocrmypdf",
     "pypdf",
     "img2pdf",
+    "fonttools",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +44,7 @@ combine-manual = "combine_manual:main"
 
 [tool.setuptools]
 py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual",
-              "pdflinks", "pdfspaces", "pdfwatermark"]
+              "pdffonts", "pdflinks", "pdfspaces", "pdfwatermark"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ocrmyworkshopmanual.__version__" }

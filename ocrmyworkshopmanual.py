@@ -103,6 +103,7 @@ import numpy as np
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
+import pdffonts
 import pdflinks
 import pdfspaces
 import pdfwatermark
@@ -3319,6 +3320,31 @@ def _fixspaces_source(src_p: Path, work: Path) -> tuple:
     return out, res, None
 
 
+def _mergefonts_source(src_p: Path, work: Path) -> tuple:
+    """(path_to_read, result, error). Returns `src_p` untouched when no TrueType face is
+    embedded more than once (see pdffonts.py), so this costs one font walk on the normal path.
+
+    WHY ON THE SOURCE, like the stamp and box-space fixes before it: the saving is in font
+    programs, which only exist while the pages are still vector -- the born-digital and
+    in-place lanes, which copy bytes and are exactly where a producer that embeds a fresh
+    subset per page leaves its files (measured: 755 programs, 18.3 MB of a 29.3 MB chapter,
+    29.3 -> 11.1 MB merged). Merged first, every lane ships the smaller file; a raster lane
+    renders identically, since the merged font draws every page pixel for pixel the same.
+
+    A FAILURE HERE IS NOT A FILE FAILURE: `clean_file` keeps its rewrite only if the file
+    shrank, every page's text is identical and a sample renders pixel-identical; otherwise
+    the source is used unchanged and the row says so."""
+    out = work / 'fontsmerged' / src_p.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        res = pdffonts.clean_file(src_p, out, render_sample=12, text_sample=0)
+    except Exception as ex:
+        return src_p, None, f'{ex.__class__.__name__}: {ex}'
+    if not res['faces'] or res['err'] or not out.exists():
+        return src_p, res, res['err']
+    return out, res, None
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -4027,7 +4053,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless_min_savings: float = LOSSLESS_MIN_SAVINGS,
                   lossless_min_mb: float = None,
                   decrypt: bool = True, dewatermark: bool = True,
-                  fix_spaces: bool = True) -> dict:
+                  fix_spaces: bool = True, merge_fonts: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -4091,6 +4117,15 @@ def _compress_one(src: str, dest: str, dpi: int,
                 dnote += f' (space-fix scan skipped: {serr})'
         dnote += pdfspaces.note_for(sp_res)
         dewatermarked = dewatermarked or bool(sp_res and sp_res.get('found') and not sp_res.get('err'))
+        # THEN merge per-page font subsets, for the reasons in `_mergefonts_source`, under the
+        # same contract: only what we READ is rebound, and a rewrite forces the write.
+        ff_res = None
+        if merge_fonts:
+            src_p, ff_res, ferr = _mergefonts_source(src_p, work)
+            if ferr and ff_res is None:
+                dnote += f' (font-merge scan skipped: {ferr})'
+        dnote += pdffonts.note_for(ff_res)
+        dewatermarked = dewatermarked or bool(ff_res and ff_res.get('fonts') and not ff_res.get('err'))
         # How many pages the SOURCE has. Everything downstream is verified against this,
         # never against the rendered count: on a corrupt PDF, rendering (or the repair
         # fallback) can silently yield fewer pages, and verifying the output against that
@@ -4630,7 +4665,8 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  sauvola_k: float, photo_descreen: float,
                  ocr: bool = True, language: str = 'auto',
                  min_compress_mb: float = None, lossless: bool = True,
-                 dewatermark: bool = True, fix_spaces: bool = True) -> dict:
+                 dewatermark: bool = True, fix_spaces: bool = True,
+                 merge_fonts: bool = True) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check, the same
@@ -4663,6 +4699,16 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     wnote += f' (would fix box spaces in {len(_bad)} font(s))'
             except Exception as ex:
                 wnote += f' (space-fix scan skipped: {ex.__class__.__name__})'
+        if merge_fonts:
+            try:
+                import pikepdf as _pike
+                with _pike.open(str(src_p)) as _p:
+                    _faces = pdffonts.detect(_p)
+                if _faces:
+                    wnote += (f' (would merge {sum(len(f) for f in _faces)} font subsets into '
+                              f'{len(_faces)} face(s))')
+            except Exception as ex:
+                wnote += f' (font-merge scan skipped: {ex.__class__.__name__})'
         born, bsig = looks_born_digital(src_p)
         if born:
             # A born-digital row used to predict only "would copy untouched", which is no
@@ -5101,6 +5147,14 @@ def main():
                          'anything renders it. The rewrite is audited (page count, every content '
                          'stream byte-identical, font count) and dropped if any check fails. '
                          'See pdfspaces.py')
+    ap.add_argument('--no-merge-fonts', action='store_true',
+                    help='leave per-page font subsets as they are. Merging them is ON by '
+                         'default and costs a font walk on a file that has none. Some producers '
+                         'embed a fresh subset of the same TrueType face on every page (measured: '
+                         '755 font programs, 18.3 MB of a 29.3 MB file); each face\'s subsets '
+                         'become one font, by glyph ID, with no content stream touched. Kept only '
+                         'if the file shrank, every page\'s text is identical and a sample renders '
+                         'pixel-identical. See pdffonts.py')
     ap.add_argument('--no-dewatermark', action='store_true',
                     help='leave a re-distributor stamp in place. Removing it is ON by '
                          'default and costs a page sample on a file that has none. What '
@@ -5400,7 +5454,8 @@ def main():
           f'{photo_desc}, {ocr_desc}, {bd_desc}, '
           f'{"fix-links" if not args.no_fix_links else "links as-is"}, '
           f'{"de-watermark" if not args.no_dewatermark else "watermarks as-is"}, '
-          f'{"fix-spaces" if not args.no_fix_spaces else "spaces as-is"}')
+          f'{"fix-spaces" if not args.no_fix_spaces else "spaces as-is"}, '
+          f'{"merge-fonts" if not args.no_merge_fonts else "fonts as-is"}')
     # The thresholds that decide compress-vs-keep. They used to be recorded only in the
     # report .log header; with the report being a per-file table, the console is where the
     # run's settings live, so print all of them rather than most of them.
@@ -5487,6 +5542,7 @@ def main():
                                   lossless=not args.no_lossless,
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,
+                                  merge_fonts=not args.no_merge_fonts,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
@@ -5507,6 +5563,7 @@ def main():
                                   decrypt=not args.no_decrypt,
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,
+                                  merge_fonts=not args.no_merge_fonts,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}

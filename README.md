@@ -158,6 +158,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller |
 | `--min-compress-mb N` | `5` | Don't re-image files smaller than this; they're passed through and reported `small size`. **OCR is still added** if missing. `0` = compress everything. See [the trade-off](#the-size-floors) |
 | `--no-fix-spaces` | off | Leave [box-shaped spaces](#box-spaces) as they are. The fix is on by default and costs one font walk on a file without the fault |
+| `--no-merge-fonts` | off | Leave [per-page font subsets](#per-page-font-subsets-pdffontspy) as they are. Merging is on by default and costs one font walk on a file with none |
 | `--no-fix-links` | off | Don't [rewrite browser-dead cross-file links](#browser-links). The rewrite is on by default: `/GoToR` and `/Launch` become relative `/URI`, in annotations and bookmarks. Internal `/GoTo` is never touched, so re-runs are no-ops |
 | `--no-lossless` | off | Don't [re-store](#lossless-rewrite) born-digital PDFs — copy them byte-for-byte |
 | `--lossless-keep-xmp` | off | Compress the per-illustration authoring XMP instead of deleting it (costs about half the saving; keeps artwork provenance) |
@@ -390,6 +391,54 @@ content stream byte-identical, font count, no font still faulty — and dropped 
 After the fix a whole-page text extraction reads those gaps as spaces, but a *clipped* one
 (PyMuPDF's `get_textbox`) returns U+FFFD for them; code that parses text inside a rectangle should
 treat U+FFFD as a gap.
+
+### Lines a caller names (`pdfwatermark.py --strip-line`)
+
+Detection only finds a stamp that carries a marker — a link, a licence nag. A third-party
+printout of a maker's pages can add text that carries none: measured on a 23,970-page repair
+manual, the service's two-line running header on every page (in two to four show-text pieces,
+drawn twice over itself on 247 pages) and 13,461 "Courtesy of …" credit lines under figures.
+For those the caller names the lines:
+
+    python pdfwatermark.py book.pdf --strip-line "2010 Make Model" --strip-line "2010 [A-Z].*" --band top:0.08
+    python pdfwatermark.py book.pdf --strip-line "Courtesy of MAKER SALES, INC\." --apply --dest out/
+
+The unit is a whole displayed **line**: a baseline goes only when all of its text, joined in
+reading order, fully matches a rule (one or more copies of it). A phrase inside a longer line —
+"Courtesy Light Switch Assembly Connector" — stays. `--band` confines rules to the top or bottom
+of the page; a report lists what the band held that no rule matched. Removal is the stamp
+remover's own operator-level code (nothing is rasterised), and the audit re-derives from the
+source, not from the matcher, that only whole named lines went: every checked page's text must
+be the source's minus exactly those lines, and every rendered pixel that changed must lie inside
+a removed line's box. Line boxes come from the fonts' own widths: the text walker advances the
+text position after every piece, as a viewer does.
+
+Taking a header's words off can leave its frame. `--band-graphics` (with `--band`) removes the
+vector paths drawn entirely inside the band — never one reaching the side margins, where a page
+border runs, and never a clipping path. Its audit: every page's text unchanged, and no rendered
+pixel changed outside the band.
+
+    python pdfwatermark.py book.pdf --band top:0.09 --band-graphics --apply
+
+### Per-page font subsets (`pdffonts.py`)
+
+Some producers embed a fresh subset of the same face on every page — measured on a 1,449-page
+chapter, 733 simple TrueType fonts from 4 faces, 18.3 MB of a 29.3 MB file, because every subset
+carries the face's full hinting programs. `pdffonts.py` merges each face's subsets into one font.
+The main pass does this on every file's source, before any lane reads it (`--no-merge-fonts`
+opts out); on its own:
+
+    python pdffonts.py book.pdf                  # report
+    python pdffonts.py book.pdf --apply          # rewrite
+
+Two subsets are one face only when their unitsPerEm, glyph count, table set and hinting programs
+(fpgm, prep, cvt) are identical, every code both draw has a byte-identical outline and the same
+PDF width, and they share at least five codes. The merge is **by glyph ID**: those subsets keep
+the face's IDs but name only the slots they fill, so a slot takes the glyph of whichever member
+draws it and the merged font's IDs are the face's own. Font dictionaries keep their `/Widths` and
+`/Encoding`; no content stream is touched. The rewrite is kept only if the file got smaller, every
+page's text is identical and a spread of pages renders pixel-identical. On the chapter above:
+29.3 → 11.1 MB.
 
 ### Text-layer decisions
 
