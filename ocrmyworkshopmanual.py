@@ -313,6 +313,7 @@ _OCR_TOKENS = None
 # `ocrmypdf_paddle` plugin shipped beside this file). Set by `main` and by `_init_worker`,
 # because the pool is processes and a child does not inherit a parent's module globals.
 OCR_ENGINE = 'tesseract'
+PADDLE_DPI = 0                  # --paddle-dpi: 0 = read pages at their native resolution
 PADDLE_PLUGIN = Path(__file__).with_name('ocrmypdf_paddle.py')
 
 
@@ -329,6 +330,9 @@ def _engine_args(language: str) -> tuple:
     other = [p for p in language.split('+') if p not in LANGUAGES]
     if other:
         return [], f' (engine tesseract: paddle does not read {"+".join(other)})'
+    if PADDLE_DPI:
+        return (['--plugin', str(PADDLE_PLUGIN), '--paddle-dpi', str(PADDLE_DPI)],
+                f' (engine paddle @{PADDLE_DPI} dpi)')
     return ['--plugin', str(PADDLE_PLUGIN)], ' (engine paddle)'
 
 
@@ -486,7 +490,7 @@ def _threads(want: int):
 
 
 def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=None,
-                 tokens=None, ocr_engine: str = 'tesseract'):
+                 tokens=None, ocr_engine: str = 'tesseract', paddle_dpi: int = 0):
     """Worker start-up: run below normal priority, tell ocrmypdf how many threads it may
     use in THIS process, and capture library logging so it stops leaking to the shared
     stderr. The pool parallelises across files, so the thread budget is the machine's cores
@@ -504,7 +508,9 @@ def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=
     per-file budgets derived independently in six processes cannot add up to more work than
     the machine has (see `_claim_threads`)."""
     global OCR_JOBS, _OCR_CORES, _OCR_WORKERS, _OCR_REMAINING, _OCR_TOKENS, OCR_ENGINE
+    global PADDLE_DPI
     OCR_ENGINE = ocr_engine
+    PADDLE_DPI = max(0, int(paddle_dpi))
     OCR_JOBS = max(1, int(ocr_jobs))
     _OCR_CORES = max(0, int(cores))
     _OCR_WORKERS = max(0, int(workers))
@@ -723,6 +729,9 @@ def _validate_numeric_args(args) -> str:
         (args.timeout >= 0, '--timeout must be >= 0 (0 = no timeout)'),
         (args.min_free_gb >= 0, '--min-free-gb must be >= 0 (0 = disabled)'),
         (args.limit >= 0, '--limit must be >= 0 (0 = no limit)'),
+        (args.paddle_dpi >= 0, '--paddle-dpi must be >= 0 (0 = native resolution)'),
+        (not args.paddle_dpi or args.ocr_engine == 'paddle',
+         '--paddle-dpi only applies with --ocr-engine paddle'),
     ]
     bad = [msg for ok, msg in checks if not ok]
     return '; '.join(bad) if bad else None
@@ -1537,6 +1546,57 @@ def _ocrmypdf_raster_mp(src_p: Path, sample: int = 40) -> tuple:
     return worst, worst_pg, worst_native
 
 
+# What an ocrmypdf exit code MEANS. The bare number told a reviewer nothing: measured, a
+# report said "exit 3221225477", which is 0xC0000005, an access violation inside the OCR
+# engine — a crash, not a bad file. ocrmypdf's own codes are `ocrmypdf.exceptions.ExitCode`;
+# the large ones are the Windows status a native crash surfaces as.
+_OCRMYPDF_EXIT = {1: 'bad arguments', 2: 'input file problem', 3: 'missing dependency',
+                  4: 'produced an invalid PDF', 5: 'file access error',
+                  6: 'page already has text', 7: 'a child process failed',
+                  8: 'encrypted PDF', 9: 'invalid configuration',
+                  10: 'PDF/A conversion failed', 15: 'other error', 130: 'interrupted'}
+_WIN_STATUS = {0xC0000005: 'access violation: the OCR engine crashed',
+               0xC0000409: 'stack buffer overrun: the OCR engine crashed',
+               0xC00000FD: 'stack overflow: the OCR engine crashed',
+               0xC0000017: 'out of memory',
+               0xC000013A: 'interrupted'}
+
+
+def _exit_meaning(code: int) -> str:
+    """'exit N (what it means)' for an ocrmypdf return code."""
+    if code in _OCRMYPDF_EXIT:
+        return f'exit {code} ({_OCRMYPDF_EXIT[code]})'
+    u = code & 0xFFFFFFFF
+    if u in _WIN_STATUS:
+        return f'exit {u:#010x} ({_WIN_STATUS[u]})'
+    if code < 0:                             # POSIX: killed by a signal
+        import signal
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f'signal {-code}'
+        return f'killed by {name}' + (' (often the out-of-memory killer)' if -code == 9 else '')
+    return f'exit {code}'
+
+
+def _ocr_failed_err(why: str) -> str:
+    """The FAILED row for a file whose OCR produced no text layer: the cause, and what can
+    be done about it.
+
+    A failed OCR used to ship the file anyway — compressed, textless, and counted as a
+    success. Measured on a 138-page Japanese manual: the OCR engine crashed on every try, the
+    run said "processed 1 ... failed 0", and only a column few would read said `failed`. A
+    scan's text layer is the half of this tool's output that cannot be added later without
+    the original, so a file without one is not finished: the original is kept and the row
+    says why."""
+    opts = ['clear the cause and re-run it with --retry-failed <report>.csv']
+    if OCR_ENGINE == 'paddle':
+        opts.append('--ocr-engine tesseract to OCR it with Tesseract instead')
+    opts.append('--no-ocr to process it without a text layer')
+    why = why.replace('(OCR FAILED - ', '(').strip()
+    return f'OCR failed {why} — original kept. Options: ' + '; '.join(opts)
+
+
 def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
                            jobs: int) -> tuple:
     """OCR a render made at each page's OWN native dpi, and return (donor_pdf, note).
@@ -1608,7 +1668,7 @@ def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
         if r2 is not None:
             lines = [x.strip() for x in ((r2.stderr or '') + (r2.stdout or '')).splitlines()
                      if x.strip()]
-            tail = f': {lines[-1][:160]}' if lines else ''
+            tail = f' {_exit_meaning(r2.returncode)}' + (f': {lines[-1][:160]}' if lines else '')
         return None, f' (native-render OCR failed{tail})'
     return out, enote
 
@@ -1737,7 +1797,7 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     else:
         tail = [x.strip() for x in ((r.stderr or '') + '\n' + (r.stdout or '')).splitlines()
                 if x.strip()]
-        why = f'exit {r.returncode}'
+        why = _exit_meaning(r.returncode)
         if tail:
             why += ': ' + tail[-1][:200]
         if not out.exists():
@@ -4066,8 +4126,10 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
                 if tries > 1:
                     note += f' (OCR retried x{tries - 1})'
             else:
-                note += ' (OCR FAILED)'
-                ocr_state = OCR_FAILED
+                why = ('(ocrmypdf did not run: crashed or stalled past the timeout)'
+                       if r is None else f'({_exit_meaning(r.returncode)})')
+                return {'src': src_p.name, 'orig': orig, 'new': 0, 'pages': pages,
+                        'note': note, 'kept': True, 'err': _ocr_failed_err(why)}
     # in-place: nothing changed (kept original, no OCR added) -> leave the file untouched.
     # `already_ocred` matters: OCR now runs on the SOURCE before this point, so `base` can
     # already carry a fresh text layer even though this function did not add one. Without
@@ -4237,7 +4299,7 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
                                          pages=src_pages)
     note += onote
     if not ocred:
-        return base, language, note, OCR_FAILED, None
+        return None, language, note, OCR_FAILED, _ocr_failed_err(onote)
     return ocred, language, note, (OCR_REDO if had_text else OCR_NEW), None
 
 
@@ -4657,8 +4719,10 @@ def _compress_one(src: str, dest: str, dpi: int,
         # text and all, so carrying would draw the layer twice.
         keep_text = {k for k in _carried_text_pages(render_src, frozenset(bsig.get('boiler') or ()))
                      if k < len(classes) and classes[k].type not in _PT_PASSTHROUGH}
+        need_ocr = set()                    # pages that get their text layer from OCR
         if ocr:
             vec_pages = {k for k, c in enumerate(classes) if c.type == PT_VECTOR}
+            need_ocr = set(range(len(pngs))) - vec_pages - keep_text
             ocr_input, ocr_map = _ocr_render_pdf(work, pngs, page_dpi, dpi,
                                                  vec_pages | keep_text)
 
@@ -4724,7 +4788,11 @@ def _compress_one(src: str, dest: str, dpi: int,
         # onto the compressed pages by the graft, decoupling text quality from image size.
         ocr_note = ''
         ocr_src = None
-        ocr_state = OCR_NONE if not ocr else OCR_FAILED
+        ocr_state = OCR_NONE if not ocr else OCR_KEPT
+        if ocr and need_ocr and ocr_input is None:
+            return {'src': src_p.name, 'orig': orig, 'new': 0,
+                    'err': _ocr_failed_err(f'(could not build the OCR input from '
+                                           f'{len(need_ocr)} rendered page(s))')}
         if ocr and ocr_input is not None:
             # Whether this is the file's FIRST text layer or a replacement is a fact about
             # the SOURCE, not about our render (which never carries text), so it has to be
@@ -4736,10 +4804,13 @@ def _compress_one(src: str, dest: str, dpi: int,
             ocr_src, language, ocr_note = _ocr_source(
                 ocr_input, work, language, has_vector=True, timeout=timeout,
                 pages=src_pages, lang_src=render_src)
-            ocr_state = (OCR_FAILED if ocr_src is None
-                         else OCR_REDO if src_had_text else OCR_NEW)
-        elif ocr and keep_text:
-            ocr_state = OCR_KEPT             # every page needing text had its own layer
+            if ocr_src is None:
+                return {'src': src_p.name, 'orig': orig, 'new': 0,
+                        'err': _ocr_failed_err(ocr_note)}
+            ocr_state = OCR_REDO if src_had_text else OCR_NEW
+        # else: no page needed OCR — every one is vector or carries its own layer, so the
+        # state stays OCR_KEPT. It used to start at 'failed' and stay there on exactly that
+        # file, which reported a layer that was never missing as a failed one.
         if keep_text:
             ocr_note += f' (source text layer kept on {len(keep_text)} of {len(pngs)} pg)'
 
@@ -5525,6 +5596,13 @@ def main():
                          '`pip install rapidocr onnxruntime` (or onnxruntime-directml / '
                          'onnxruntime-gpu to run on a GPU, ~6x faster). Language detection '
                          'still uses Tesseract, so it stays installed either way')
+    ap.add_argument('--paddle-dpi', type=int, default=0, metavar='DPI',
+                    help='with --ocr-engine paddle: read pages scanned finer than DPI at DPI, '
+                         'which is faster; the text layer is still mapped onto the full page. '
+                         '0 = native resolution (default, the most accurate). Measured on 600 '
+                         'dpi Japanese scans on a GTX 1060: 300 took 12-18 s a page against '
+                         '~22 s, Japanese recall 0.805 against 0.819, same 25 of 28 '
+                         'hand-checked diagram labels')
     ap.add_argument('--photo-threshold', type=float, default=0.02,
                     help='page kept as image if this fraction of tiles are continuous-tone (default 0.02)')
     ap.add_argument('--photo-dpi', type=int, default=150,
@@ -5586,8 +5664,9 @@ def main():
     err = check_tools(want_ocr=not args.no_ocr, ocr_engine=args.ocr_engine)
     if err:
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
-    global OCR_ENGINE
-    OCR_ENGINE = args.ocr_engine          # the workers get it through `_init_worker`
+    global OCR_ENGINE, PADDLE_DPI
+    OCR_ENGINE = args.ocr_engine          # the workers get both through `_init_worker`
+    PADDLE_DPI = args.paddle_dpi
 
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
@@ -5812,7 +5891,8 @@ def main():
         with cf.ProcessPoolExecutor(max_workers=args.workers,
                                     initializer=_init_worker,
                                     initargs=(_ocr_jobs, _cores, args.workers,
-                                              _remaining, _tokens, args.ocr_engine)) as ex:
+                                              _remaining, _tokens, args.ocr_engine,
+                                              args.paddle_dpi)) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size,

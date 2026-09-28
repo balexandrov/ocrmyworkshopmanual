@@ -112,26 +112,47 @@ def _line(quad, text: str, score: float) -> OcrElement:
     return OcrElement(ocr_class=OcrClass.LINE, bbox=box, textangle=angle, children=[word])
 
 
-def ocr_page(input_file: Path, page_number: int = 0) -> tuple[OcrElement, str]:
+def ocr_page(input_file: Path, page_number: int = 0,
+             max_dpi: float = 0) -> tuple[OcrElement, str]:
     """OCR one page image into an OcrElement page and its plain text, lines in reading
     order (top to bottom, then left to right). Split out of the plugin class so it can be
-    called and tested without an OCRmyPDF run."""
+    called and tested without an OCRmyPDF run.
+
+    `max_dpi` (0 = off) reads a page scanned finer than that at `max_dpi` instead, then maps
+    the lines back onto the full-size image, so the text layer still fits the page it is
+    laid over. It is the speed knob: measured on a 138-page Japanese manual scanned at
+    600 dpi, recognition at native resolution took ~22 s a page on a GTX 1060 and filled its
+    6 GB, while 300 dpi took 12-18 s — at a small cost, Japanese recall 0.805 against 0.819,
+    with the same 25 of 28 hand-checked diagram labels found."""
     with Image.open(input_file) as img:
         width, height = img.size
+        known = 'dpi' in img.info
         dpi = img.info.get('dpi', (300, 300))
         dpi = float(dpi[0] if isinstance(dpi, tuple) else dpi)
+        scale = max_dpi / dpi if (max_dpi and known and dpi > max_dpi) else 1.0
+        src = (img.resize((round(width * scale), round(height * scale)), Image.LANCZOS)
+               if scale < 1.0 else str(input_file))
     page = OcrElement(ocr_class=OcrClass.PAGE,
                       bbox=BoundingBox(left=0, top=0, right=width, bottom=height),
                       dpi=dpi, page_number=page_number)
     engine = _get_engine()
     if _gpu:
         with _gpu_lock:
-            r = engine(str(input_file))
+            r = engine(src)
     else:
-        r = engine(str(input_file))
+        r = engine(src)
     if r.boxes is None:
         return page, ''
-    items = sorted(zip(r.boxes, r.txts, r.scores),
+    if scale < 1.0:
+        r_boxes = [[(x / scale, y / scale) for x, y in q] for q in r.boxes]
+    else:
+        r_boxes = r.boxes
+    return _page_from(page, r_boxes, r.txts, r.scores)
+
+
+def _page_from(page: OcrElement, boxes, txts, scores) -> tuple[OcrElement, str]:
+    """Fill `page` with one LINE per detected text box, in reading order."""
+    items = sorted(zip(boxes, txts, scores),
                    key=lambda t: (round(min(p[1] for p in t[0]) / 20), min(p[0] for p in t[0])))
     lines = [(q, s, c) for q, s, c in items if s and s.strip()]
     page.children = [_line(q, s, c) for q, s, c in lines]
@@ -168,7 +189,8 @@ class PaddleOcrEngine(OcrEngine):
 
     @staticmethod
     def generate_ocr(input_file: Path, options, page_number: int = 0):
-        return ocr_page(input_file, page_number)
+        return ocr_page(input_file, page_number,
+                        max_dpi=getattr(options, 'paddle_dpi', 0) or 0)
 
     @staticmethod
     def generate_hocr(input_file: Path, output_hocr: Path, output_text: Path, options):
@@ -178,6 +200,23 @@ class PaddleOcrEngine(OcrEngine):
     def generate_pdf(input_file: Path, output_pdf: Path, output_text: Path, options):
         raise NotImplementedError('ocrmypdf_paddle implements generate_ocr only '
                                   '(use the default --pdf-renderer)')
+
+
+@hookimpl
+def add_options(parser):
+    g = parser.add_argument_group('PaddleOCR', 'Options for the ocrmypdf_paddle plugin')
+    g.add_argument('--paddle-dpi', type=int, default=0, metavar='DPI',
+                   help='read pages scanned finer than DPI at DPI (faster; the text layer is '
+                        'still mapped onto the full page). 0 = native resolution (default). '
+                        'Measured on 600 dpi scans: 300 took 12-18 s a page against ~22 s, '
+                        'Japanese recall 0.805 against 0.819')
+
+
+@hookimpl
+def check_options(options):
+    from ocrmypdf.exceptions import BadArgsError
+    if (getattr(options, 'paddle_dpi', 0) or 0) < 0:
+        raise BadArgsError('--paddle-dpi must be >= 0')
 
 
 @hookimpl

@@ -5,6 +5,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — a file whose OCR fails is FAILED, not shipped without a text layer
+
+When OCR produced no text layer, the file was still written — compressed, or its original images
+copied — and counted as processed. Measured on a 138-page Japanese manual whose OCR engine crashed
+on every try: the run reported "processed 1 ... failed 0" and only the `ocr` column said `failed`.
+Now the file fails and nothing is written for it; the row gives the cause, with the exit code
+translated (`exit 3221225477` is `0xc0000005`, an access violation inside the OCR engine), and the
+options: `--retry-failed`, `--ocr-engine tesseract` when the paddle engine failed, or `--no-ocr`.
+Along the way, a compressed file on which no page needed OCR (every page vector, or carrying its
+own text layer) no longer reports its OCR as `failed`: the state started there and was never
+cleared on that path.
+
+### Added — `--paddle-dpi`: read pages at a lower resolution with the paddle engine
+
+Pages reached PaddleOCR at native resolution: on a 600 dpi scan ~22 s a page on a GTX 1060, with its
+6 GB full. `--paddle-dpi 300` reads them at 300 dpi (12–18 s a page) and maps each line back onto
+the full-size page, for a small measured loss (Japanese recall 0.805 against 0.819, the same 25 of
+28 hand-checked diagram labels). The default stays native. It is also a plugin option, so
+`ocrmypdf --plugin ocrmypdf_paddle.py --paddle-dpi 300` works on its own.
+
 ### Added — `--ocr-engine paddle`: PaddleOCR PP-OCRv6 as a second OCR engine
 
 Tesseract reads scanned Japanese poorly. Measured on two Japanese wiring manuals against text read

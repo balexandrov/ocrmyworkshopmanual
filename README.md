@@ -155,6 +155,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--workers N` | one per **physical** core | Files in parallel. OCR threads come from the same budget and follow how many files are still in flight, so the last file of a batch gets the cores the batch no longer needs |
 | `--language L` | `auto` | Tesseract language(s). `auto` detects each file's script from the image — Latin→`eng`, Cyrillic→`rus+eng`, CJK→`jpn+eng` — and adds any pack the file's existing text layer proves it needs. Or pass a spec: `eng+fra+spa+deu` |
 | `--ocr-engine E` | `tesseract` | `tesseract` or `paddle` (PaddleOCR PP-OCRv6 — [OCR engines](#ocr-engines)). A file in a language `paddle` does not read still goes to Tesseract, and the report note says so |
+| `--paddle-dpi N` | `0` | With `--ocr-engine paddle`: read pages scanned finer than N dpi at N — faster, and the text layer is still mapped onto the full page. `0` = native resolution, the most accurate |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--sauvola-k F` | `0.30` | Threshold sensitivity (lower = bolder ink, higher = thinner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px (an area at 300 dpi, scaled by dpi²) |
@@ -480,6 +481,20 @@ Its one measured weakness is dense, leader-dotted contents pages, where it can d
 that Tesseract keeps. It reads Japanese, Chinese and English — not Cyrillic, so a Russian file
 stays on Tesseract. Speed: ~75 s a page on a CPU, ~12 s on a GTX 1060 through DirectML (same
 text). Language detection still runs through Tesseract, so Tesseract stays installed either way.
+
+Pages reach the engine at their native resolution. On a 600 dpi scan that costs ~22 s a page on
+the GTX 1060 and fills its 6 GB; `--paddle-dpi 300` reads them at 300 instead (12–18 s a page),
+for a small measured loss — Japanese recall 0.805 against 0.819, the same 25 of 28 hand-checked
+diagram labels.
+
+### When OCR fails
+
+A file whose OCR produces no text layer is **FAILED**, and nothing is written for it: the text
+layer is the half of the output that cannot be added later without the original, so a file
+without one is not finished. The row names the cause — the exit code is translated, so a native
+crash reads `exit 0xc0000005 (access violation: the OCR engine crashed)`, not `exit 3221225477`
+— and the ways out: clear the cause and `--retry-failed`, `--ocr-engine tesseract` if the paddle
+engine was the one that failed, or `--no-ocr` to process the file without a text layer.
 
 ### Verification
 

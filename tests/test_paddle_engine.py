@@ -78,6 +78,43 @@ def test_ocr_page_reads_a_rendered_scan(tmp_path):
 
 
 @needs_paddle
+def test_paddle_dpi_reads_smaller_but_maps_back_to_the_full_page(tmp_path, monkeypatch):
+    """--paddle-dpi is a speed knob: the page is read at the lower resolution, but the text
+    layer has to sit on the FULL-size image OCRmyPDF lays it over."""
+    src = U.make_scan_pdf(tmp_path / 's.pdf', npages=1)
+    png = tmp_path / 'p.png'
+    assert U.render_gray(src, 1, 300, png)
+    from PIL import Image
+    with Image.open(png) as im:
+        w, h = im.size
+    seen, real = [], paddle._get_engine
+
+    def spy():
+        engine = real()
+        return lambda x: (seen.append(getattr(x, 'size', None)), engine(x))[1]
+    monkeypatch.setattr(paddle, '_get_engine', spy)
+    full, _ = paddle.ocr_page(png)
+    half, t_half = paddle.ocr_page(png, max_dpi=150)
+    assert seen == [None, (w // 2, h // 2)], f'the engine must be given the smaller page: {seen}'
+    assert 'Scan page 1 line' in t_half, t_half[:200]
+    assert (half.bbox.right, half.bbox.bottom) == (w, h), 'the page keeps its full size'
+    # each line lands where the full-resolution read put it (measured: within ~6 px)
+    assert len(half.children) == len(full.children)
+    for a, b in zip(full.children, half.children):
+        for fa, fb in ((a.bbox.left, b.bbox.left), (a.bbox.top, b.bbox.top),
+                       (a.bbox.right, b.bbox.right), (a.bbox.bottom, b.bbox.bottom)):
+            assert abs(fa - fb) < 0.01 * w, (a.bbox, b.bbox)
+
+
+@needs_paddle
+def test_paddle_dpi_is_passed_through(paddle_engine, monkeypatch):
+    monkeypatch.setattr(owm, 'PADDLE_DPI', 300)
+    args, note = owm._engine_args('jpn+eng')
+    assert args == ['--plugin', str(owm.PADDLE_PLUGIN), '--paddle-dpi', '300']
+    assert note == ' (engine paddle @300 dpi)'
+
+
+@needs_paddle
 def test_concurrent_pages_do_not_crash_the_engine(tmp_path):
     """OCRmyPDF calls the engine from several THREADS at once (its default executor). On a
     GPU provider that crashed the whole process (0xC0000005) until calls were serialised —
