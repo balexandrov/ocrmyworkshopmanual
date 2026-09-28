@@ -5,6 +5,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `--ocr-engine paddle`: PaddleOCR PP-OCRv6 as a second OCR engine
+
+Tesseract reads scanned Japanese poorly. Measured on two Japanese wiring manuals against text read
+off the page images by eye, PP-OCRv6 (medium) found 25 of 28 diagram labels with 3 wrong Japanese
+characters, where Tesseract found 14 with 13 and the files' own ABBYY layers 19 with 45; on two
+explanation pages it read 57 of 63 printed lines exactly, against Tesseract's 46. It ships as
+`ocrmypdf_paddle.py`, an ordinary OCRmyPDF plugin that runs the PaddleOCR models through RapidOCR
+on onnxruntime (PaddlePaddle has no wheel for current Python), so no other stage changes. The
+plugin sets a text angle on vertical lines: without one, OCRmyPDF's renderer drops a line whose
+box does not fit its text, and vertical Japanese would silently vanish from the layer. A file in
+a language the model does not read (Cyrillic) stays on Tesseract and the note says so; a GPU is
+used when the installed onnxruntime offers one (~12 s a page on a GTX 1060 against ~75 s on the
+CPU, same text). Optional: `pip install rapidocr onnxruntime`, checked at startup through the
+ocrmypdf the tool will actually run.
+
 ### Fixed — a scan's own OCR layer is carried onto its compressed pages, not re-OCR'd
 
 A scan that a desktop OCR engine had already made searchable was re-OCR'd by Tesseract on the

@@ -309,6 +309,28 @@ _OCR_WORKERS = 0
 _OCR_REMAINING = None
 _OCR_TOKENS = None
 
+# Which engine reads the page images: 'tesseract' (ocrmypdf's own) or 'paddle' (the
+# `ocrmypdf_paddle` plugin shipped beside this file). Set by `main` and by `_init_worker`,
+# because the pool is processes and a child does not inherit a parent's module globals.
+OCR_ENGINE = 'tesseract'
+PADDLE_PLUGIN = Path(__file__).with_name('ocrmypdf_paddle.py')
+
+
+def _engine_args(language: str) -> tuple:
+    """(extra ocrmypdf arguments, note) for OCR_ENGINE on a file resolved to `language`.
+
+    A file whose language the paddle model does not read (Cyrillic, most notably) goes to
+    Tesseract instead, and the note says so. The alternative is OCR in the wrong script,
+    which replaces a missing text layer with noise — or no layer at all when ocrmypdf
+    refuses the language."""
+    if OCR_ENGINE != 'paddle':
+        return [], ''
+    from ocrmypdf_paddle import LANGUAGES
+    other = [p for p in language.split('+') if p not in LANGUAGES]
+    if other:
+        return [], f' (engine tesseract: paddle does not read {"+".join(other)})'
+    return ['--plugin', str(PADDLE_PLUGIN)], ' (engine paddle)'
+
 
 def _installed_langs() -> set:
     """Tesseract language packs actually installed (cached per process). `tesseract
@@ -464,7 +486,7 @@ def _threads(want: int):
 
 
 def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=None,
-                 tokens=None):
+                 tokens=None, ocr_engine: str = 'tesseract'):
     """Worker start-up: run below normal priority, tell ocrmypdf how many threads it may
     use in THIS process, and capture library logging so it stops leaking to the shared
     stderr. The pool parallelises across files, so the thread budget is the machine's cores
@@ -481,7 +503,8 @@ def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=
     `tokens` is the matching shared tally of threads already promised to running steps, so
     per-file budgets derived independently in six processes cannot add up to more work than
     the machine has (see `_claim_threads`)."""
-    global OCR_JOBS, _OCR_CORES, _OCR_WORKERS, _OCR_REMAINING, _OCR_TOKENS
+    global OCR_JOBS, _OCR_CORES, _OCR_WORKERS, _OCR_REMAINING, _OCR_TOKENS, OCR_ENGINE
+    OCR_ENGINE = ocr_engine
     OCR_JOBS = max(1, int(ocr_jobs))
     _OCR_CORES = max(0, int(cores))
     _OCR_WORKERS = max(0, int(workers))
@@ -634,7 +657,27 @@ def _ocrmypdf_ok():
         return False
 
 
-def check_tools(want_ocr: bool):
+def _paddle_error() -> str:
+    """'' if ocrmypdf can load the paddle plugin, else why not.
+
+    Asked of the ocrmypdf this tool will actually run, not of this interpreter: OCRMYPDF can
+    be a console script from another environment, and a package installed here would then
+    prove nothing. The plugin imports its dependencies when loaded, so `--version` with it
+    loaded is the whole test."""
+    if not PADDLE_PLUGIN.exists():
+        return f'{PADDLE_PLUGIN.name} is missing beside {Path(__file__).name}'
+    try:
+        r = subprocess.run(OCRMYPDF + ['--plugin', str(PADDLE_PLUGIN), '--version'],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as ex:
+        return repr(ex)
+    if r.returncode == 0:
+        return ''
+    lines = [x.strip() for x in ((r.stderr or '') + (r.stdout or '')).splitlines() if x.strip()]
+    return lines[-1][:200] if lines else f'ocrmypdf exited {r.returncode}'
+
+
+def check_tools(want_ocr: bool, ocr_engine: str = 'tesseract'):
     """Return an error string if a required tool is missing, else None."""
     if not GS:
         return ('Ghostscript not found. Install it (ghostscript.com / apt install '
@@ -653,6 +696,13 @@ def check_tools(want_ocr: bool):
                     'or run with --no-ocr.')
         if not _ocrmypdf_ok():
             return 'ocrmypdf not available (pip install ocrmypdf), or run with --no-ocr.'
+        if ocr_engine == 'paddle':
+            why = _paddle_error()
+            if why:
+                return (f'--ocr-engine paddle: ocrmypdf cannot load the plugin ({why}). '
+                        'Install `pip install rapidocr onnxruntime` into the environment '
+                        'ocrmypdf runs from (onnxruntime-directml or onnxruntime-gpu instead '
+                        'of onnxruntime to use a GPU).')
     return None
 
 
@@ -1548,8 +1598,9 @@ def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
     except Exception as ex:
         return None, f' (native-render OCR failed: merge: {ex})'
     out = work / 'native_ocr.pdf'
+    eargs, enote = _engine_args(language)
     r2, _tries = _run_retry(lambda: subprocess.run(
-        OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
+        OCRMYPDF + eargs + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
                     '--skip-text', '--quiet', '--jobs', str(jobs), str(merged), str(out)],
         capture_output=True, text=True))
     if r2 is None or r2.returncode != 0 or not out.exists() or not out.stat().st_size:
@@ -1559,7 +1610,7 @@ def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
                      if x.strip()]
             tail = f': {lines[-1][:160]}' if lines else ''
         return None, f' (native-render OCR failed{tail})'
-    return out, ''
+    return out, enote
 
 
 def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
@@ -1641,16 +1692,18 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                                         ' untouched source failed: ' + repr(ex) + ')')
             return shipped, language, (
                 f' (lang:{language}, OCR at native ~{native:.0f} dpi: page {worst_pg}'
-                f' declares a box ocrmypdf would rasterise to {worst_mp:.0f} MP)')
+                f' declares a box ocrmypdf would rasterise to {worst_mp:.0f} MP)' + nnote)
     # Budget from THIS file's page count, held for the whole call. `--jobs` cannot be changed
     # on a running process, so a number sampled from queue state here is frozen for however
     # long the file takes — hours, on the manuals that need the threads most.
+    eargs, enote = _engine_args(language)
     with _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
         r, tries = _run_retry(lambda: subprocess.run(
-            OCRMYPDF + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
-                        mode, '--quiet', '--jobs', str(jobs), str(src_p), str(out)],
+            OCRMYPDF + eargs + ['--language', language, '--optimize', '0', '--output-type',
+                                'pdf', mode, '--quiet', '--jobs', str(jobs), str(src_p),
+                                str(out)],
             capture_output=True, text=True))
-    note = f' (lang:{language}'
+    note = enote + f' (lang:{language}'
     # the MODE, not a claim about the outcome: --redo-ocr is chosen to protect the images,
     # and it runs on files that have no text layer to redo at all. Whether this was a first
     # OCR or a replacement is reported by the `ocr` column, which reads the source.
@@ -3987,6 +4040,8 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             # rather than erroring OCR out and leaving the file with no text at all.
             language = _available_ocr_lang(language)
             note += lnote or f' (lang:{language})'
+            eargs, enote = _engine_args(language)
+            note += enote
             ocr_pdf = work / 'ocr.pdf'
             # NO timeout on OCR: ocrmypdf emits no usable progress signal (measured: it is
             # silent for ~90% of a run), so any wall-clock bound would just kill healthy
@@ -3994,10 +4049,11 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             # OCR'ing correctly. A crash is retried; slowness is simply waited out.
             with _threads(_ocr_jobs_budget(base, pages)) as ocr_jobs:
                 r, tries = _run_retry(lambda: subprocess.run(
-                    OCRMYPDF + ['--language', language, '--optimize', '0',
-                                '--output-type', 'pdf', '--skip-text', '--quiet',
-                                '--jobs', str(ocr_jobs),
-                                str(base), str(ocr_pdf)], capture_output=True, text=True))
+                    OCRMYPDF + eargs + ['--language', language, '--optimize', '0',
+                                        '--output-type', 'pdf', '--skip-text', '--quiet',
+                                        '--jobs', str(ocr_jobs),
+                                        str(base), str(ocr_pdf)],
+                    capture_output=True, text=True))
             # Only worth saying when it is not the saturated-pool default: with it, the report
             # alone proves a big file actually got the threads. This path used to record
             # nothing, so its budget was invisible.
@@ -5459,6 +5515,16 @@ def main():
                          'explicit spec to override, e.g. eng or eng+fra+spa+deu — a source whose '
                          'existing text layer proves another script still gets that pack added, '
                          'because OCR\'ing Cyrillic as English replaces real text with noise')
+    ap.add_argument('--ocr-engine', choices=('tesseract', 'paddle'), default='tesseract',
+                    help="engine that reads the page images (default tesseract). 'paddle' is "
+                         'PaddleOCR PP-OCRv6 via the ocrmypdf_paddle plugin: measured on '
+                         'Japanese wiring manuals it found 25 of 28 diagram labels where '
+                         'Tesseract found 14, and 57 of 63 printed lines against 46. It reads '
+                         'Japanese, Chinese and English; a file in any other language still '
+                         'goes to Tesseract, and the report note says so. Needs '
+                         '`pip install rapidocr onnxruntime` (or onnxruntime-directml / '
+                         'onnxruntime-gpu to run on a GPU, ~6x faster). Language detection '
+                         'still uses Tesseract, so it stays installed either way')
     ap.add_argument('--photo-threshold', type=float, default=0.02,
                     help='page kept as image if this fraction of tiles are continuous-tone (default 0.02)')
     ap.add_argument('--photo-dpi', type=int, default=150,
@@ -5517,9 +5583,11 @@ def main():
     if err:
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
 
-    err = check_tools(want_ocr=not args.no_ocr)
+    err = check_tools(want_ocr=not args.no_ocr, ocr_engine=args.ocr_engine)
     if err:
         print(f'ERROR: {err}', file=sys.stderr); sys.exit(1)
+    global OCR_ENGINE
+    OCR_ENGINE = args.ocr_engine          # the workers get it through `_init_worker`
 
     if args.in_place and args.dest:
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
@@ -5657,7 +5725,7 @@ def main():
     print(f'jbig2enc    : {JBIG}')
     print(f'Source      : {src_root}')
     print(f'Dest        : {"IN-PLACE (overwrites source PDFs)" if args.in_place else dest_root}')
-    ocr_desc = f'OCR({args.language})' if not args.no_ocr else 'no OCR'
+    ocr_desc = (f'OCR({args.language}, {args.ocr_engine})' if not args.no_ocr else 'no OCR')
     bd_desc = 'born-digital-safe'
     photo_desc = f'photo>{args.photo_threshold:g}@{args.photo_dpi}dpi'
     bin_desc = f'adaptive(sauvola k={args.sauvola_k:g})'
@@ -5744,7 +5812,7 @@ def main():
         with cf.ProcessPoolExecutor(max_workers=args.workers,
                                     initializer=_init_worker,
                                     initargs=(_ocr_jobs, _cores, args.workers,
-                                              _remaining, _tokens)) as ex:
+                                              _remaining, _tokens, args.ocr_engine)) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size,

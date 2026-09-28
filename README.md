@@ -37,6 +37,10 @@ any tree of scanned documents. For each page it decides the right treatment, com
   compression never degrades recognition
 - **Per-file language detection** (`--language auto`) from the page image, plus the script its
   existing text layer proves
+- **A second OCR engine** for Japanese and Chinese: `--ocr-engine paddle` (PaddleOCR PP-OCRv6),
+  which on Japanese wiring manuals reads far more than Tesseract — see [OCR engines](#ocr-engines)
+- **An existing OCR layer is kept**: a scan made searchable by another engine (ABBYY, say) keeps
+  that layer on its compressed pages instead of being re-OCR'd
 - **Stamp-aware** — a paywall watermark repeated on every page isn't mistaken for a text layer
 
 **Browser-usable cross-references**
@@ -99,7 +103,10 @@ ocrmyworkshopmanual --version
 
 The `jbig2topdf.py` wrapper ships in `tools/`. If a tool isn't on PATH, point at it with
 `JBIG2_GS` (Ghostscript) or `JBIG2_BIN` (jbig2). `--no-ocr` drops the Tesseract requirement.
-**Optional:** `pip install zopfli` enables `--lossless-zopfli`.
+**Optional:** `pip install zopfli` enables `--lossless-zopfli`. `pip install rapidocr onnxruntime`
+enables `--ocr-engine paddle`; install `onnxruntime-directml` (Windows, any DirectX 12 GPU) or
+`onnxruntime-gpu` (CUDA) *instead of* `onnxruntime` to run it on a GPU. The models are downloaded
+on first use.
 
 ---
 
@@ -147,6 +154,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--dpi N` | `200` | Render resolution (native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel. OCR threads come from the same budget and follow how many files are still in flight, so the last file of a batch gets the cores the batch no longer needs |
 | `--language L` | `auto` | Tesseract language(s). `auto` detects each file's script from the image — Latin→`eng`, Cyrillic→`rus+eng`, CJK→`jpn+eng` — and adds any pack the file's existing text layer proves it needs. Or pass a spec: `eng+fra+spa+deu` |
+| `--ocr-engine E` | `tesseract` | `tesseract` or `paddle` (PaddleOCR PP-OCRv6 — [OCR engines](#ocr-engines)). A file in a language `paddle` does not read still goes to Tesseract, and the report note says so |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--sauvola-k F` | `0.30` | Threshold sensitivity (lower = bolder ink, higher = thinner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px (an area at 300 dpi, scaled by dpi²) |
@@ -450,6 +458,28 @@ at most 4 lines / 400 chars — twenty identical lines is a form template, and a
 content. Applied **line-wise**, so a page with a repeated running header plus body text keeps its
 body. The stamp is **never removed**; the file is reported with `boiler=2ln/66c` in
 `scan signals`.
+
+### OCR engines
+
+Tesseract is the default. `--ocr-engine paddle` swaps in PaddleOCR PP-OCRv6 (the medium model),
+run through [RapidOCR](https://github.com/RapidAI/RapidOCR) on onnxruntime by the
+`ocrmypdf_paddle.py` plugin that ships beside the tool. It is an ordinary
+[OCRmyPDF plugin](https://ocrmypdf.readthedocs.io/en/latest/plugins.html), so everything else —
+which pages are OCR'd, the graft, the audit, the report — is unchanged, and it also works on its
+own: `ocrmypdf --plugin ocrmypdf_paddle.py -l jpn+eng in.pdf out.pdf`.
+
+Measured on two scanned Japanese wiring manuals, against text read off the page images by eye:
+
+| | diagram labels found (28) | wrong Japanese chars | printed lines read exactly (63) |
+|---|---|---|---|
+| **PaddleOCR PP-OCRv6** | **25** | **3** | **57** |
+| Tesseract `jpn+eng` | 14 | 13 | 46 |
+| ABBYY FineReader (the files' own layers) | 19 | 45 | 42 |
+
+Its one measured weakness is dense, leader-dotted contents pages, where it can drop whole lines
+that Tesseract keeps. It reads Japanese, Chinese and English — not Cyrillic, so a Russian file
+stays on Tesseract. Speed: ~75 s a page on a CPU, ~12 s on a GTX 1060 through DirectML (same
+text). Language detection still runs through Tesseract, so Tesseract stays installed either way.
 
 ### Verification
 

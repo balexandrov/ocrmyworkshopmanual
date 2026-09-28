@@ -32,6 +32,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+# --ocr-engine paddle. For a GPU, install onnxruntime-directml (Windows, any DirectX 12 card)
+# or onnxruntime-gpu (CUDA) INSTEAD of onnxruntime — they are one package under three names.
+paddle = ["rapidocr", "onnxruntime"]
 
 [project.urls]
 Homepage = "https://github.com/balexandrov/ocrmyworkshopmanual"
@@ -44,7 +47,7 @@ combine-manual = "combine_manual:main"
 
 [tool.setuptools]
 py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual",
-              "pdffonts", "pdflinks", "pdfspaces", "pdfwatermark"]
+              "pdffonts", "pdflinks", "pdfspaces", "pdfwatermark", "ocrmypdf_paddle"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ocrmyworkshopmanual.__version__" }
