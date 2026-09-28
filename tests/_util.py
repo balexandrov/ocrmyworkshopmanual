@@ -353,6 +353,42 @@ def make_ocr_layer_pdf(path: Path, npages: int = 4, dpi: int = 200) -> Path:
     return path
 
 
+def make_engine_layer_pdf(path: Path, npages: int = 4, dpi: int = 200,
+                          line=lambda k, j: f'Circuit {k + 1}.{j} harness connector '
+                                            f'pin {k * 10 + j} to ground') -> Path:
+    """A scan made searchable by a desktop OCR engine, in the shape ABBYY FineReader writes:
+    the page stream is `q /Fg Do Q` — the scan wrapped in an image-only Form XObject — then
+    ONE BT..ET that sets `3 Tr` once and places each line with its own Tf/Tm.
+
+    Measured on a 138-page ABBYY-made Japanese manual: 137 pages have exactly this stream,
+    and the Form holds nothing but `q 558 0 0 756 0 0 cm /Im0 Do Q`. The wrapper is the part
+    `make_ocr_layer_pdf` lacks, and it matters: a Form on the page is also where publisher
+    TEXT hides (see `make_form_wrapped_pdf`), so an image-only one must not be mistaken for it.
+    `line(k, j)` is the text of line j on page k."""
+    import pikepdf
+    make_scan_pdf(path, npages=npages, dpi=dpi)
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf:
+        for k, page in enumerate(pdf.pages):
+            mb = [float(v) for v in page.mediabox]
+            res = page.obj.Resources
+            (iname, img), = list(res.XObject.items())
+            form = pikepdf.Stream(pdf, f'q {mb[2]:g} 0 0 {mb[3]:g} 0 0 cm {iname} Do Q '
+                                  .encode())
+            form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+            form.BBox = pikepdf.Array(mb)
+            form.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary({iname: img}))
+            res.XObject = pikepdf.Dictionary(Fg=pdf.make_indirect(form))
+            _add_font(pdf, res, '/F1')
+            txt = ''.join(f'/F1 11 Tf 1 0 0 1 60 {700 - 13 * j} Tm ({line(k, j)}) Tj '
+                          for j in range(8))
+            page.Contents = pikepdf.Stream(pdf, f'q /Fg Do Q BT 3 Tr {txt}ET '.encode())
+        pdf.save()
+    from pypdf import PdfReader
+    t = PdfReader(str(path)).pages[0].extract_text() or ''
+    assert line(0, 0) in t, f'fixture broken: {t[:200]!r}'
+    return path
+
+
 def make_born_digital_pdf(path: Path, npages: int = 3, lines_per_page: int = 25,
                           header: str = None) -> Path:
     """Hand-build a valid born-digital PDF: vector Helvetica text, NO raster images.

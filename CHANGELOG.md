@@ -5,6 +5,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a scan's own OCR layer is carried onto its compressed pages, not re-OCR'd
+
+A scan that a desktop OCR engine had already made searchable was re-OCR'd by Tesseract on the
+compress path, because the graft replaces each page's content stream and the engine's text lives
+in it. The audit then refused the file whenever Tesseract read worse than the engine. Measured on
+a 138-page, 89 MB Japanese wiring manual made searchable by ABBYY FineReader: word recall 0.20,
+FAILED, original kept. Now a page whose text is separable — every glyph it shows is invisible
+(`Tr 3`), and no Form it draws holds text of its own — has that text lifted out before the swap
+and drawn back over the compressed image, scaled from the source page's box to the new one. That
+manual now compresses to 5.3 MB (6%) with its ABBYY text intact on all 137 pages that had any,
+and only the one page without a layer is sent to OCR. Rotated or cropped pages, Type 3 fonts,
+visible text and stamp-only layers keep the old path. `--no-ocr` also keeps the layer now, where
+it used to drop it and fail the audit.
+
 ### Added — `pdffonts.py`: per-page subsets of one TrueType face merged back into one font
 
 A producer that embeds a fresh subset of the same face on every page spends most of the file on

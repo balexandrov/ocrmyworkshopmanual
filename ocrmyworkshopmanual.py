@@ -1922,6 +1922,195 @@ def _page_ocr_xobjects(page):
         return {}
 
 
+# ── carrying a source's OWN invisible text layer onto the compressed page ─────────────
+#
+# A scan that an OCR engine already made searchable used to be re-OCR'd by Tesseract on the
+# compress path, because the graft swaps each page's /Contents wholesale and the engine's
+# text lives in that very stream. The audit then compares Tesseract's text with the source's,
+# which is right, and refuses the file whenever Tesseract is the worse reader. Measured on a
+# 138-page, 89 MB Japanese Subaru wiring manual made searchable by ABBYY FineReader: word
+# recall 0.20, file FAILED, original kept — although the same scan without a text layer
+# compresses to 4.8 MB. The source's layer is the better one, so it is the one to ship.
+#
+# It can be lifted out only when it is SEPARABLE: every glyph the page shows is invisible
+# (Tr 3), so dropping everything else loses nothing a viewer can see — the render has the
+# pixels. ABBYY's shape, on 137 of those 138 pages: `q /Fg Do Q` for the scan, then ONE
+# BT..ET whose only render mode is 3. A page that shows any glyph visibly, or draws a Form
+# that holds text of its own, keeps going through OCR exactly as before.
+
+_TEXT_SHOW_OPS = frozenset(('Tj', 'TJ', "'", '"'))
+# Inside BT..ET only these are kept. Colour and line-style operators are dropped: under
+# Tr 3 they paint nothing, and keeping them would drag colour spaces and patterns (which
+# can hold images) into the text layer's resources.
+_TEXT_KEEP_OPS = frozenset(('BT', 'ET', 'Tf', 'Tc', 'Tw', 'Tz', 'TL', 'Ts', 'Tr', 'Td',
+                            'TD', 'Tm', 'T*', 'BMC', 'BDC', 'EMC', 'MP', 'DP')) | _TEXT_SHOW_OPS
+_TEXT_STATE_OPS = frozenset(('Tf', 'Tc', 'Tw', 'Tz', 'TL', 'Ts', 'Tr'))   # legal outside BT
+_TR_INVISIBLE = 3
+
+
+def _inherited_resources(page_obj):
+    """A page's /Resources, walking /Parent — the key is inheritable, and a page that
+    inherits it has none of its own."""
+    node, hops = page_obj, 0
+    while node is not None and hops < 64:
+        res = node.get('/Resources')
+        if res is not None:
+            return res
+        node, hops = node.get('/Parent'), hops + 1
+    return None
+
+
+def _forms_draw_text(res, seen: set, depth: int = 0) -> bool:
+    """True if any Form XObject reachable from `res` opens a text object. Such text is not
+    carried (only the page's own stream is), so its page must not be treated as separable.
+    Unsure — unparseable, or nested implausibly deep — answers True, the safe side."""
+    import pikepdf
+    try:
+        xo = res.get('/XObject') if res is not None else None
+        if not xo:
+            return False
+        for name in list(xo.keys()):
+            x = xo[name]
+            if x.get('/Subtype') != '/Form':
+                continue
+            key = x.objgen if x.objgen != (0, 0) else id(x)
+            if key in seen:
+                continue
+            seen.add(key)
+            if depth > 8:
+                return True
+            if any(str(op) == 'BT' for _, op in pikepdf.parse_content_stream(x)):
+                return True
+            if _forms_draw_text(x.get('/Resources'), seen, depth + 1):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _invisible_text_ops(page):
+    """(content bytes, resources) of the page's own text layer, or None if it is not
+    separable. See the section comment above for what separable means and why.
+
+    Also None for a page that is rotated or cropped: Ghostscript bakes both into the render,
+    so the compressed page's geometry no longer maps onto the source's by a plain scale,
+    and text carried across by one would land in the wrong place. Those pages go to OCR."""
+    import pikepdf
+    try:
+        obj = page.obj
+        if int(obj.get('/Rotate', 0)) % 360:
+            return None
+        mb = [float(v) for v in page.mediabox]
+        if [float(v) for v in page.cropbox] != mb:
+            return None
+        res = _inherited_resources(obj)
+        if res is None:
+            return None
+        fonts = res.get('/Font') or {}
+        # Tr does not govern a Type 3 glyph, whose procedure paints whatever it paints.
+        if any(fonts[n].get('/Subtype') == '/Type3' for n in fonts.keys()):
+            return None
+        if _forms_draw_text(res, set()):
+            return None
+        gstates = res.get('/ExtGState') or {}
+        ops = pikepdf.parse_content_stream(page)
+    except Exception:
+        return None
+    keep, stack, tr, in_bt, shown = [], [], 0, False, 0
+    for operands, op in ops:
+        o = str(op)
+        if o == 'q':
+            stack.append(tr)
+            keep.append((operands, op))
+        elif o == 'Q':
+            tr = stack.pop() if stack else 0
+            keep.append((operands, op))
+        elif o == 'cm':
+            keep.append((operands, op))
+        elif o == 'BT':
+            in_bt = True
+            keep.append((operands, op))
+        elif o == 'ET':
+            in_bt = False
+            keep.append((operands, op))
+        elif o == 'gs':
+            # Dropped, but an ExtGState can SET the font, and text drawn in it would then
+            # come out without one. Refuse rather than guess.
+            try:
+                if '/Font' in gstates[operands[0]]:
+                    return None
+            except Exception:
+                return None
+        elif o in _TEXT_SHOW_OPS:
+            if not in_bt or tr != _TR_INVISIBLE:
+                return None
+            shown += 1
+            keep.append((operands, op))
+        elif o == 'Tr':
+            try:
+                tr = int(operands[0])
+            except Exception:
+                return None
+            keep.append((operands, op))
+        elif (in_bt and o in _TEXT_KEEP_OPS) or o in _TEXT_STATE_OPS:
+            keep.append((operands, op))
+        # anything else (the scan's Do, inline images, paths, colour) is what the render has
+    if not shown:
+        return None
+    kres = pikepdf.Dictionary(Font=fonts)
+    if '/Properties' in res:
+        kres['/Properties'] = res['/Properties']
+    return pikepdf.unparse_content_stream(keep), kres
+
+
+def _carried_text_pages(pdf: Path, boiler=frozenset()) -> set:
+    """0-based indexes of the pages whose own text layer is separable and says something
+    beyond the file's repeated boilerplate — the pages to carry rather than re-OCR.
+
+    Boilerplate is discounted for the reason `has_text` discounts it: a page whose only
+    text is a stamp has no text layer worth keeping, and carrying the stamp would stand in
+    for the OCR that page actually needs."""
+    import pikepdf
+    out = set()
+    try:
+        rd = PdfReader(str(pdf))
+        with pikepdf.open(str(pdf)) as p:
+            for k, page in enumerate(p.pages):
+                if _invisible_text_ops(page) is None:
+                    continue
+                try:
+                    t = rd.pages[k].extract_text() or ''
+                except Exception:
+                    continue
+                if _minus_boilerplate(t, boiler).strip():
+                    out.add(k)
+    except Exception:
+        return set()
+    return out
+
+
+def _carried_text_xobject(pdf, page, dst_box):
+    """A Form XObject, owned by `pdf`, holding `page`'s separable text layer, mapped from
+    the source page's box onto `dst_box` (the compressed page's). Must be called BEFORE
+    the page's /Contents are replaced. None if the layer is not separable."""
+    import pikepdf
+    got = _invisible_text_ops(page)
+    if got is None:
+        return None
+    data, kres = got
+    sb = [float(v) for v in page.mediabox]
+    db = [float(v) for v in dst_box]
+    sx = (db[2] - db[0]) / (sb[2] - sb[0])
+    sy = (db[3] - db[1]) / (sb[3] - sb[1])
+    form = pikepdf.Stream(pdf, data)
+    form['/Type'] = pikepdf.Name('/XObject')
+    form['/Subtype'] = pikepdf.Name('/Form')
+    form['/BBox'] = pikepdf.Array(sb)
+    form['/Matrix'] = pikepdf.Array([sx, 0, 0, sy, db[0] - sx * sb[0], db[1] - sy * sb[1]])
+    form['/Resources'] = kres
+    return pdf.make_indirect(form)
+
+
 class GraftFailed(Exception):
     """`_graft_into_source` could not put the compressed pages back into the original.
 
@@ -1933,7 +2122,7 @@ class GraftFailed(Exception):
 
 
 def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
-                       ocr_map: dict = None) -> bool:
+                       ocr_map: dict = None, keep_text: set = frozenset()) -> bool:
     """Put the COMPRESSED page content back into the ORIGINAL document, instead of
     shipping a freshly-built PDF that carries only pages.
 
@@ -1951,7 +2140,11 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
     comp_path untouched) on any problem, so the caller just ships the rebuild.
 
     Raises `GraftFailed` with the reason rather than returning a bare False: the caller still
-    falls back to the rebuild, but the cause reaches the report instead of being discarded."""
+    falls back to the rebuild, but the cause reaches the report instead of being discarded.
+
+    `keep_text` names the pages whose OWN invisible text layer is carried across instead of
+    an OCR layer (see `_carried_text_pages`); it is lifted out of the source stream before
+    that stream is replaced."""
     try:
         import pikepdf
     except Exception as ex:
@@ -1978,6 +2171,14 @@ def _graft_into_source(src_pdf: Path, comp_path: Path, ocr_pdf: Path = None,
                 else:
                     ocr_xo = _page_ocr_xobjects(sp)
                 fp = s.copy_foreign(cp.obj)      # bring the compressed page across
+                if idx in keep_text:
+                    kept = _carried_text_xobject(s, sp, fp.get('/MediaBox', sp.mediabox))
+                    if kept is None:
+                        # The plan said separable; the page says otherwise. Shipping it
+                        # without text would be the loss this exists to prevent.
+                        raise GraftFailed(f'page {idx + 1}: source text layer is no '
+                                          f'longer separable')
+                    ocr_xo = {**ocr_xo, '/OCR-kept': kept}
                 sp.Contents = fp.Contents
                 sp.Resources = fp.Resources
                 if ocr_xo:
@@ -4393,9 +4594,17 @@ def _compress_one(src: str, dest: str, dpi: int,
         # place below, and OCR wants the grayscale version, not the 1-bit one.
         ocr_input = None
         ocr_map = None
+        # Pages whose own invisible text layer is carried onto the compressed page instead
+        # of being re-OCR'd (see `_carried_text_pages`). Worked out with or without --no-ocr:
+        # that flag means "run no OCR", and dropping a layer the source already has is not
+        # what it asks for. Pass-through pages are left out — they ship the original page,
+        # text and all, so carrying would draw the layer twice.
+        keep_text = {k for k in _carried_text_pages(render_src, frozenset(bsig.get('boiler') or ()))
+                     if k < len(classes) and classes[k].type not in _PT_PASSTHROUGH}
         if ocr:
             vec_pages = {k for k, c in enumerate(classes) if c.type == PT_VECTOR}
-            ocr_input, ocr_map = _ocr_render_pdf(work, pngs, page_dpi, dpi, vec_pages)
+            ocr_input, ocr_map = _ocr_render_pdf(work, pngs, page_dpi, dpi,
+                                                 vec_pages | keep_text)
 
         seg_pdfs = []
         i = 0
@@ -4473,6 +4682,10 @@ def _compress_one(src: str, dest: str, dpi: int,
                 pages=src_pages, lang_src=render_src)
             ocr_state = (OCR_FAILED if ocr_src is None
                          else OCR_REDO if src_had_text else OCR_NEW)
+        elif ocr and keep_text:
+            ocr_state = OCR_KEPT             # every page needing text had its own layer
+        if keep_text:
+            ocr_note += f' (source text layer kept on {len(keep_text)} of {len(pngs)} pg)'
 
         # Put the compressed pages back INTO the original document, so links, bookmarks,
         # named destinations, metadata AND the source-quality OCR layer are inherited
@@ -4485,7 +4698,7 @@ def _compress_one(src: str, dest: str, dpi: int,
         # ships, and one that lost navigation keeps its original instead.
         graft_err = None
         try:
-            grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map)
+            grafted = _graft_into_source(render_src, comp, ocr_src, ocr_map, keep_text)
         except GraftFailed as ex:
             grafted, graft_err = False, str(ex)
         kept_ocred = False
