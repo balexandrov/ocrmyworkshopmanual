@@ -39,9 +39,14 @@ any tree of scanned documents. For each page it decides the right treatment, com
   existing text layer proves
 - **A second OCR engine** for Japanese and Chinese: `--ocr-engine paddle` (PaddleOCR PP-OCRv6),
   which on Japanese wiring manuals reads far more than Tesseract — see [OCR engines](#ocr-engines)
-- **An existing OCR layer is kept**: a scan made searchable by another engine (ABBYY, say) keeps
-  that layer on its compressed pages instead of being re-OCR'd
+- **[An existing OCR layer is carried](#carried-ocr-layers)**: a scan made searchable by another
+  engine (ABBYY, say) keeps that layer on its compressed pages instead of being re-OCR'd — an
+  89 MB Japanese manual that used to FAIL now ships at 5.3 MB with its own text on every page
+- **OCR at the page's native resolution** when ocrmypdf's fixed 400 dpi floor would blow a
+  mis-sized page past the image-size limit, and **form-bearing scans** get a text layer too
 - **Stamp-aware** — a paywall watermark repeated on every page isn't mistaken for a text layer
+- **A file whose OCR fails is FAILED**, never shipped without a text layer — see
+  [When OCR fails](#when-ocr-fails)
 
 **Browser-usable cross-references**
 - **[`/GoToR` and `/Launch` links rewritten to relative `/URI`](#browser-links)** (default on) —
@@ -51,15 +56,26 @@ any tree of scanned documents. For each page it decides the right treatment, com
   file, because [that link is usually the wrong car](#browser-links)
 - Verified case-sensitively off the real directory listing before it is kept
 
-**Readable text**
-- **[Box-shaped spaces fixed](#box-spaces)** (default on) — a converter's TrueType subsets that
-  draw a box at every word gap get their space routed back to the font's own empty glyph: three
-  edits per font, one byte of font data, no layout change, audited
+**Source clean-up** (each on by default, each audited, each run on the source before any lane
+reads it — so born-digital and in-place files get it too)
+- **[Re-distributor stamps removed](#re-distributor-stamps)** — a download site's domain drawn on
+  every page is deleted at the operator that draws it, before OCR can type it into the text layer
+  on every page; the scan underneath is never touched
+- **[Box-shaped spaces fixed](#box-spaces)** — a converter's TrueType subsets that draw a box at
+  every word gap get their space routed back to the font's own empty glyph: three edits per font,
+  one byte of font data, no layout change
+- **[Per-page font subsets merged](#per-page-font-subsets-pdffontspy)** — one face embedded afresh
+  on every page becomes one font (29.3 → 11.1 MB on a 1,449-page chapter)
+- **[Encrypted PDFs decrypted](#lossless-rewrite)** on every lane — these files carry an empty
+  user password and only permission flags, which the report records as dropped
+- **[Named lines stripped](#lines-a-caller-names-pdfwatermarkpy---strip-line)** on request — a
+  printout service's running header or credit lines (`pdfwatermark.py --strip-line`)
 
 **Safety**
 - **[Born-digital detection](#born-digital-safety)** — always on, no flag to defeat it
 - **[Output verification](#verification)** — always on: page count, colour depth, font metrics,
-  text by word recall, links, bookmarks; a failed check keeps the original
+  text by word recall, links, bookmarks; a failed check keeps the original. Differential where a
+  fault can pre-exist, and fails closed when the source can't be counted
 - **Independent auditors** in `helpers/` that share no code with the tool they audit
 - Originals untouched unless you ask for `--in-place`, which stages and atomically swaps
 
@@ -74,7 +90,11 @@ any tree of scanned documents. For each page it decides the right treatment, com
 - [`scan_candidates.py`](#finding-what-to-compress) — rank folders worth compressing (read-only)
 - [`combine_manual.py`](#combining-loose-pages) — merge loose page images/PDFs into one manual
 - [`helpers/`](#sweeping-an-existing-archive) — build work lists, audit a pass, promote results
-- [Windows right-click menus](#windows-right-click-menus) for both tools
+- [`pdflinks.py`, `pdfspaces.py`, `pdffonts.py`, `pdfwatermark.py`](#how-it-works) — each
+  clean-up stage also runs on its own (report by default, `--apply` to rewrite)
+- [`ocrmypdf_paddle.py`](#ocr-engines) — the PaddleOCR engine, usable as a plain OCRmyPDF plugin
+- [Windows right-click menus](#windows-right-click-menus) — compress a PDF, compress a whole
+  folder in place, or combine a folder
 
 ---
 
@@ -166,6 +186,8 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--jpeg-quality Q` | `60` | JPEG quality for photo pages |
 | `--min-savings F` | `0.25` | Keep the compressed file only if ≥ this fraction smaller |
 | `--min-compress-mb N` | `5` | Don't re-image files smaller than this; they're passed through and reported `small size`. **OCR is still added** if missing. `0` = compress everything. See [the trade-off](#the-size-floors) |
+| `--no-decrypt` | off | Leave encrypted PDFs encrypted. Decryption is on by default so a file's lock doesn't depend on which lane it took; see [encryption](#lossless-rewrite) |
+| `--no-dewatermark` | off | Leave a [re-distributor stamp](#re-distributor-stamps) in place. Removal is on by default and costs a two-page sample on a file without one |
 | `--no-fix-spaces` | off | Leave [box-shaped spaces](#box-spaces) as they are. The fix is on by default and costs one font walk on a file without the fault |
 | `--no-merge-fonts` | off | Leave [per-page font subsets](#per-page-font-subsets-pdffontspy) as they are. Merging is on by default and costs one font walk on a file with none |
 | `--no-fix-links` | off | Don't [rewrite browser-dead cross-file links](#browser-links). The rewrite is on by default: `/GoToR` and `/Launch` become relative `/URI`, in annotations and bookmarks. Internal `/GoTo` is never touched, so re-runs are no-ops |
@@ -197,11 +219,15 @@ flagging.
 
 ### Per-page pipeline
 
-0. **Safety check first** — a born-digital (vector/text) PDF is never rendered, binarized or
+0. **Clean the source** — decrypt, [remove a re-distributor stamp](#re-distributor-stamps),
+   [fix box spaces](#box-spaces), [merge per-page font subsets](#per-page-font-subsets-pdffontspy).
+   Each stage audits its own rewrite and only changes what the later stages *read*; nothing is
+   written over the original until the finished file has been verified.
+1. **Safety check** — a born-digital (vector/text) PDF is never rendered, binarized or
    OCR'd. It is copied byte-for-byte or [re-stored losslessly](#lossless-rewrite). A corrupt one
    is repaired rather than reproduced unreadable.
-1. **Render** the page (Ghostscript, interpolated, at the page's own source resolution).
-2. **Classify** it into a page type and apply that type's strategy:
+2. **Render** the page (Ghostscript, interpolated, at the page's own source resolution).
+3. **Classify** it into a page type and apply that type's strategy:
 
    | page type | what it is | strategy |
    |---|---|---|
@@ -211,9 +237,14 @@ flagging.
    | `COLOR_LINE` | colour **line-art** — wiring diagrams, schematics | **passed through losslessly**, never binarized |
    | `VECTOR` | a born-digital page inside a scanned PDF — TOC, index, type over a scan | **passed through untouched** (vector text, colour, links survive) |
 
-3. **Merge** back in order; consecutive bitonal pages share one JBIG2.
-4. **Skip** compression entirely if a sample projects it won't shrink the file.
-5. **OCR** — add an invisible text layer with ocrmypdf, unless the file already has one.
+4. **Merge** back in order; consecutive bitonal pages share one JBIG2.
+5. **Skip** compression entirely if a sample projects it won't shrink the file.
+6. **OCR** — the original page images are read by ocrmypdf with the chosen
+   [engine](#ocr-engines) and the invisible text layer is grafted onto the compressed pages. A
+   page that already has one keeps it — [carried across](#carried-ocr-layers) when it is
+   separable, left alone when the whole file is already searchable.
+7. **Fix links** — last, on the shipped file, so every lane gets it:
+   [`/GoToR` → relative `/URI`](#browser-links).
 
 Add a page kind by adding a type + a classifier rule + a strategy (see the `PT_*` constants and
 `classify_page`).
@@ -376,6 +407,43 @@ leaves the file exactly as it was and says why.
 `pdflinks.py` is also runnable on its own — `python pdflinks.py <file-or-dir>` to report,
 `--apply` to rewrite.
 
+### Re-distributor stamps
+
+A file that has passed through a download site often carries that site's signature — a domain
+or an email address — drawn onto every page in one pass. It's content nobody asked for, OCR
+reads it out on every page, and on a landscape page it was measured sitting on top of a table
+row. `pdfwatermark.py` removes it on the **source**, before anything renders it: after a render
+the stamp is pixels. `--no-dewatermark` opts out.
+
+A stamp is text that passes **all three** of these, because dropping any one was measured to
+cause damage:
+
+1. **A marker** — it is link-like (`example.org`, `https://…`) or a converter's licence nag
+   (`trial version`). Repetition alone takes section titles, running footers, `HINT:` labels and
+   wiring-diagram terminal names out of manuals that carry no stamp at all.
+2. **It repeats** character for character, from the same operator, on consecutive pages. A
+   manual cites a real URL once; it doesn't cite it identically on every page.
+3. **It is on a line of its own.** Without this, `: www.motul.fr` in a lubricant maker's own
+   address block passes the other two tests: other text on the line came to 0–3 characters for
+   four real stamps, and 124 for that footer.
+
+Where it sits on the page is **not** a test. It used to be ("the bottom 12%"); over 3,007 archive
+files that condition prevented zero false positives, and its one effect was hiding a real stamp
+in the top margin. Nothing about a particular site is hard-coded.
+
+Removal is exact because the stamp is *drawn*, not painted in: the show-text or `Do` operator that
+draws it is deleted and every other byte of the page stays — no re-render, no re-compression.
+Only an operator whose whole text is the confirmed repeating string goes; where a stamp shares an
+operator with page content it is left, and counted. The rewrite is audited against the source
+(page, bookmark and annotation counts, every token that vanished, rendered ink on a sample of
+pages); if any check fails the stamp stays, the file is still processed, and the report says the
+stamp was found and not removed. Otherwise the note reads
+`(watermark 'example.org' removed from N pages, N operators)`.
+
+    python pdfwatermark.py book.pdf                # report
+    python pdfwatermark.py book.pdf --apply        # rewrite in place
+    python pdfwatermark.py book.pdf --pages 1-8 --dest out/
+
 ### Box spaces
 
 Some Interleaf-era converters subset their TrueType fonts at `/FirstChar 37`, so the subset's
@@ -457,8 +525,9 @@ searchable?", so a paywall watermark can't answer yes for a file with no text la
 narrow: ≥3 pages must carry text, a line must appear on ~90% of them, and the whole thing must be
 at most 4 lines / 400 chars — twenty identical lines is a form template, and a template is
 content. Applied **line-wise**, so a page with a repeated running header plus body text keeps its
-body. The stamp is **never removed**; the file is reported with `boiler=2ln/66c` in
-`scan signals`.
+body. This check removes nothing — it only stops a stamp answering the question; the file is
+reported with `boiler=2ln/66c` in `scan signals`. (A link-like stamp *is* removed, by the
+separate [de-watermark stage](#re-distributor-stamps).)
 
 ### OCR engines
 
@@ -487,6 +556,47 @@ the GTX 1060 and fills its 6 GB; `--paddle-dpi 300` reads them at 300 instead (1
 for a small measured loss — Japanese recall 0.805 against 0.819, the same 25 of 28 hand-checked
 diagram labels.
 
+```bash
+pip install rapidocr onnxruntime-directml      # or onnxruntime (CPU) / onnxruntime-gpu (CUDA)
+python ocrmyworkshopmanual.py SRC --ocr-engine paddle --paddle-dpi 300
+```
+
+The plugin gives vertical Japanese lines a text angle: without one, OCRmyPDF's renderer drops a
+line whose box doesn't fit its text, and vertical text would silently vanish from the layer. The
+engine's availability is checked at startup through the ocrmypdf the tool will actually run, so a
+missing package fails the run up front rather than every file in turn.
+
+### Carried OCR layers
+
+A scan that a desktop engine already made searchable used to be re-OCR'd on the compress path,
+because compressing replaces each page's content stream and that engine's text lives in it — and
+the audit then refused the file whenever Tesseract read worse. Measured on a 138-page, 89 MB
+Japanese manual OCR'd by ABBYY FineReader: word recall 0.20, FAILED, original kept.
+
+Now a page whose text is **separable** — every glyph it shows is invisible (`Tr 3`) and no Form
+it draws holds text of its own — has that text lifted out before the swap and drawn back over the
+compressed image, scaled from the source page's box to the new one. That manual now compresses to
+**5.3 MB (6%)** with its ABBYY text intact on all 137 pages that had any; only the one page
+without a layer is sent to OCR. The note says `(source text layer kept on 137 of 138 pg)`.
+Rotated or cropped pages, Type 3 fonts, visible text and stamp-only layers take the ordinary OCR
+path. `--no-ocr` keeps a carried layer too: "run no OCR" isn't "drop the text this file has".
+
+### OCR on awkward sources
+
+A file that isn't re-imaged (under the size floor, or not worth compressing) is OCR'd where it
+sits. Two source shapes used to leave such a file with no text layer at all:
+
+- **A page box that doesn't match its raster.** ocrmypdf rasterises at no less than 400 dpi on
+  any page carrying text or vector content, and no option lowers that. One producer laid its
+  images out at a pixel per *point*, so a 101-page manual's pages declare 70.78 × 97.19 in while
+  holding ~29 MP of scan; at 400 dpi that is 1.1 gigapixels — past PIL's 500 MP limit, so a hard failure.
+  The raster is now projected first, and a file over budget is rendered here at each page's own
+  native dpi, OCR'd, and its text grafted onto the untouched original: 0 → 4,769 characters with
+  every image byte-for-byte unchanged.
+- **A fillable form.** ocrmypdf refuses `--redo-ocr` on one. Such a file is OCR'd as a *text
+  donor* and only the donor's text is grafted on, so the shipped file keeps its own images
+  (measured: its 1-bit CCITT scans kept, +14%, against 5× if the donor were shipped).
+
 ### When OCR fails
 
 A file whose OCR produces no text layer is **FAILED**, and nothing is written for it: the text
@@ -505,6 +615,19 @@ paints an XObject the output no longer defines; font `/Widths` match their own
 `/FirstChar`..`/LastChar`; text survived by **word recall** on sampled pages (a legitimate re-OCR
 differs in character count); links and bookmarks didn't shrink. Any failure keeps the original and
 is reported on the console and in the CSV.
+
+Two rules keep the audit honest in both directions:
+
+- **Differential where a fault can pre-exist.** A fault the source already carries isn't damage
+  this run did, and failing the file over it throws away a good output *and* leaves the file
+  unsearchable. The colour check is judged on **collapse** — fatal only when an output page is
+  bilevel and its source page was not — so an MRC scan (8-bit tiles plus a 1-bit mask, passed
+  through untouched) is no longer called binarised: six such files went from FAILED to 85 → 42 MB
+  with a text layer. Flattening that same page to 1-bit still fails.
+- **Fail closed when the source can't be measured.** The source page count is asked of pypdf,
+  then pikepdf; if neither can count it, the audit fails rather than comparing the output against
+  itself. Measured: a 1,904-page manual pypdf cannot open had been replaced by a 1-page stub while
+  the run reported a 56 MB saving.
 
 For an independent second opinion, `helpers/` has two auditors that deliberately share no code
 with the tool — `verify_run.py` (colour from rendered pixels, text by word recall, structure via
@@ -663,13 +786,20 @@ bertone\general info\GI-1.jpg …            21 sections, 1246 files
 
 ### Windows right-click menus
 
-Both `.reg` files write only under `HKEY_CURRENT_USER`, so **no admin rights**; double-click to
+All three `.reg` files write only under `HKEY_CURRENT_USER`, so **no admin rights**; double-click to
 install, and each has an `-uninstall.reg`. On Windows 11 look under *Show more options*.
 
 `tools\compress-pdf-context-menu.reg` adds **Compress + OCR (searchable)** to a `.pdf`. Defaults
 mean your original is never touched — the result lands beside it as `<name> (COMPRESSED).pdf`, no
 report files appear next to it, and the window stays open so you can read the log. It installs
 under `SystemFileAssociations\.pdf`, so it survives changing your default viewer.
+
+`tools\compress-folder-context-menu.reg` adds **Compress + OCR this folder (in place)** to any
+folder. It runs the tool with defaults plus `--in-place`, over the folder **and all its
+subfolders**: every scanned PDF is overwritten with its verified, searchable result. Because that
+is destructive and one stray right-click away, `tools\compress_folder_here.cmd` asks you to type
+`YES` before it starts. No `--log` is passed, so nothing but the PDFs is written and the summary
+stays in the console window.
 
 `tools\combine-pdf-context-menu.reg` adds a **Combine PDF** submenu to any folder:
 
@@ -680,7 +810,7 @@ under `SystemFileAssociations\.pdf`, so it survives changing your default viewer
 | Combine including subfolders | `--recursive --no-compress` |
 | Combine, then compress + OCR | the full default pipeline (slow) |
 
-The registry holds one path — `tools\combine_pdf_here.cmd` — which locates the script and the
+Each registry entry holds one path — its `tools\*_here.cmd` — which locates the script and the
 repo's virtualenv relative to itself. If you move the checkout, edit that path and re-import.
 
 ---
