@@ -576,9 +576,11 @@ def detect(pdf, sample=2, give_up=8):
         per_page[i] = kept
         for run in page_runs(page, i, painters):
             dx, dy, w, h = _display(run.x, run.y, box, rot)
-            kept.append((run, dx / w if w else 0, dy / h if h else 0))
+            ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
+            kept.append((run, dx / w if w else 0, dy / h if h else 0,
+                         abs(ey - dy) > abs(ex - dx)))
         alone = _uncrowded(kept)
-        for idx, (run, _krx, _kry) in enumerate(kept):
+        for idx, (run, _krx, _kry, _vert) in enumerate(kept):
             if idx not in alone:
                 continue                           # a URL inside a sentence is not a stamp
             marker = stamp_marker(run.text)
@@ -638,21 +640,39 @@ def _uncrowded(entries):
     -- and, once companion lines were added, took 'Web' and 'development' out of the
     address block with it. That file was flagged by the ORIGINAL bottom-band rule too; the
     band never protected against this, it just happened to look elsewhere.
+
+    A run's line runs the way its text reads. Each entry is (run, rx, ry, vertical), and
+    a vertical run -- one drawn up or down the page -- is judged against everything that
+    starts in its COLUMN, not on its baseline. Measured on a Toyota A442F repair manual
+    whose `WWW.ALL-TRANS.BY` is written bottom-to-top in the top-left margin of all 142
+    pages: its start point, at y 0.957, shares a baseline with the running header
+    (`INTRODUCTION`, `-`, `ABBREVIATIONS USED IN THIS MANUAL`), so the header counted as
+    its line and the file was reported clean. Nothing else starts in its column.
+
+    A horizontal run is judged exactly as before, against every run on its baseline
+    whichever way that one reads. A vertical run is judged against every run starting in
+    its column, horizontal ones included, and NO LONGER against its baseline -- which is
+    the loosening, and it is the right one: text across the page at the height where a
+    vertical run happens to start is not on its line. The marker and repeat tests are
+    unchanged, and they are what keep a manual's own rotated labels out.
     """
-    order = sorted(range(len(entries)), key=lambda i: entries[i][2])
     out = set()
-    for a, i in enumerate(order):
-        ry = entries[i][2]
-        n = 0
-        for step in (-1, 1):                       # walk out until the line ends
-            b = a + step
-            while 0 <= b < len(order) and abs(entries[order[b]][2] - ry) <= _SAME_LINE:
-                n += len(entries[order[b]][0].text.strip())
-                if n > _LINE_NEIGHBOURS:
-                    break
-                b += step
-        if n <= _LINE_NEIGHBOURS:
-            out.add(i)
+    for axis, vertical in ((2, False), (1, True)):
+        order = sorted(range(len(entries)), key=lambda i: entries[i][axis])
+        for a, i in enumerate(order):
+            if entries[i][3] != vertical:
+                continue
+            at = entries[i][axis]
+            n = 0
+            for step in (-1, 1):                   # walk out until the line ends
+                b = a + step
+                while 0 <= b < len(order) and abs(entries[order[b]][axis] - at) <= _SAME_LINE:
+                    n += len(entries[order[b]][0].text.strip())
+                    if n > _LINE_NEIGHBOURS:
+                        break
+                    b += step
+            if n <= _LINE_NEIGHBOURS:
+                out.add(i)
     return out
 
 
@@ -678,9 +698,9 @@ def _companions(hits, per_page, sample):
     if not stamp_texts:
         return []
 
-    anchors = {}                                   # page -> [(rx, ry)] of the stamp itself
+    anchors = {}                                   # page -> [(rx, ry, vertical)] of the stamp
     for i, runs in per_page.items():
-        spots = [(rx, ry) for run, rx, ry in runs if run.text in stamp_texts]
+        spots = [(rx, ry, v) for run, rx, ry, v in runs if run.text in stamp_texts]
         if spots:
             anchors[i] = spots
     if not anchors:
@@ -689,10 +709,14 @@ def _companions(hits, per_page, sample):
     near = collections.defaultdict(list)
     for i, spots in anchors.items():
         alone = _uncrowded(per_page[i])
-        for idx, (run, rx, ry) in enumerate(per_page[i]):
+        for idx, (run, rx, ry, v) in enumerate(per_page[i]):
             if run.text in stamp_texts or idx not in alone:
                 continue
-            if any(max(abs(rx - ax), abs(ry - ay)) <= _ADJACENT for ax, ay in spots):
+            # A block is written one way. Measured on a synthetic A442F-shaped page: a
+            # vertical margin stamp starting 0.047 from a constant running header made
+            # the header its "companion", and removal deleted the header from every page.
+            if any(v == av and max(abs(rx - ax), abs(ry - ay)) <= _ADJACENT
+                   for ax, ay, av in spots):
                 near[run.text].append((i, rx, ry))
 
     out = []

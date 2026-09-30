@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a stamp written up the margin is found, and a header beside it is never taken
+
+A stamp drawn bottom-to-top in a page margin was judged against the text on the baseline where
+it happens to start. Measured on a Toyota A442F repair manual stamped `WWW.ALL-TRANS.BY` up the
+top-left margin of all 142 pages: the running header starts on that baseline, so the stamp
+looked crowded and the file was reported clean — as were three more books from the same site,
+while 30 others, with no header at that height, were cleaned. A vertical run is now judged
+against its own column. The first version of the fix then made a constant running header 0.047
+from the stamp its "companion" and deleted it from every page of a test file, so a companion
+must now read the same way as the stamp: a stamping tool writes its block in one direction.
+
 ### Changed — a file whose OCR fails is FAILED, not shipped without a text layer
 
 When OCR produced no text layer, the file was still written — compressed, or its original images
