@@ -47,7 +47,8 @@ combine-manual = "combine_manual:main"
 
 [tool.setuptools]
 py-modules = ["ocrmyworkshopmanual", "scan_candidates", "combine_manual",
-              "pdffonts", "pdflinks", "pdfspaces", "pdfwatermark", "ocrmypdf_paddle"]
+              "pdffonts", "pdflinks", "pdfspaces", "pdfwatermark", "pdfrepair",
+              "ocrmypdf_paddle"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ocrmyworkshopmanual.__version__" }

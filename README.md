@@ -69,7 +69,8 @@ any tree of scanned documents. For each page it decides the right treatment, com
 - `combine_manual.py` merges loose page images/PDFs into one manual; `scan_candidates.py` ranks
   folders worth compressing; `helpers/` builds work lists, audits a pass and promotes results
 - `pdflinks.py`, `pdfspaces.py`, `pdffonts.py`, `pdfwatermark.py` run each clean-up stage on its
-  own; `ocrmypdf_paddle.py` is the paddle engine as a plain OCRmyPDF plugin
+  own; `pdfrepair.py` gives pages back fonts/images/graphics states their content uses but their
+  resources lack; `ocrmypdf_paddle.py` is the paddle engine as a plain OCRmyPDF plugin
 - Windows right-click menus: compress a PDF, compress a folder in place, combine a folder
 
 ---
