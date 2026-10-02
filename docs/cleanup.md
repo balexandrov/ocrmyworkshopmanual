@@ -58,6 +58,13 @@ cause damage:
    address block passes the other two tests: other text on the line came to 0–3 characters for
    four real stamps, and 124 for that footer.
 
+A stamping tool sometimes writes a block, not a line — a nag line beside the URL. Such a
+**companion** line goes only where it sits **beside** the confirmed stamp, on the same reading
+direction, and it must sit there on pages spread through the book, not just the first few. Matched
+on its text alone, a body-text "Result" that happened to sit by the footer stamp on pages 1 and 2
+of a 42,638-page RAV4 printout was taken from the middle of page 7,753 too; the audit refused the
+file and the stamp stayed on every page.
+
 Where it sits on the page is **not** a test. It used to be ("the bottom 12%"); over 3,007 archive
 files that condition prevented zero false positives, and its one effect was hiding a real stamp
 in the top margin. Nothing about a particular site is hard-coded.

@@ -137,6 +137,63 @@ def test_a_line_that_changes_per_page_is_never_a_companion(tmp_path):
     assert _labels(f) == ['www.example-stamp.org']
 
 
+def _coincidence_pdf(path, npages=12, word='Result:'):
+    """A stamped book where a body-text word happens to sit beside the stamp on the first
+    two pages only, and appears in the body, far from the stamp, on a later page.
+
+    The shape of a 42,638-page RAV4 printout: "Result:" sat within reach of the footer
+    stamp on pages 1 and 2, became a companion, and removing it by text alone took a real
+    "Result:" off page 7,753 -- the audit refused the file, and every page kept its stamp.
+    """
+    pdf = pikepdf.Pdf.new()
+    for k in range(npages):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        U._add_font(pdf, U._sub_dict(page.obj, '/Resources'), '/NxF0')
+        ops = f' q BT /NxF0 11 Tf 1 0 0 1 200 400 Tm (Step {k + 1}: check the connector.) Tj ET Q'
+        ops += ' q BT /NxF0 8 Tf 1 0 0 1 20 24 Tm (www.example-stamp.org) Tj ET Q'
+        if k < 2:                                  # beside the stamp, by coincidence
+            ops += f' q BT /NxF0 8 Tf 1 0 0 1 20 40 Tm ({word}) Tj ET Q'
+        elif k == npages - 3:                      # the real one, in the body
+            ops += f' q BT /NxF0 11 Tf 1 0 0 1 200 380 Tm ({word}) Tj ET Q'
+        page.contents_add(pikepdf.Stream(pdf, (ops + chr(10)).encode('latin1')),
+                          prepend=False)
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def test_a_word_beside_the_stamp_on_the_front_pages_only_is_no_companion(tmp_path):
+    """Two front pages are enough to settle what the stamp IS, not what goes with it. A
+    companion must sit beside the stamp on pages through the whole book."""
+    f = _coincidence_pdf(tmp_path / 'coincidence.pdf')
+    assert _labels(f) == ['www.example-stamp.org']
+
+
+def test_a_companion_is_removed_only_where_it_sits_beside_the_stamp(tmp_path):
+    """The removal half: even a confirmed companion goes only from beside the stamp. The
+    same text in the body of a page is the manual's, and stays."""
+    pdf = pikepdf.Pdf.new()
+    for k in range(4):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        U._add_font(pdf, U._sub_dict(page.obj, '/Resources'), '/NxF0')
+        ops = (' q BT /NxF0 8 Tf 1 0 0 1 20 24 Tm (www.example-stamp.org) Tj ET Q'
+               ' q BT /NxF0 8 Tf 1 0 0 1 20 34 Tm (Shared by a stranger) Tj ET Q')
+        if k == 3:
+            ops += ' q BT /NxF0 11 Tf 1 0 0 1 200 400 Tm (Shared by a stranger) Tj ET Q'
+        page.contents_add(pikepdf.Stream(pdf, (ops + chr(10)).encode('latin1')),
+                          prepend=False)
+    f = tmp_path / 'companion.pdf'
+    pdf.save(str(f))
+    pdf.close()
+    assert _labels(f) == ['Shared by a stranger', 'www.example-stamp.org']
+
+    with pikepdf.open(str(f)) as p:
+        hits, _ = W.detect(p)
+        flags, _painters, _skip = W.flagged_on_page(p.pages[3], 3, hits)
+    assert sum(len(v) for v in flags.values()) == 2, \
+        'page 4: the stamp and its companion beside it, not the body-text copy'
+
+
 def test_companions_need_a_confirmed_stamp_to_anchor_to(tmp_path):
     """The rule cannot reach a file with no stamp: with nothing confirmed there is no
     anchor, so a repeating footer on a clean file stays put."""

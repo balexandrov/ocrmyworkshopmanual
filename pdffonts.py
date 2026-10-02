@@ -473,6 +473,10 @@ def _pdfs_under(path):
 
 
 def main(argv=None):
+    try:                                                # non-ASCII names in a cp1252 console
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:                                   # pragma: no cover
+        pass
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[3].strip(),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('path')

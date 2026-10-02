@@ -13,6 +13,7 @@ python combine_manual.py "…\Honda\--Engines--\Haynes_ZC_Manual"
 python combine_manual.py FOLDER --dry-run              # print the page order, write nothing
 python combine_manual.py FOLDER --no-compress          # raw combined PDF only
 python combine_manual.py FOLDER --recursive            # include subfolders, add bookmarks
+python combine_manual.py FOLDER --recursive --outline tree   # bookmark every folder and file
 python combine_manual.py FOLDER --skip-unrecoverable   # combine readable parts, name the rest
 python combine_manual.py FOLDER --no-repair            # refuse instead of repairing
 ```
@@ -39,6 +40,11 @@ python combine_manual.py FOLDER --no-repair            # refuse instead of repai
 - Images are wrapped **losslessly** (img2pdf embeds the JPEG as-is).
 - `--recursive` orders files and subfolders together at every level, so a subfolder's pages take
   their place in the sequence, and each section folder gets a **bookmark** at its first page.
+  `--outline tree` bookmarks **every folder at every depth and every file by its name**, nested —
+  for an export of one PDF per document, whose folder and file names are the only structure it
+  has (a Lexus IS350 TIS export: 3,456 documents under system/subject folders, which one bookmark
+  per top folder left unfindable). Titles are names on disk and no pages are added; the finished
+  file is read back and the run prints how many of the outline items it carries.
 - **The result is verified before the tool exits**: it must reopen and carry exactly the sum of
   its inputs' page counts, counted over the pages actually merged. Staged to a `.part` and moved
   into place only once that passes.
@@ -47,6 +53,27 @@ python combine_manual.py FOLDER --no-repair            # refuse instead of repai
 bertone\general info\GI-1.jpg …            21 sections, 1246 files
   ->  bertone.pdf   1220 pages, 135.0 MB, 26 low-res duplicates dropped, 21 bookmarks
 ```
+
+## Repairing missing page resources (`pdfrepair.py`)
+
+A manual assembled from many prints by a re-distributor can have pages whose content draws with a
+font, image or graphics state their own `/Resources` don't hold — `/F4 12 Tf` on a page whose
+`/Font` has only `/F5`. A viewer then substitutes: on a 2022–2024 Honda Civic FE/FL download, page
+1501 rendered as letter-shifted gibberish ("+RZ WR XVH WKLV PDQXDO" for "How to use this manual")
+and lost two images. `pdfrepair.py` is a standalone tool, not a pipeline stage:
+
+```bash
+python pdfrepair.py book.pdf                        # report only
+python pdfrepair.py book.pdf --apply --dest out/    # write the repaired copy into out/
+python pdfrepair.py book.pdf --apply                # repair in place
+```
+
+For each name a page uses and lacks, the same name is looked for on the nearest pages (`--reach`,
+default 10 either side), and each candidate is **tried**: it is kept only if the page then lacks
+fewer names and, for a font, its extracted text carries more real words — a wrong font gives
+gibberish again, so it cannot win. Only the page's resource dictionary changes, and only to point
+at objects already in the file. A page whose `/Contents` points at something that isn't content
+(19 such pages in the same Civic) has lost its content; those are listed, not guessed at.
 
 ## Windows right-click menus
 

@@ -548,6 +548,34 @@ def section_bookmarks(files, folder: Path) -> dict:
     return marks if len(marks) > 1 else {}
 
 
+def tree_bookmarks(files, folder: Path) -> dict:
+    """{index into `files`: [(level, title), ...]} -- the WHOLE tree as an outline (--outline tree):
+    each folder at every depth, at the first page it contributes, and each file under its own
+    name (its stem), nested.
+
+    For a manual exported as a folder per system and subject, one PDF per document -- a Lexus
+    IS350 TIS export: `Drivetrain\\AA81E AUTOMATIC TRANSMISSION  TRANSAXLE\\COMPONENTS.pdf`, 3,456
+    of them. One bookmark per top folder (the default) leaves 3,456 documents with no way to find
+    any of them; the folder and file names ARE the structure, so they are the outline. As with the
+    sections, the titles are names on disk and the order is the page order: navigation, never a
+    claim about content, and no pages are added."""
+    marks, seen = {}, set()
+    for i, p in enumerate(files):
+        try:
+            rel = p.relative_to(folder)
+        except ValueError:
+            continue
+        items = []
+        for depth in range(len(rel.parts) - 1):
+            key = rel.parts[:depth + 1]
+            if key not in seen:
+                seen.add(key)
+                items.append((depth, rel.parts[depth]))
+        items.append((len(rel.parts) - 1, p.stem))
+        marks[i] = items
+    return marks
+
+
 def bookmark_preview(files, marks: dict) -> list:
     """[(title, 1-based page), ...] PREDICTED from the inputs' page counts — for --dry-run,
     which merges nothing. An image is one page and a PDF contributes its own count, exactly
@@ -571,6 +599,16 @@ def outline_pages(pdf: Path) -> list:
                 for it in r.outline if not isinstance(it, list)]
     except Exception:
         return []
+
+
+def outline_count(pdf: Path) -> int:
+    """Every outline item, at every depth, read back out of a finished PDF (-1 if unreadable)."""
+    def walk(items):
+        return sum(walk(it) if isinstance(it, list) else 1 for it in items)
+    try:
+        return walk(PdfReader(win_long(pdf)).outline)
+    except Exception:
+        return -1
 
 
 _PAGE_OBJ = re.compile(rb'/Type\s*/Page(?![s/\w])')
@@ -687,7 +725,7 @@ class CombineFailed(Exception):
     above all do not delete the sources on the strength of it."""
 
 
-def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -> int:
+def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, tree: dict = None) -> int:
     """Merge `files` (images and/or PDFs), in the given order, into out_pdf. Returns the
     page count. Raises CombineFailed if an input cannot be read or merged, or if the
     result does not carry exactly the sum of the inputs' pages.
@@ -699,7 +737,10 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
     never a page number, because the page a file lands on is something only the merge knows.
     Outline items are catalogue objects, not pages, so they cannot move the count that guards
     this merge: `want` is still computed from the inputs before anything is appended, and it
-    is still checked against the REOPENED result at the end."""
+    is still checked against the REOPENED result at the end.
+
+    `tree` (see `tree_bookmarks`) does the same for a nested outline: index -> [(level, title)];
+    each item hangs under the last item one level up."""
     want, bad = (0, []) if not verify else expected_pages(files)
     if bad:
         # EVERY unreadable input, by FULL path, one per line — never a count plus the first.
@@ -721,17 +762,20 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
         except Exception as ex:
             raise CombineFailed(f'{p}: {type(ex).__name__}: {ex}') from ex
         if bookmarks and i in bookmarks:
-            marks.append((bookmarks[i], first, p))
+            marks.append((0, bookmarks[i], first, p))
+        if tree and i in tree:
+            marks.extend((lvl, title, first, p) for lvl, title in tree[i])
     # Page indices come from the merge, not from a prediction: a section whose first part is a
     # 9-page PDF must not have its bookmark land 8 pages early. An index past the end can only
     # mean that input contributed NO pages — a 0-page PDF, which `expected_pages` counts as 0
     # and which would otherwise merge invisibly — so it is refused, not quietly moved.
     n_pages = len(w.pages)
-    for title, pg, src in marks:
+    parents = {}
+    for lvl, title, pg, src in marks:
         if pg >= n_pages:
             raise CombineFailed(f'bookmark {title!r} would point past the end (page {pg + 1} '
                                 f'of {n_pages}): {src} contributed no pages')
-        w.add_outline_item(title, pg)
+        parents[lvl] = w.add_outline_item(title, pg, parent=parents.get(lvl - 1) if lvl else None)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_pdf.with_suffix(out_pdf.suffix + '.part')
     try:
@@ -750,6 +794,10 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None) -
 
 
 def main():
+    try:                                                # non-ASCII names in a cp1252 console
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:                                   # pragma: no cover
+        pass
     ap = argparse.ArgumentParser(
         description='Combine a folder of page images/PDFs into one PDF named after the folder.',
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -778,6 +826,11 @@ def main():
                          'of refusing the whole manual. The skipped parts and the pages they '
                          'held are named in full; the files themselves are left where they are. '
                          'Opt-in, so an unattended run never ships a manual with pages missing')
+    ap.add_argument('--outline', choices=('sections', 'tree'), default='sections',
+                    help="with --recursive: 'sections' (default) bookmarks each top-level folder; "
+                         "'tree' bookmarks every folder at every depth and every file by its name, "
+                         'nested -- for an export of one PDF per document, whose folder and file '
+                         'names are the only structure it has')
     ap.add_argument('--no-compress', action='store_true',
                     help='produce the raw combined PDF only; skip the compress + OCR step')
     ap.add_argument('--language', default='auto',
@@ -812,7 +865,8 @@ def main():
                       f'so doc-id order was NOT applied]' if missing else
                       '  [order: publisher doc id]')
 
-    marks = section_bookmarks(files, folder)
+    tree = tree_bookmarks(files, folder) if args.outline == 'tree' else None
+    marks = {} if tree is not None else section_bookmarks(files, folder)
     out_pdf = folder.parent / (folder.name + '.pdf')
     n_img = sum(1 for p in files if not is_pdf(p))
     n_pdf = len(files) - n_img
@@ -912,11 +966,14 @@ def main():
                     print(f'  --skip-unrecoverable: leaving out {len(broken)} part(s)'
                           + (f', ~{lost} page(s)' if lost else '')
                           + ' — the files stay on disk, untouched')
-                    marks = section_bookmarks(files, folder)   # indices shifted; recompute
+                    if tree is not None:                       # indices shifted; recompute
+                        tree = tree_bookmarks(files, folder)
+                    else:
+                        marks = section_bookmarks(files, folder)
 
         print(f'\nCombining -> {out_pdf} ...', flush=True)
         try:
-            pages = combine(files, out_pdf, bookmarks=marks)
+            pages = combine(files, out_pdf, bookmarks=marks, tree=tree)
         except CombineFailed as ex:
             sys.exit(f'ERROR: combine refused: {ex}\n'
                      f'       {folder} is untouched — do NOT delete it.')
@@ -936,6 +993,10 @@ def main():
             print(f'  {r.src}'
                   + (f'  (~{r.expected} page(s), {r.recovered} salvageable)'
                      if r.expected else ''))
+    if tree:
+        want_items = sum(len(v) for v in tree.values())
+        got_items = outline_count(out_pdf)
+        print(f'Bookmarks: {got_items} of {want_items} tree item(s) present in the output')
     if marks:
         # Read back out of the finished file, like the page count. A missing bookmark is
         # reported as what it is — lost navigation — and never as lost pages.

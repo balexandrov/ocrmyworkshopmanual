@@ -572,13 +572,8 @@ def detect(pdf, sample=2, give_up=8):
     for i in range(min(n, max(sample, give_up))):
         page = pdf.pages[i]
         box, rot = _box(page), _rotation(page)
-        kept = []
+        kept = _page_entries(page, i, painters)
         per_page[i] = kept
-        for run in page_runs(page, i, painters):
-            dx, dy, w, h = _display(run.x, run.y, box, rot)
-            ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
-            kept.append((run, dx / w if w else 0, dy / h if h else 0,
-                         abs(ey - dy) > abs(ex - dx)))
         alone = _uncrowded(kept)
         for idx, (run, _krx, _kry, _vert) in enumerate(kept):
             if idx not in alone:
@@ -602,9 +597,44 @@ def detect(pdf, sample=2, give_up=8):
             if hits:
                 break
     if hits:
+        # Companions are judged on pages spread through the book as well, not only on the
+        # front pages that settled the stamp. Measured on a 42,638-page RAV4 printout: body
+        # text "Result" happened to sit within _ADJACENT of the footer stamp on both page 1
+        # and page 2, qualified as a companion, and its removal took a real "Result" out of
+        # page 7,753 -- the audit refused the file and the stamp stayed on every page. A line
+        # of a stamping tool's block sits beside the stamp on EVERY page; a coincidence
+        # does not survive a few pages from the middle and the back of the book.
+        for i in _spread(n, _COMPANION_SPREAD, skip=per_page):
+            per_page[i] = _page_entries(pdf.pages[i], i, painters)
         hits += _companions(hits, per_page, sample)
     hits.sort(key=lambda c: -len(c.pages))
     return hits, painters
+
+
+# Extra pages, spread through the book, on which a companion line must also sit beside the
+# stamp. Each costs one content-stream walk, and only on a file where a stamp was confirmed.
+_COMPANION_SPREAD = 6
+
+
+def _spread(n, k, skip=()):
+    """Up to `k` page indices spread evenly through a book of `n` pages, minus `skip`."""
+    if n <= 0 or k <= 0:
+        return []
+    picks = sorted({min(n - 1, round((j + 1) * n / (k + 1))) for j in range(k)})
+    return [i for i in picks if i not in skip]
+
+
+def _page_entries(page, page_no, painters):
+    """[(run, rx, ry, vertical)] for one page: each text run with its origin as a fraction
+    of the page AS DISPLAYED, and whether it is drawn up or down the page."""
+    box, rot = _box(page), _rotation(page)
+    kept = []
+    for run in page_runs(page, page_no, painters):
+        dx, dy, w, h = _display(run.x, run.y, box, rot)
+        ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
+        kept.append((run, dx / w if w else 0, dy / h if h else 0,
+                     abs(ey - dy) > abs(ex - dx)))
+    return kept
 
 
 # How close a line has to sit to a confirmed stamp to count as part of it, as a fraction
@@ -802,9 +832,29 @@ def flagged_on_page(page, page_no, candidates, spots=None):
             if w and h:
                 spots.setdefault(page_no, []).append((dx / w, dy / h))
 
+    # A companion line's only licence to go is that it sits BESIDE the stamp (`_companions`),
+    # so that is the only place it is taken from: never by its text alone, anywhere on the
+    # page. Matching on text alone deleted a body-text "Result" from the middle of a RAV4
+    # printout's page 7,753 because a "Result" had sat beside the stamp on pages 1 and 2.
+    def _spot(run):
+        dx, dy, w, h = _display(run.x, run.y, box, rot)
+        ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
+        return (dx / w if w else 0, dy / h if h else 0, abs(ey - dy) > abs(ex - dx))
+
+    anchors = []
+    for r in runs:
+        m = stamp_marker(r.text)
+        if m and any(c.matches(m, r.text) for c in candidates):
+            anchors.append(_spot(r))
+
+    def _beside(run):
+        rx, ry, v = _spot(run)
+        return any(v == av and max(abs(rx - ax), abs(ry - ay)) <= _ADJACENT for ax, ay, av in anchors)
+
     for run in runs:
         if any(c.matches_text(run.text) for c in candidates):
-            _take(run)                             # a companion line of a confirmed stamp
+            if _beside(run):
+                _take(run)                         # a companion line of a confirmed stamp
             continue
         link = stamp_marker(run.text)
         if not link:
@@ -1761,6 +1811,13 @@ def _pdfs_under(path):
 
 
 def main(argv=None):
+    # The report quotes removed text, which can hold anything: a RAV4 printout's mis-encoded
+    # "(c)" ("В©") raised in a cp1252 console AFTER the removal, and the run exited 1 as if it
+    # had failed. Same guard as pdflinks.
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:                                   # pragma: no cover
+        pass
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[3].strip(),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('path')

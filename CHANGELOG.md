@@ -5,6 +5,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a stamp's companion line is taken only from beside the stamp
+
+A line qualified as a stamp's companion by sitting next to it on the first sampled pages, and was
+then removed wherever its text appeared. Measured on a 42,638-page RAV4 printout: body text
+"Result" sat within reach of the footer stamp on pages 1 and 2, and its removal took a real
+"Result" out of page 7,753 — the audit refused the file, so the stamp stayed on every page. A
+companion must now also sit beside the stamp on six pages spread through the book, and on each
+page it is removed only where it sits beside a stamp occurrence, in the same reading direction.
+
+### Added — `combine_manual.py --outline tree`
+
+With `--recursive`, bookmarks every folder at every depth and every file by its name, nested,
+instead of one bookmark per top folder. For an export of one PDF per document — a Lexus IS350 TIS
+export of 3,456 documents — the folder and file names are the only structure there is. The
+finished file is read back and the run reports how many outline items it carries.
+
+### Fixed — non-ASCII text no longer crashes the stage tools on a Windows console
+
+`pdfwatermark.py`, `pdfspaces.py`, `pdffonts.py` and `combine_manual.py` write UTF-8 to stdout.
+A RAV4 printout's mis-encoded "(c)" in a removal report raised in a cp1252 console AFTER the file
+was written, and the run exited 1 as if it had failed. Same guard `pdflinks.py` already had.
+
 ### Changed — born-digital PDFs are optimised in every way: duplicate images merged, images JPEG'd
 
 A browser "Print to PDF" of a web manual is born-digital — real text, never rasterised — yet its

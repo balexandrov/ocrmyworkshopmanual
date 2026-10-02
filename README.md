@@ -241,7 +241,7 @@ failed check keeps the original and says why. See [Safety](docs/safety.md).
 | [Safety](docs/safety.md) | born-digital detection, output verification, resilience (timeouts, repair, duplicates, crashes) |
 | [Working with a large archive](docs/archive.md) | in-place mode, the size floors and what they cost, finding what to compress |
 | [Run report](docs/report.md) | the CSV's columns and their fixed vocabularies |
-| [Companion tools](docs/tools.md) | `combine_manual.py`, Windows right-click menus |
+| [Companion tools](docs/tools.md) | `combine_manual.py`, `pdfrepair.py`, Windows right-click menus |
 | [Compression tuning](docs/tuning.md) | render, threshold, photo and JBIG2 details, size comparison |
 
 ## Config file

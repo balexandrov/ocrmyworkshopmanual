@@ -439,6 +439,40 @@ def test_a_bookmark_after_a_multipage_pdf_lands_on_the_right_page(tmp_path):
     assert CM.outline_pages(out) == [('a', 1), ('b', 4)]
 
 
+def test_the_tree_outline_bookmarks_every_folder_and_every_document(tmp_path):
+    """--outline tree: an export of one PDF per document (a Lexus IS350 TIS export, 3,456 of
+    them) has no structure but its folder and file names, so every folder at every depth and
+    every file becomes a nested bookmark, on the page the merge actually put it."""
+    root = tmp_path / 'IS350'
+    _pdf(root / 'Drivetrain' / 'AA81E' / 'COMPONENTS.pdf', npages=2)
+    _pdf(root / 'Drivetrain' / 'AA81E' / 'REMOVAL.pdf', npages=1)
+    _pdf(root / 'Engine' / '2GR-FSE ENGINE CONTROL' / 'P0101.pdf', npages=3)
+    files = CM.collect(root, recursive=True)
+    tree = CM.tree_bookmarks(files, root)
+    assert [it for i in sorted(tree) for it in tree[i]] == [
+        (0, 'Drivetrain'), (1, 'AA81E'), (2, 'COMPONENTS'), (2, 'REMOVAL'),
+        (0, 'Engine'), (1, '2GR-FSE ENGINE CONTROL'), (2, 'P0101')]
+    out = tmp_path / 'IS350.pdf'
+    assert CM.combine(files, out, tree=tree) == 6
+    assert CM.outline_count(out) == 7
+
+    from pypdf import PdfReader
+    r = PdfReader(str(out))
+    top = r.outline
+    assert [str(it.title) for it in top if not isinstance(it, list)] == ['Drivetrain', 'Engine']
+    pages = {}
+
+    def walk(items, depth):
+        for it in items:
+            if isinstance(it, list):
+                walk(it, depth + 1)
+            else:
+                pages[(depth, str(it.title))] = r.get_destination_page_number(it) + 1
+    walk(top, 0)
+    assert pages == {(0, 'Drivetrain'): 1, (1, 'AA81E'): 1, (2, 'COMPONENTS'): 1, (2, 'REMOVAL'): 3,
+                     (0, 'Engine'): 4, (1, '2GR-FSE ENGINE CONTROL'): 4, (2, 'P0101'): 4}
+
+
 def test_a_flat_folder_gets_no_bookmarks(tmp_path):
     """So every non-recursive run — the default, and what the Explorer menu uses — produces
     exactly the PDF it produced before this existed."""
