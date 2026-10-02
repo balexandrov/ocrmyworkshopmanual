@@ -18,9 +18,11 @@ One worker process per file → uses all cores. Originals are never touched; out
 mirrors the source tree under a sibling "(COMPRESSED)" folder (or --dest).
 Skip-if-exists, so it is resumable. Typical result on clean B&W scans: ~8-12% of
 original, crisp, and full-text searchable.
-NOTE: for SCANNED/image PDFs only. A SAFETY CHECK (looks_born_digital) detects
-born-digital/vector/text PDFs and copies them to dest byte-for-byte, untouched
-(never rasterised) — always on, no flag to disable it. A run reports to the console
+NOTE: the raster pipeline is for SCANNED/image PDFs only. A SAFETY CHECK
+(looks_born_digital) detects born-digital/vector/text PDFs, which are never rasterised —
+always on, no flag to disable it. They are optimised in place of rendering instead:
+re-stored smaller, duplicate images merged, and losslessly stored images re-encoded as
+JPEG (--born-digital, default `full`). A run reports to the console
 and writes NO files but its output; pass --log to keep a report (which file, what
 was done, final stats) in the current folder, or --log PATH to place it.
 
@@ -3471,12 +3473,29 @@ def _resolve_language(src_p: Path, work: Path, language: str, timeout: int = 0) 
 # spends far more encoder time choosing matches (shortest-path over the real bit cost rather
 # than greedy) and block splits. It is ~700x slower than zlib-9, so it is opt-in.
 #
-# WHAT THIS CANNOT DO, BY CONSTRUCTION: no page is rendered, no image is re-encoded, no
-# drawing operator is touched. Tiers 1 and 3 change only compression, and each recompressed
-# stream is accepted only if it decodes to the identical bytes. Tier 2 is the only tier that
-# alters the object graph, which is why the document-level checks below exist.
+# WHAT THESE TIERS CANNOT DO, BY CONSTRUCTION: no page is rendered and no drawing operator
+# is touched. Tiers 1 and 3 change only compression, and each recompressed stream is accepted
+# only if it decodes to the identical bytes. Tier 2 is the only tier that alters the object
+# graph, which is why the document-level checks below exist. The image steps further down
+# (dedupe, and the JPEG pass that runs by default) are the ones that touch images.
 
 LOSSLESS_MIN_SAVINGS = 0.03   # under 3% smaller, keep the original bytes — not worth a rewrite
+
+# --born-digital LEVEL -> what the lane does. One option instead of seven: each level is the
+# previous one plus one more step, so there is no combination to get wrong.
+#   copy      byte-for-byte, the lane is off
+#   lossless  tiers 1+2 and duplicate-image merge: every page decodes to identical bytes
+#   full      + JPEG the losslessly stored images (the default)
+#   max       + zopfli (tier 3)
+BORN_DIGITAL_LEVELS = ('copy', 'lossless', 'full', 'max')
+
+
+def born_digital_options(level: str) -> dict:
+    """compress_one / preview_one keyword arguments for a --born-digital level."""
+    i = BORN_DIGITAL_LEVELS.index(level)
+    return {'lossless': i >= 1,
+            'recompress_images': RECOMPRESS_IMAGES_Q if i >= 2 else 0,
+            'lossless_zopfli': i >= 3}
 ZOPFLI_ITERATIONS = 15        # what the 19.9% was measured at; higher buys little for the time
 _ZOPFLI_BATCH_BYTES = 40 * 1024 * 1024   # decoded bytes in flight per batch, to bound memory
 # qpdf GENERATES these two itself on save, so recompressing them here is thrown away.
@@ -3671,7 +3690,7 @@ def _lossless_sample_pages(n: int, want: int = 12) -> list:
     return sorted(i for i in idx if 0 <= i < n)
 
 
-def _lossless_fingerprint(pdf_path: Path) -> dict:
+def _lossless_fingerprint(pdf_path: Path, exact_images: bool = True) -> dict:
     """Everything the guard compares, or None if it cannot be read.
 
     None means SKIP THE REWRITE — never "passed". That distinction is the whole reason this
@@ -3740,7 +3759,18 @@ def _lossless_fingerprint(pdf_path: Path) -> dict:
                     if xo is not None:
                         for k in sorted(xo.keys()):
                             try:
-                                h.update(xo[k].read_bytes())
+                                x = xo[k]
+                                if not exact_images and x.get('/Subtype') == '/Image':
+                                    # A JPEG'd image cannot match its pixels, by design, so
+                                    # hold it to what the page relies on: it is still there,
+                                    # same size, same colour space. Never the ICC stream's
+                                    # objgen -- qpdf renumbers objects on save.
+                                    cs = x.get('/ColorSpace')
+                                    cs = cs[0] if isinstance(cs, pikepdf.Array) else cs
+                                    h.update(f'{x.get("/Width")}x{x.get("/Height")} {cs} '
+                                             f'{x.get("/BitsPerComponent")}'.encode())
+                                else:
+                                    h.update(x.read_bytes())
                             except Exception:
                                 pass
                     per[i] = (h.hexdigest(), str(pg.obj.get('/MediaBox')),
@@ -3753,10 +3783,10 @@ def _lossless_fingerprint(pdf_path: Path) -> dict:
         return None
 
 
-def _lossless_verify(base: dict, out_p: Path) -> str:
+def _lossless_verify(base: dict, out_p: Path, exact_images: bool = True) -> str:
     """'' if the rewrite is sound, else a short description of WHAT differs (for the report).
     Cheapest discriminators first, so a broken output costs a page count, not a full re-read."""
-    got = _lossless_fingerprint(out_p)
+    got = _lossless_fingerprint(out_p, exact_images)
     if got is None:
         return 'output could not be re-opened for verification'
     for key, what in (('pages', 'page count'), ('annots', 'annotation count'),
@@ -3869,12 +3899,227 @@ def _zopfli_streams(pdf, workers: int, progress=None) -> dict:
     return stat
 
 
+# ── Duplicate images and JPEG re-encoding (born-digital) ─────────────────────
+#
+# Measured on a 2019-2022 Acura RDX body chapter (252,384,487 bytes, 1,941 pages), split out
+# of a 977 MB Firefox "Print to PDF" capture (cairo 1.17.4): 240 MB of the file is 2,528
+# illustrations -- shaded renders, the website's JPEGs decoded by cairo and stored back as
+# 8-bit Flate RGB. Fonts are 4.2 MB, page content 1.9 MB. Tiers 1-3 above cannot touch that:
+# the source rewrite scored 2.7% and was discarded. Over all 2,265 unique images:
+#
+#     stored now (Flate, no predictor)                  217.4 MB
+#     exact PNG predictors + zlib 9                     200.7 MB   (92%)
+#     ... with near-neutral images forced to gray       ~78% on a 10% sample
+#     JPEG 2000 reversible                              144% -- BIGGER
+#     JPEG quality 85                                    62.8 MB   (29%)
+#     plus 159 images stored 2-6 times over              22.2 MB   of exact duplicates
+#
+# Not one of the 2,036 RGB images was EXACTLY neutral (the old JPEG's chroma noise survives),
+# so "store the grey ones as grey" is not lossless here either. Re-JPEGing an image that was
+# a JPEG to begin with is one more generation, not a rasterisation: no page is rendered, no
+# operator is touched, text and links stay vector. At q85 the in-image labels and blue link
+# text were indistinguishable from the original at 3x zoom. Both run by default: these are
+# diagrams, not photographs, and a second JPEG generation costs nothing a reader of a workshop
+# manual can see. `--born-digital lossless` stops before the JPEG pass.
+
+RECOMPRESS_IMAGES_Q = 85         # JPEG quality the `full` born-digital level uses
+_IMG_JPEG_MIN_PIXELS = 64 * 64   # below this the JPEG header outweighs any saving
+_IMG_JPEG_MAX_RATIO = 0.9        # keep the original unless the JPEG is 10% smaller
+# Floor on PSNR(original, decoded JPEG). Not a quality knob -- a "did the encode go wrong"
+# check (wrong channel count, mis-sized buffer, an image that is really a mask), which on
+# real data also turns away small text-heavy charts -- see _recompress_images' docstring.
+_IMG_JPEG_MIN_PSNR = 30.0
+# Single filters whose decoded output is plain samples we can re-encode. A chain, or an
+# image codec (DCT, JPX, JBIG2, CCITT), is left exactly as it is.
+_IMG_REENCODE_FILTERS = ('None', '/FlateDecode', '/LZWDecode', '/RunLengthDecode')
+
+
+def _image_key(o, canon: dict):
+    """Identity of an image XObject for de-duplication: its raw stream bytes plus its
+    dictionary, with indirect references named by the CANONICAL object they map to -- so two
+    images whose /SMask objects were themselves duplicates compare equal on the next pass."""
+    import pikepdf
+
+    def norm(v):
+        if isinstance(v, (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)) and v.is_indirect:
+            return ('ref', canon.get(v.objgen, v.objgen))
+        if isinstance(v, pikepdf.Array):
+            return tuple(norm(x) for x in v)
+        if isinstance(v, pikepdf.Dictionary):
+            return tuple(sorted((str(k), norm(v[k])) for k in v.keys()))
+        return repr(v)
+    d = tuple(sorted((str(k), norm(o.stream_dict[k])) for k in o.stream_dict.keys()
+                     if k not in ('/Length', '/DL')))
+    return hashlib.sha256(o.read_raw_bytes()).digest(), d
+
+
+def _dedupe_images(pdf) -> dict:
+    """Point every reference to a byte-identical image XObject at one copy. Exact: the kept
+    object has the same raw bytes AND the same dictionary as every one it replaces, so no
+    page can draw differently; qpdf then drops the unreferenced copies on save.
+
+    Measured on the RDX body chapter: 421 image objects in 159 groups, 22.2 MB redundant --
+    the same illustration placed on several pages, each placement embedded afresh by cairo.
+
+    Runs to a fixpoint (at most 4 passes) because an image's identity includes its /SMask
+    reference: duplicate masks must merge first before their images can compare equal."""
+    import pikepdf
+    images = [o for o in pdf.objects
+              if isinstance(o, pikepdf.Stream) and o.get('/Subtype') == '/Image']
+    canon, saved = {}, 0
+    for _ in range(4):
+        seen, merged = {}, 0
+        for o in images:
+            if o.objgen in canon:
+                continue
+            k = _image_key(o, canon)
+            first = seen.get(k)
+            if first is None:
+                seen[k] = o.objgen
+            else:
+                canon[o.objgen] = first
+                saved += len(o.read_raw_bytes())
+                merged += 1
+        if not merged:
+            break
+    if not canon:
+        return {'groups': 0, 'objects': 0, 'bytes': 0, 'merged': set()}
+    by_gen = {o.objgen: o for o in images}
+    target = {g: by_gen[c] for g, c in canon.items()}
+
+    def fix(container):
+        # Direct children only: an indirect child is a top-level object of its own, and
+        # `pdf.objects` visits it separately.
+        if isinstance(container, pikepdf.Array):
+            for i, v in enumerate(container):
+                if isinstance(v, pikepdf.Object) and v.is_indirect:
+                    if v.objgen in target:
+                        container[i] = target[v.objgen]
+                elif isinstance(v, (pikepdf.Array, pikepdf.Dictionary)):
+                    fix(v)
+            return
+        d = container.stream_dict if isinstance(container, pikepdf.Stream) else container
+        for k in list(d.keys()):
+            v = d[k]
+            if isinstance(v, pikepdf.Object) and v.is_indirect:
+                if v.objgen in target:
+                    d[k] = target[v.objgen]
+            elif isinstance(v, (pikepdf.Array, pikepdf.Dictionary)):
+                fix(v)
+
+    for o in pdf.objects:
+        if isinstance(o, (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)):
+            fix(o)
+    for pg in pdf.pages:     # page dicts are in pdf.objects too; this is belt and braces
+        fix(pg.obj)
+    # `merged` is for the caller, not the report: those objects stay in `pdf.objects` until
+    # save drops them, and the JPEG pass must not spend an encode on each dead copy.
+    return {'groups': len(set(canon.values())), 'objects': len(canon), 'bytes': saved,
+            'merged': set(canon)}
+
+
+def _image_components(o) -> int:
+    """Samples per pixel for the colour spaces we will JPEG, else 0 (leave it alone)."""
+    import pikepdf
+    cs = o.get('/ColorSpace')
+    if cs == '/DeviceRGB':
+        return 3
+    if cs == '/DeviceGray':
+        return 1
+    if (isinstance(cs, pikepdf.Array) and len(cs) == 2 and cs[0] == '/ICCBased'
+            and isinstance(cs[1], pikepdf.Stream) and int(cs[1].get('/N', 0)) in (1, 3)):
+        return int(cs[1]['/N'])
+    return 0
+
+
+def _recompress_images(pdf, quality: int, skip=frozenset()) -> dict:
+    """Re-encode losslessly-stored 8-bit gray/RGB image XObjects as baseline JPEG. LOSSY;
+    on by default at q85 (the `full` level of --born-digital).
+
+    Left alone, by construction:
+      * anything used as an /SMask or /Mask -- alpha and stencils must stay exact;
+      * images with a colour-key /Mask array (JPEG noise breaks exact-colour keying), a
+        /Decode array, /ImageMask, or a bit depth other than 8;
+      * colour spaces other than Device/ICC gray and RGB (indexed, CMYK, Lab, separations);
+      * images already in an image codec or a filter chain;
+      * images under _IMG_JPEG_MIN_PIXELS, or where the JPEG is not 10% smaller.
+    Each JPEG is decoded again and must match the original at PSNR >= _IMG_JPEG_MIN_PSNR,
+    or the original is kept. The image's dictionary keeps its size and colour space, so the
+    page draws the same picture at the same place; only /Filter changes.
+
+    Measured on the RDX body chapter at q85 (2,266 unique images after dedupe): 2,086
+    re-encoded, 205.4 -> 58.2 MB; whole file 240.7 -> 67.0 MB in 46 s. PSNR over every
+    candidate: p1 26.2, p5 31.1, median 40.5 dB. The 30 rejected by the floor (0.94 MB) were
+    all small text-heavy line-art charts -- exactly where JPEG rings around lettering -- so
+    the floor keeps those Flate. 89 more were not 10% smaller as JPEG, 60 were tiny. An
+    independent pypdf comparison found all 1,941 pages' text, all 7,760 link annotations,
+    all 100 bookmarks and every image placement identical to the source."""
+    import io
+    import pikepdf
+    masks = set()
+    for o in pdf.objects:
+        if isinstance(o, pikepdf.Stream):
+            for k in ('/SMask', '/Mask'):
+                m = o.get(k)
+                if isinstance(m, pikepdf.Stream):
+                    masks.add(m.objgen)
+    st = {'images': 0, 'jpeg': 0, 'before': 0, 'after': 0, 'kept': 0, 'min_psnr': None}
+    for o in pdf.objects:
+        if (not isinstance(o, pikepdf.Stream) or o.get('/Subtype') != '/Image'
+                or o.objgen in skip):
+            continue
+        st['images'] += 1
+        if (o.objgen in masks or o.get('/ImageMask') or isinstance(o.get('/Mask'), pikepdf.Array)
+                or o.get('/Decode') is not None or int(o.get('/BitsPerComponent', 0)) != 8):
+            continue
+        nc = _image_components(o)
+        if not nc or str(o.get('/Filter')) not in _IMG_REENCODE_FILTERS:
+            continue
+        w, h = int(o.get('/Width', 0)), int(o.get('/Height', 0))
+        if w * h < _IMG_JPEG_MIN_PIXELS:
+            continue
+        old = len(o.read_raw_bytes())
+        try:
+            data = o.read_bytes()
+        except Exception:
+            continue                      # undecodable: leave it exactly as it is
+        if len(data) < w * h * nc:
+            continue
+        a = np.frombuffer(data, np.uint8)[: w * h * nc].reshape(h, w, nc)
+        im = Image.fromarray(a[..., 0] if nc == 1 else a, 'L' if nc == 1 else 'RGB')
+        buf = io.BytesIO()
+        im.save(buf, 'JPEG', quality=quality, optimize=True)
+        new = buf.getvalue()
+        if len(new) >= old * _IMG_JPEG_MAX_RATIO:
+            st['kept'] += 1
+            continue
+        back = np.asarray(Image.open(io.BytesIO(new)), dtype=np.float32).reshape(h, w, nc)
+        mse = float(np.mean((back - a.astype(np.float32)) ** 2))
+        psnr = 99.0 if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+        if psnr < _IMG_JPEG_MIN_PSNR:
+            st['kept'] += 1
+            continue
+        o.write(new, filter=pikepdf.Name('/DCTDecode'))
+        for k in ('/DecodeParms', '/DL'):
+            if k in o.stream_dict:
+                del o.stream_dict[k]
+        st['jpeg'] += 1
+        st['before'] += old
+        st['after'] += len(new)
+        st['min_psnr'] = psnr if st['min_psnr'] is None else min(st['min_psnr'], psnr)
+    if st['min_psnr'] is not None:
+        st['min_psnr'] = round(st['min_psnr'], 1)
+    return st
+
+
 def lossless_signature(src_p: Path) -> dict:
     """What a lossless rewrite has to work with, WITHOUT rewriting anything: bytes sitting in
     unfiltered streams, and bytes of non-catalog XMP. Used by --dry-run so a preview can say
     which born-digital files are worth a pass, instead of guessing from file size."""
     import pikepdf
-    sig = {'unfiltered': 0, 'xmp': 0, 'streams': 0}
+    # `images` = raw bytes of the images the JPEG pass could take: 8-bit gray/RGB
+    # stored in a lossless filter. An upper bound -- masks and tiny images are still skipped.
+    sig = {'unfiltered': 0, 'xmp': 0, 'streams': 0, 'images': 0}
     try:
         with pikepdf.open(str(src_p)) as p:
             keep = p.Root.get('/Metadata')
@@ -3898,6 +4143,10 @@ def lossless_signature(src_p: Path) -> dict:
                     sig['unfiltered'] += raw
                 if o.objgen in xmp_ids:
                     sig['xmp'] += raw
+                if (o.get('/Subtype') == '/Image' and int(o.get('/BitsPerComponent', 0)) == 8
+                        and _image_components(o)
+                        and str(o.get('/Filter')) in _IMG_REENCODE_FILTERS):
+                    sig['images'] += raw
     except Exception as ex:
         sig['error'] = repr(ex)[:120]
     return sig
@@ -3906,7 +4155,8 @@ def lossless_signature(src_p: Path) -> dict:
 def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
                      zopfli: bool = False, workers: int = 1,
                      min_savings: float = LOSSLESS_MIN_SAVINGS,
-                     progress=None, decrypt: bool = True) -> dict:
+                     progress=None, decrypt: bool = True, dedupe_images: bool = True,
+                     jpeg_quality: int = RECOMPRESS_IMAGES_Q) -> dict:
     """Rewrite a born-digital PDF smaller without changing what any page draws.
 
     Returns {'ok': bool, 'new': bytes_or_0, 'note': str, 'skip': str, 'stats': {...}}.
@@ -3915,11 +4165,16 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
 
     An ENCRYPTED source is handled, not refused: it is opened with one of _LOSSLESS_PASSWORDS
     and saved DECRYPTED, dropping the owner permission flags. Never called for one whose
-    baseline cannot be captured."""
+    baseline cannot be captured.
+
+    `jpeg_quality` > 0 is the one LOSSY step this lane can take (see _recompress_images):
+    image pixels then change, so the guard compares image geometry instead of image bytes,
+    and the note says plainly that images were re-encoded."""
     import pikepdf
     orig = src_p.stat().st_size
     stats = {}
-    base = _lossless_fingerprint(src_p)
+    exact = not jpeg_quality
+    base = _lossless_fingerprint(src_p, exact)
     if base is None:
         # Distinguish "locked" from "corrupt": both fail the fingerprint, but only one of them
         # is fixable by knowing a password, and a report that calls them the same thing sends
@@ -3951,6 +4206,19 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
                 stats['decrypted'] = True
             if strip_xmp:
                 stats['xmp'] = _strip_private_xmp(p)
+            # Dedupe BEFORE the JPEG pass, so each shared illustration is encoded once.
+            merged = set()
+            if dedupe_images:
+                # A partial run is still exact (each swap points at an identical object),
+                # so a failure here costs the saving, not the file.
+                try:
+                    stats['dedupe'] = _dedupe_images(p)
+                    merged = stats['dedupe'].pop('merged')
+                except Exception as ex:
+                    stats['dedupe_error'] = repr(ex)[:120]
+            if jpeg_quality:
+                stats['jpeg'] = _recompress_images(p, jpeg_quality, merged)
+                stats['jpeg']['quality'] = jpeg_quality
             if zopfli:
                 stats['zopfli'] = _zopfli_streams(p, workers, progress)
             # compress_streams=True is REQUIRED even after zopfli, and its interaction with
@@ -3989,7 +4257,7 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
             return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
                     'skip': f'{pct} and no smaller once decrypted' if stats.get('decrypted')
                             else pct}
-        bad = _lossless_verify(base, tmp)
+        bad = _lossless_verify(base, tmp, exact)
         if bad:
             tmp.unlink(missing_ok=True)
             return {'ok': False, 'new': 0, 'stats': stats, 'note': '',
@@ -4010,8 +4278,18 @@ def lossless_rewrite(src_p: Path, out_p: Path, strip_xmp: bool = True,
 
 def _lossless_note(orig: int, new: int, stats: dict) -> str:
     """The per-file note: what the rewrite did, in the terms a reviewer would audit it in."""
-    bits = [f'lossless rewrite: {mb(orig):.2f} -> {mb(new):.2f} MB '
+    j = stats.get('jpeg')
+    lossy = bool(j and j['jpeg'])
+    bits = [f'{"rewrite" if lossy else "lossless rewrite"}: {mb(orig):.2f} -> {mb(new):.2f} MB '
             f'({100 * (1 - new / orig):.0f}% smaller)']
+    if lossy:
+        bits.append(f'LOSSY: {j["jpeg"]}/{j["images"]} images re-encoded as JPEG '
+                    f'q{j["quality"]} {mb(j["before"]):.1f} -> {mb(j["after"]):.1f} MB '
+                    f'(min PSNR {j["min_psnr"]} dB); text and vectors untouched')
+    d = stats.get('dedupe')
+    if d and d['objects']:
+        bits.append(f'{d["objects"]} duplicate images merged into {d["groups"]} '
+                    f'({mb(d["bytes"]):.1f} MB)')
     if stats.get('decrypted'):
         bits.append('source was encrypted; output is DECRYPTED and its owner permission '
                     'flags are dropped (page content unchanged and still verified)')
@@ -4036,8 +4314,9 @@ def _lossless_note(orig: int, new: int, stats: dict) -> str:
 # reviewer asks of every row. Kept as constants so a value can never be spelled two ways.
 
 # WHY the file ended up compressed or kept (pairs with the `action` column).
-REASON_BORN = 'born digital'          # vector/text PDF — never rasterised, copied as-is
-REASON_LOSSLESS = 'lossless rewrite'  # born-digital, stored smaller; page content untouched
+REASON_BORN = 'born digital'          # vector/text PDF — never rasterised; nothing to gain, copied
+REASON_LOSSLESS = 'lossless rewrite'  # born-digital, stored smaller; no image re-encoded either
+REASON_IMAGES = 'images recompressed' # born-digital, stored smaller AND images JPEG'd (lossy)
 REASON_SMALL = 'small size'           # under the compression floor — not worth the work
 REASON_ALREADY = 'already compressed' # re-encoding it would not (or did not) pay off
 REASON_COMPRESSIBLE = 'compressible'  # it did beat the min-savings bar, so we shipped it
@@ -4371,6 +4650,7 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless_zopfli: bool = False,
                   lossless_min_savings: float = LOSSLESS_MIN_SAVINGS,
                   lossless_min_mb: float = None,
+                  dedupe_images: bool = True, recompress_images: int = RECOMPRESS_IMAGES_Q,
                   decrypt: bool = True, dewatermark: bool = True,
                   fix_spaces: bool = True, merge_fonts: bool = True) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
@@ -4494,7 +4774,7 @@ def _compress_one(src: str, dest: str, dpi: int,
             # is an atomic os.replace), the temp is verified against that fingerprint, and only
             # then does it take the original's name. A failure at any step leaves the original
             # untouched and byte-identical, because nothing has been written over it yet.
-            # `--no-lossless` opts out; a corrupt-but-repairable source still refuses in place
+            # `--born-digital copy` opts out; a corrupt-but-repairable source still refuses in place
             # (above), because THAT rewrite would change page content rather than storage.
             if not in_place:
                 dest_p.parent.mkdir(parents=True, exist_ok=True)
@@ -4503,7 +4783,7 @@ def _compress_one(src: str, dest: str, dpi: int,
             # rewriting every one of an archive's born-digital files, and under --in-place not
             # worth the churn of replacing them.
             #
-            # --lossless-min-mb overrides it, and the two floors have to be separable because
+            # --born-digital-min-mb overrides it, and the two floors have to be separable because
             # they price different risks. The raster floor prices a LOSSY re-encode of every
             # page; this one prices churn on a file that is merely small. Measured on 200
             # sampled sub-5 MB manuals (mean 51 KB): -17% in 24 s across 6 workers, which
@@ -4523,17 +4803,20 @@ def _compress_one(src: str, dest: str, dpi: int,
                     copy_from, dest_p, strip_xmp=lossless_strip_xmp,
                     zopfli=lossless_zopfli,
                     workers=_ocr_jobs_budget(copy_from, src_pages) if lossless_zopfli else 1,
-                    min_savings=lossless_min_savings, decrypt=decrypt)
+                    min_savings=lossless_min_savings, decrypt=decrypt,
+                    dedupe_images=dedupe_images, jpeg_quality=recompress_images)
                 lnote, lstats, lskip = lres['note'], lres['stats'], lres['skip']
+                lossy = bool((lstats.get('jpeg') or {}).get('jpeg'))
                 if lres['ok']:
                     return {'src': src_p.name, 'orig': orig, 'new': lres['new'],
                             'pages': bsig.get('sampled'), 'kept': False, 'err': None,
                             # A lossless rewrite IS a compression — it just did not go
                             # near the raster pipeline. `reason` is what says which.
                             'action': 'compressed', 'signals': bsig,
-                            'reason': REASON_LOSSLESS, 'lang': '',
+                            'reason': REASON_IMAGES if lossy else REASON_LOSSLESS, 'lang': '',
                             'ocr_state': OCR_KEPT if bsig.get('text_pages') else OCR_NA,
-                            'note': (f' (born-digital: rewritten losslessly'
+                            'note': (f' (born-digital: rewritten'
+                                     f'{", images re-encoded as JPEG" if lossy else " losslessly"}'
                                      f'{" in place" if in_place else ""}; '
                                      f'scan_frac={bsig.get("scan_frac")})'
                                      + rnote + lnote + dnote),
@@ -5005,6 +5288,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  sauvola_k: float, photo_descreen: float,
                  ocr: bool = True, language: str = 'auto',
                  min_compress_mb: float = None, lossless: bool = True,
+                 recompress_images: int = RECOMPRESS_IMAGES_Q,
                  dewatermark: bool = True, fix_spaces: bool = True,
                  merge_fonts: bool = True) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
@@ -5063,6 +5347,11 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                     lnote = (f' (would attempt a lossless rewrite: '
                              f'{mb(lsig["unfiltered"]):.1f} MB in unfiltered streams, '
                              f'{mb(lsig["xmp"]):.1f} MB of private XMP')
+                if recompress_images and lsig.get('images'):
+                    lnote = (f' (would re-encode up to {mb(lsig["images"]):.1f} MB of '
+                             f'losslessly stored images as JPEG q{recompress_images}'
+                             + (lnote.replace(' (would attempt', '; and attempt')
+                                if 'lossless rewrite' in lnote else ''))
             return {'src': src_p.name, 'orig': orig, 'new': orig, 'pages': bsig.get('sampled'),
                     'kept': True, 'err': None, 'action': 'born_digital', 'signals': bsig,
                     'reason': REASON_BORN, 'lang': '',
@@ -5461,8 +5750,9 @@ def main():
                     help='OVERWRITE each PDF with its compressed/OCR result IN PLACE (no output '
                          'tree). Non-PDF files, folder structure and already-optimal files are '
                          'left untouched; unchanged files are not rewritten. A born-digital PDF '
-                         'is never rasterised, but IS re-stored smaller when the lossless '
-                         'rewrite verifies against it (--no-lossless to leave it alone). '
+                         'is never rasterised, but IS replaced by its optimised copy (re-stored, '
+                         'duplicate images merged, images JPEG\'d) when that verifies against it '
+                         '(--born-digital copy to leave it alone). '
                          'DESTRUCTIVE — back up first. A report is written only where --log '
                          'says, never among the manuals. Cannot be combined with --dest.')
     ap.add_argument('--no-decrypt', action='store_true',
@@ -5526,36 +5816,22 @@ def main():
                          'case-sensitively against the real directory listing before it is '
                          'kept — a URL that opens on Windows and 404s on a Linux server is '
                          'worse than the inert link it replaced')
-    ap.add_argument('--no-lossless', action='store_true',
-                    help='do not attempt the lossless rewrite on born-digital PDFs — copy them '
-                         'out byte-for-byte, as this tool did before. The rewrite re-stores a '
-                         'vector/text PDF smaller (Flate its unfiltered streams, bundle its '
-                         'objects, drop per-illustration authoring XMP) without rendering, '
-                         're-encoding or touching one drawing operator, and its output is kept '
-                         'only if it verifies against the source AND beats --lossless-min-savings')
-    ap.add_argument('--lossless-keep-xmp', action='store_true',
-                    help='in the lossless rewrite, compress the per-illustration XMP metadata '
-                         'instead of deleting it. Measured on a 7,376-page Subaru manual: '
-                         'keeping it costs 96 MB (-39%% instead of -57%%). What it buys you is '
-                         'which Illustrator/EPS file each drawing came from, plus its preview '
-                         'thumbnail — provenance for source files an archive does not have')
-    ap.add_argument('--lossless-zopfli', action='store_true',
-                    help='in the lossless rewrite, re-Deflate every stream with zopfli. Output '
-                         'is an ordinary Deflate stream that every reader reads at normal speed; '
-                         'it just costs ~700x more encoder time. Worth ~21%% beyond the rest '
-                         '(233 -> 186 MB on that Subaru manual, 23 min on 11 cores). Intended '
-                         'for a one-time archive pass, not a routine run')
-    ap.add_argument('--lossless-min-mb', type=float, default=None, metavar='N',
-                    help='size floor for the lossless rewrite alone (default: whatever '
+    ap.add_argument('--born-digital', choices=BORN_DIGITAL_LEVELS, default='full',
+                    metavar='LEVEL',
+                    help='what to do with a born-digital (vector/text) PDF, which is never '
+                         'rasterised. copy = byte-for-byte. lossless = re-store it smaller with '
+                         'every page decoding to identical bytes: Flate unfiltered streams, '
+                         'bundle objects, drop per-illustration authoring XMP, merge duplicate '
+                         'images. full (default) = lossless + re-encode losslessly stored images '
+                         f'as JPEG q{RECOMPRESS_IMAGES_Q} -- 252 -> 67 MB on a browser-printed '
+                         'manual. max = full + re-Deflate with zopfli (~12%% more, ~700x the CPU, '
+                         'needs `pip install zopfli`; for a one-time archive pass). The result is '
+                         'kept only if it verifies against the source and is 3%% smaller')
+    ap.add_argument('--born-digital-min-mb', type=float, default=None, metavar='N',
+                    help='size floor for born-digital optimisation alone (default: whatever '
                          '--min-compress-mb is). Lower it to sweep small born-digital files '
-                         'without letting the RASTER path re-image small scans — the two '
-                         'floors price different risks: --min-compress-mb prices a lossy '
-                         're-encode of every page, this one prices churn on a file that is '
-                         'merely small. Measured on 200 sampled sub-5 MB manuals: -17%%')
-    ap.add_argument('--lossless-min-savings', type=float, default=LOSSLESS_MIN_SAVINGS,
-                    help=f'discard the lossless rewrite unless it is at least this much smaller '
-                         f'(default {LOSSLESS_MIN_SAVINGS:.2f} = 3%%); the original bytes are '
-                         f'then copied instead')
+                         'without letting the RASTER path re-image small scans -- the two floors '
+                         'price different risks. Measured on 200 sampled sub-5 MB manuals: -17%%')
     ap.add_argument('--dpi', type=int, default=200, help='render dpi (default 200; good speed/quality)')
     ap.add_argument('--workers', type=int, default=_default_workers(),
                     help='parallel worker processes (default: one per PHYSICAL core — the '
@@ -5672,11 +5948,10 @@ def main():
         print('ERROR: --in-place cannot be combined with --dest', file=sys.stderr); sys.exit(1)
     # Fail HERE, not per-file: a missing optional encoder must not turn into 4,000 rows that
     # quietly did tier 1+2 while the run was asked for tier 3.
-    if args.lossless_zopfli and not _zopfli_available():
-        print('ERROR: --lossless-zopfli needs the `zopfli` package (pip install zopfli)',
+    if args.born_digital == 'max' and not _zopfli_available():
+        print('ERROR: --born-digital max needs the `zopfli` package (pip install zopfli)',
               file=sys.stderr); sys.exit(1)
-    if args.lossless_zopfli and args.no_lossless:
-        print('ERROR: --lossless-zopfli contradicts --no-lossless', file=sys.stderr); sys.exit(1)
+    bd = born_digital_options(args.born_digital)
     if args.from_list and args.src:
         print('ERROR: pass EITHER a src OR --from-list, not both', file=sys.stderr); sys.exit(1)
     if not args.from_list and not args.src:
@@ -5830,9 +6105,8 @@ def main():
     elif args.in_place:
         print('*** IN-PLACE: source PDFs will be OVERWRITTEN with their compressed/OCR '
               'result. Non-PDFs, structure & already-optimal files untouched. A born-digital '
-              'PDF is never rasterised, but IS replaced by a verified smaller re-store of '
-              'itself' + (' — disabled here by --no-lossless' if args.no_lossless else
-                          ' (--no-lossless to leave it alone)') + '. ***\n')
+              'PDF is never rasterised, but IS replaced by a verified, optimised copy of '
+              f'itself (--born-digital {args.born_digital}; copy to leave it alone). ***\n')
 
     set_below_normal_priority()
     if not args.dry_run:
@@ -5900,7 +6174,8 @@ def main():
                                   args.min_savings, args.sauvola_k, args.photo_descreen,
                                   ocr=not args.no_ocr, language=args.language,
                                   min_compress_mb=args.min_compress_mb,
-                                  lossless=not args.no_lossless,
+                                  lossless=bd['lossless'],
+                                  recompress_images=bd['recompress_images'],
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,
                                   merge_fonts=not args.no_merge_fonts,
@@ -5916,11 +6191,8 @@ def main():
                                   args.photo_descreen,
                                   args.timeout, args.in_place,
                                   min_compress_mb=args.min_compress_mb,
-                                  lossless=not args.no_lossless,
-                                  lossless_strip_xmp=not args.lossless_keep_xmp,
-                                  lossless_zopfli=args.lossless_zopfli,
-                                  lossless_min_savings=args.lossless_min_savings,
-                                  lossless_min_mb=args.lossless_min_mb,
+                                  lossless_min_mb=args.born_digital_min_mb,
+                                  **bd,
                                   decrypt=not args.no_decrypt,
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,

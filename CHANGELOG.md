@@ -5,6 +5,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — born-digital PDFs are optimised in every way: duplicate images merged, images JPEG'd
+
+A browser "Print to PDF" of a web manual is born-digital — real text, never rasterised — yet its
+bulk is illustrations: cairo decodes each website JPEG and stores it back as lossless 8-bit Flate
+RGB, and embeds an illustration afresh every time it is placed. Measured on a 252 MB, 1,941-page
+Acura RDX chapter: 240 MB was such images, 22.2 MB of them exact duplicates. The lossless lane
+could not touch them (the source scored 2.7% and was discarded), and nothing lossless does much:
+exact PNG predictors reach 92%, and JPEG 2000 reversible is *bigger*. Not one RGB image was
+exactly neutral, so "store the grey ones as grey" is not lossless either.
+
+- **Duplicate images are merged** in the born-digital rewrite, by default. Exact: the kept object
+  has the same bytes and dictionary as each one it replaces.
+- **Losslessly stored images are re-encoded as JPEG q85, by default.** These are diagrams, not
+  photographs. 8-bit gray/RGB images only. Masks, indexed/CMYK images, anything already in an image codec, tiny
+  images and any image whose JPEG is not 10% smaller stay as they are, and each JPEG must decode
+  back within 30 dB PSNR of the original. The guard compares image geometry instead of image
+  bytes, and the report's `reason` is `images recompressed`, never `lossless rewrite`. Born-digital
+  files are still never rasterised, but no longer described as left untouched.
+- **One option instead of seven: `--born-digital copy|lossless|full|max`** (default `full`).
+  `copy` replaces `--no-lossless`; `lossless` stops before the JPEG step; `max` replaces
+  `--lossless-zopfli`. **Removed:** `--no-lossless`, `--lossless-zopfli`, `--lossless-keep-xmp`
+  (private XMP is always dropped from `lossless` up), `--lossless-min-savings` (fixed at 3%).
+  **Renamed:** `--lossless-min-mb` → `--born-digital-min-mb`. A config file still naming a removed
+  key gets a warning and the key is ignored — so an old `no_lossless = true` no longer applies;
+  write `born_digital = "copy"`.
+
+On that chapter, with the defaults: **240.7 → 67.0 MB (−72%) in 46 s**; 2,086 images re-encoded, 262
+duplicates merged; the 30 images the PSNR floor turned away were all small text-heavy charts. An
+independent comparison found every page's text, all 7,760 link annotations and all 100 bookmarks
+identical to the source.
+
 ### Fixed — a stamp written up the margin is found, and a header beside it is never taken
 
 A stamp drawn bottom-to-top in a page margin was judged against the text on the baseline where

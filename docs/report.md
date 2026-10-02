@@ -18,12 +18,12 @@ pivots without reading the prose `note`:
 | column | values | answers |
 |---|---|---|
 | `action` | `compressed` · `kept original` · `FAILED` | What was done |
-| `reason` | `compressible` · `lossless rewrite` · `born digital` · `already compressed` · `small size` · `error` | Why |
+| `reason` | `compressible` · `images recompressed` · `lossless rewrite` · `born digital` · `already compressed` · `small size` · `error` | Why |
 | `ocr` | `new ocr` · `re-ocr` · `kept existing` · `not requested` · `failed` | What became of the text layer |
 | `language` | e.g. `eng`, `rus+eng` | Which packs OCR used (blank when none ran) |
 
-`lossless rewrite` vs `compressible` is the distinction that matters for trust: both are
-`compressed`, but the first means **no page rendered and no image re-encoded**. `re-ocr` vs
+`images recompressed` and `lossless rewrite` are born-digital files: **no page rendered**, and
+in the second no image re-encoded either. `compressible` went through the raster pipeline. `re-ocr` vs
 `new ocr` distinguishes replacing an existing text layer from giving a file its first.
 `page types` tallies the classification (`line=12 vector=3`); `scan signals` carries the
 born-digital scan's evidence (`scan_frac=0.033 scan_pages=1/30 text_pages=29 chars=8412`).

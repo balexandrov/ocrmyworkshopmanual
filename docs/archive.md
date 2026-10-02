@@ -13,7 +13,7 @@
 PDFs, so back up first.
 
 - **PDFs that compress** → overwritten with the smaller, searchable version
-- **Born-digital** → never rasterised; re-stored losslessly when that verifies, else left alone
+- **Born-digital** → never rasterised; replaced by its optimised copy (images JPEG'd) when that verifies, else left alone
 - **Already-optimal or unchanged** PDFs, **non-PDFs**, folder structure → untouched
 - Reports go only where `--log` says, never among your manuals
 
@@ -23,7 +23,7 @@ Each file is built in the **system temp dir** (not on your manuals drive), verif
 
 ## The size floors
 
-`--min-compress-mb` (default 5) prices a **lossy re-encode of every page**; `--lossless-min-mb`
+`--min-compress-mb` (default 5) prices a **lossy re-encode of every page**; `--born-digital-min-mb`
 prices **churn on a file that is merely small**. They're separate knobs for that reason — lowering
 the first to reach small born-digital files would also let the raster path re-image small scans.
 
@@ -60,4 +60,4 @@ qualified), `scan_candidates.txt` (just the paths, as a feed list), and
 ## Sweeping an existing archive
 
 A lossless pass over a whole archive — building the work list from past run reports, staging,
-auditing and promoting — is in [Lossless rewrite](lossless.md#sweeping-an-existing-archive).
+auditing and promoting — is in [Born-digital optimisation](lossless.md#sweeping-an-existing-archive).

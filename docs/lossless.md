@@ -1,15 +1,18 @@
-# Lossless rewrite
+# Born-digital optimisation
 
 [← README](../README.md) · [all docs](../README.md#documentation)
 
-A born-digital PDF is big because of **how its bytes are stored**, not what it draws — and storage
-can change without touching a drawing operator. Three tiers, on by default:
+A born-digital PDF is never rasterised, but it is optimised in every other way. It is big because
+of **how its bytes are stored**, not what it draws — and storage can change without touching a
+drawing operator. One option, `--born-digital LEVEL`, picks how far to go; each level adds a step
+to the one before:
 
-| tier | what it does | on the manual below |
+| level | adds | on the manual below |
 |---|---|---|
-| 1 | Flate the **unfiltered** streams, bundle objects into `/ObjStm`, re-Deflate at level 9 | 537.6 → 195.1 MB |
-| 2 | delete the **per-illustration** authoring XMP (`--lossless-keep-xmp` to keep it) | included above |
-| 3 | re-Deflate everything with **zopfli** (`--lossless-zopfli`, opt-in) | → ~172 MB |
+| `copy` | nothing — byte-for-byte | 537.6 MB |
+| `lossless` | Flate the **unfiltered** streams, bundle objects into `/ObjStm`, re-Deflate at level 9, delete the **per-illustration** authoring XMP, [merge duplicate images](#duplicate-images-and-jpeg) | 537.6 → 195.1 MB (measured before the merge existed) |
+| `full` (default) | re-encode losslessly stored images as [JPEG q85](#duplicate-images-and-jpeg) | not measured on this file — see [below](#duplicate-images-and-jpeg): 252 → 67 MB |
+| `max` | re-Deflate everything with **zopfli** — ~700× the CPU, a one-time archive pass | → ~172 MB |
 
 Measured on `2020 WRX - WRX STI SERVICE MANUAL G1740BE.pdf` (537,575,830 bytes, 7,376 pages,
 FrameMaker 7.2 → Distiller 9, PDF 1.4, 489,674 loose objects): **−62% in 3.2 minutes**, every
@@ -31,17 +34,18 @@ authoring chain wrote its metadata compressed:
 | 513 MB Subaru WRX (Distiller 9) | 7,710 **unfiltered** + 9,898 compressed | **−62%** |
 | 236 MB Mitsubishi L200 (Distiller 6) | 0 unfiltered, 10,235 compressed | **−8%** |
 
-**Why it can't damage a file.** No page is rendered, no image re-encoded, no operator touched.
-Tiers 1 and 3 change only compression, and a recompressed stream is accepted only if it decodes
-to identical bytes. Tier 2 is the only tier that alters the object graph. On top of that the
-output is discarded and the original bytes copied unless it beats `--lossless-min-savings` **and**
-matches the source on:
+**What is verified.** No page is rendered and no operator touched. Re-Deflating changes only
+compression, and a recompressed stream is accepted only if it decodes to identical bytes. Dropping
+XMP and merging duplicates are the only steps that alter the object graph; the JPEG step is the
+only one that changes pixels. The output is discarded and the original bytes copied unless it is
+at least 3% smaller **and** matches the source on:
 
 - page, annotation, bookmark and named-destination counts
 - **document-wide decoded content bytes and stream-part count** — not a sample; this is the check
   that caught an early version dropping 9,898 XMP streams while every count and sampled page
   still matched
-- per-page content-stream + XObject fingerprints across a spread of pages
+- per-page content-stream + XObject fingerprints across a spread of pages (with the JPEG step on,
+  an image is held to its size and colour space rather than its bytes)
 - docinfo and document XMP, compared as **parsed fields** (pikepdf renormalises the packet on
   save, so bytes would differ on every file)
 
@@ -53,6 +57,36 @@ still refuses in place, since repairing changes content rather than storage.
 **Not preserved:** Fast Web View. The linearization hint stream (a pure index) is dropped;
 relinearizing costs ~6 MB and 6× the save time and only matters for byte-range HTTP streaming.
 
+## Duplicate images and JPEG
+
+Some born-digital files are big for a reason none of the tiers above can reach: their
+illustrations. A browser **"Print to PDF"** of a web manual (cairo) decodes every website JPEG
+and stores it back as lossless 8-bit Flate RGB, and embeds an illustration afresh each time it is
+placed. On a 252 MB, 1,941-page Acura RDX chapter, 240 MB was images:
+
+| storage of those images | size |
+|---|---|
+| as found (Flate, no predictor) | 217.4 MB + 22.2 MB of exact duplicates |
+| exact PNG predictors + zlib 9 | 92% |
+| JPEG 2000 reversible | 144% — bigger |
+| **JPEG quality 85** | **29%** |
+
+- **Duplicates are merged** from the `lossless` level up. Exact — the kept copy has the same
+  bytes and dictionary as every one it replaces — so the guard is unchanged.
+- **Losslessly stored images become JPEG at quality 85** at the `full` level, the default
+  (`--born-digital lossless` keeps every image exact). These are diagrams, not photographs: at q85 the labels and link
+  text baked into an illustration were indistinguishable from the original at 3× zoom. 8-bit
+  gray/RGB images are re-encoded. Left alone: alpha masks and stencils, colour-keyed, indexed,
+  CMYK and Lab images, anything already JPEG/JPX/JBIG2/CCITT, images under 64×64, and any image
+  whose JPEG is not 10% smaller. Each JPEG must decode back within 30 dB PSNR of the original or
+  the original is kept — on real data that turns away small text-heavy charts, where JPEG rings.
+  The guard compares each image's size and colour space instead of its bytes; everything else it
+  checks is unchanged, and the row's `reason` reads `images recompressed`.
+
+On that chapter, with the defaults: **240.7 → 67.0 MB (−72%) in 46 s**, 2,086 images
+re-encoded and 262 duplicates merged. An independent pypdf comparison found every page's text,
+all 7,760 link annotations, all 100 bookmarks and every image placement identical to the source.
+
 ## Sweeping an existing archive
 
 Every born-digital file a past run touched was reported as `born digital`, so those rows already
@@ -63,7 +97,8 @@ are the inventory — no re-scan needed:
 python helpers/lossless_candidates.py --min-mb 50 --sample 8
 
 # 2. rewrite into a staging tree, so a "before" copy still exists
-python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr --log reports
+python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr --log reports \
+    --born-digital lossless   # verify_lossless.py compares pixels, so keep the images exact
 
 # 3. audit the pairs independently of the code that produced them
 python helpers/verify_lossless.py --before SRC_ROOT --after OUT --render 3

@@ -30,17 +30,17 @@ min_compress_mb = 5      # don't compress files smaller than this (MB) — the w
                          # hundred KB against a lossy re-encode of every page. They are
                          # still checked for OCR and made searchable. 0 = compress everything
 
-# ── lossless rewrite (born-digital PDFs only) ─────────────────────────────────
-# These files are never rasterised; the rewrite only changes how their bytes are STORED
-# (Flate the unfiltered streams, bundle objects, drop per-illustration authoring XMP) and
-# its output is kept only if it verifies against the source. -62% on a 513 MB Subaru manual.
-# no_lossless = false        # true = copy born-digital files out byte-for-byte instead
-# lossless_keep_xmp = false  # true = compress the per-illustration XMP rather than drop it
-                             # (costs about half the saving; keeps artwork provenance)
-# lossless_zopfli = false    # true = re-Deflate with zopfli: ~12% more, ~700x the CPU.
-                             # Needs `pip install zopfli`. For a one-time archive pass.
-lossless_min_savings = 0.03  # discard the rewrite unless it is at least this much smaller
-# lossless_min_mb = 5       # size floor for the lossless lane alone (default: min_compress_mb).
+# ── born-digital optimisation (born-digital PDFs only) ────────────────────────
+# These files are never rasterised; they are re-stored smaller (Flate the unfiltered streams,
+# bundle objects, drop per-illustration authoring XMP), duplicate images are merged and
+# losslessly stored images re-encoded as JPEG. The output is kept only if it verifies against
+# the source. -62% on a 513 MB Subaru manual, -72% on a browser-printed Acura chapter.
+born_digital = "full"        # copy | lossless | full | max
+                             #   copy     = byte-for-byte
+                             #   lossless = re-store + merge duplicate images; pages decode identically
+                             #   full     = lossless + JPEG q85 for losslessly stored images
+                             #   max      = full + zopfli (~700x the CPU; needs `pip install zopfli`)
+# born_digital_min_mb = 5   # size floor for born-digital optimisation alone (default: min_compress_mb).
                             # Lower to sweep small born-digital files WITHOUT letting the raster
                             # path re-image small scans. Measured on this archive: the <5 MB band
                             # is 282,676 files / 19.2 GB for only -12%, ~10 h (I/O-bound), while

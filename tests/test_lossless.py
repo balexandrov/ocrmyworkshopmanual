@@ -364,7 +364,7 @@ def test_from_list_with_dest_writes_a_mirror_tree(tmp_path):
     out = tmp_path / 'out'
     r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
                         '--from-list', str(lst), '--dest', str(out), '--no-ocr',
-                        '--min-compress-mb', '0', '--lossless-min-savings', '0.01'],
+                        '--min-compress-mb', '0'],
                        capture_output=True, text=True, timeout=900)
     assert r.returncode == 0, r.stdout + r.stderr
     # originals untouched, results mirrored under --dest
@@ -392,7 +392,7 @@ def test_from_list_in_place_rewrites_the_listed_originals(tmp_path):
     lst.write_text(f'{p1}\n{p2}\n', encoding='utf-8')
     r = subprocess.run([sys.executable, str(U.REPO_ROOT / 'ocrmyworkshopmanual.py'),
                         '--from-list', str(lst), '--no-ocr',
-                        '--min-compress-mb', '0', '--lossless-min-savings', '0.01'],
+                        '--min-compress-mb', '0'],
                        capture_output=True, text=True, timeout=900)
     assert r.returncode == 0, r.stdout + r.stderr
     for p in (p1, p2):
@@ -448,3 +448,200 @@ def test_lossless_min_mb_lowers_only_the_lossless_floor(born_xmp):
                            lossless_min_savings=0.01)
     assert res['reason'] == owm.REASON_LOSSLESS, res
     assert born_xmp.stat().st_size < len(before), 'the lowered lossless floor had no effect'
+
+
+# ── Duplicate images and --recompress-images ─────────────────────────────────
+#
+# Shape of the file that motivated both: a browser "Print to PDF" of a web manual (cairo).
+# Every illustration is a JPEG from the website, decoded and stored back as 8-bit Flate RGB,
+# and an illustration placed on several pages is embedded afresh each time. Measured on a
+# 1,941-page chapter: 240 of 252 MB were such images, 22.2 MB of them exact duplicates.
+
+def _render_like(seed, w=320, h=240):
+    """A shaded-render-like RGB image: smooth gradients, a dark outline, faint chroma noise
+    (what an earlier JPEG generation leaves behind) — the content JPEG is good at."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    y, x = np.mgrid[0:h, 0:w]
+    g = (180 + 60 * np.sin(x / 37.0 + seed) * np.cos(y / 29.0)).astype(np.float32)
+    g[(abs(x - w // 2) < 2) | (abs(y - h // 2) < 2)] = 20
+    a = np.stack([g + rng.normal(0, 2, g.shape) for _ in range(3)], -1)
+    return np.clip(a, 0, 255).astype(np.uint8)
+
+
+def _add_images(path, placements, smask_on=None):
+    """Draw Flate RGB images on the pages of a born-digital PDF, cairo-style: one fresh
+    XObject per placement, even when the pixels repeat. `placements` is a list of
+    (page_index, seed); `smask_on` names a seed whose image also carries an /SMask."""
+    import os
+    import numpy as np
+    with pikepdf.open(str(path)) as p:
+        for n, (pi, seed) in enumerate(placements):
+            a = _render_like(seed)
+            h, w = a.shape[:2]
+            img = p.make_stream(zlib.compress(a.tobytes(), 6))
+            img.stream_dict.update(pikepdf.Dictionary(Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
+                                   Width=w, Height=h, ColorSpace=pikepdf.Name.DeviceRGB,
+                                   BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode))
+            if seed == smask_on:
+                alpha = np.full((h, w), 255, np.uint8)
+                alpha[:, : w // 4] = 0
+                m = p.make_stream(zlib.compress(alpha.tobytes(), 6))
+                m.stream_dict.update(pikepdf.Dictionary(Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
+                                     Width=w, Height=h, ColorSpace=pikepdf.Name.DeviceGray,
+                                     BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode))
+                img.stream_dict['/SMask'] = m
+            pg = p.pages[pi]
+            res = pg.obj['/Resources']
+            if '/XObject' not in res:
+                res['/XObject'] = pikepdf.Dictionary()
+            name = f'/Im{n}'
+            res['/XObject'][name] = img
+            pg.contents_add(p.make_stream(f'q 200 0 0 150 72 {100 + 160 * (n % 3)} cm '
+                                          f'{name} Do Q'.encode()))
+        p.save(str(path) + '.tmp')
+    os.replace(str(path) + '.tmp', str(path))
+    return path
+
+
+def _images(path):
+    """[(objgen, filter, decoded bytes)] for every image XObject reachable from a page."""
+    out = {}
+    with pikepdf.open(str(path)) as p:
+        for pg in p.pages:
+            for _, x in (pg.obj['/Resources'].get('/XObject') or {}).items():
+                raw = x.read_raw_bytes() if x.get('/Filter') == '/DCTDecode' else x.read_bytes()
+                out[x.objgen] = (str(x.get('/Filter')), raw, '/SMask' in x)
+                if '/SMask' in x:
+                    m = x['/SMask']
+                    out[m.objgen] = (str(m.get('/Filter')), m.read_bytes(), 'mask')
+    return out
+
+
+@pytest.fixture
+def born_imgs(tmp_path):
+    # seed 1 placed three times (pages 0, 1, 2), seed 2 twice, seed 3 once with an SMask
+    return _add_images(U.make_born_digital_pdf(tmp_path / 'imgs.pdf', npages=4),
+                       [(0, 1), (1, 1), (2, 1), (1, 2), (3, 2), (3, 3)], smask_on=3)
+
+
+def test_duplicate_images_are_merged_by_default_and_exactly(born_imgs, tmp_path):
+    """Six placements of three illustrations must leave three image objects (plus the one
+    mask), every page still drawing the same bytes — dedupe is exact. JPEG off, so the image
+    bytes themselves can be compared."""
+    out = tmp_path / 'out.pdf'
+    before = _decoded_pages(born_imgs)
+    res = owm.lossless_rewrite(born_imgs, out, min_savings=0.01, jpeg_quality=0)
+    assert res['ok'], res
+    d = res['stats']['dedupe']
+    assert d['objects'] == 3 and d['groups'] == 2, d        # 2 extra of seed 1, 1 of seed 2
+    imgs = _images(out)
+    assert sum(1 for f, _, s in imgs.values() if s != 'mask') == 3, imgs.keys()
+    assert all(f == '/FlateDecode' for f, _, _ in imgs.values()), 'dedupe re-encoded an image'
+    assert _decoded_pages(out) == before
+    assert 'duplicate images merged' in res['note'], res['note']
+    # each page still names its own XObject, and the shared one decodes to the same pixels
+    with pikepdf.open(str(out)) as p:
+        a = p.pages[0].obj['/Resources']['/XObject']['/Im0']
+        b = p.pages[2].obj['/Resources']['/XObject']['/Im2']
+        assert a.objgen == b.objgen and a.read_bytes() == _render_like(1).tobytes()
+
+
+def test_no_dedupe_keeps_every_copy(born_imgs, tmp_path):
+    out = tmp_path / 'out.pdf'
+    res = owm.lossless_rewrite(born_imgs, out, min_savings=0.0, dedupe_images=False,
+                               jpeg_quality=0)
+    assert 'dedupe' not in res['stats']
+    if res['ok']:
+        assert sum(1 for _, _, s in _images(out).values() if s != 'mask') == 6
+
+
+def test_images_are_jpegd_by_default_at_q85(born_imgs, tmp_path):
+    out = tmp_path / 'out.pdf'
+    res = owm.lossless_rewrite(born_imgs, out, min_savings=0.01)
+    assert res['ok'], res
+    assert res['stats']['jpeg']['quality'] == owm.RECOMPRESS_IMAGES_Q == 85
+    assert res['stats']['jpeg']['jpeg'] == 3, res['stats']['jpeg']
+
+
+def test_quality_zero_keeps_every_image_exact(born_imgs, tmp_path):
+    """The opt-out: --recompress-images 0 must leave every image's bytes as they were and the
+    row must read as a lossless rewrite."""
+    out = tmp_path / 'out.pdf'
+    res = owm.lossless_rewrite(born_imgs, out, min_savings=0.01, jpeg_quality=0)
+    assert res['ok'], res
+    assert 'jpeg' not in res['stats']
+    assert 'LOSSY' not in res['note']
+    assert all(f == '/FlateDecode' for f, _, _ in _images(out).values())
+    dest = tmp_path / 'o2' / 'x.pdf'
+    row = owm.compress_one(str(born_imgs), str(dest), 200, ocr=False, lossless_min_savings=0.01,
+                           lossless_min_mb=0.0, recompress_images=0)
+    assert row['reason'] == owm.REASON_LOSSLESS, row
+
+
+def test_recompress_images_jpegs_renders_but_never_a_mask(born_imgs, tmp_path):
+    """The opt-in lossy step: renders become DCT, the alpha mask stays exactly as it was,
+    page content streams are untouched, and the note says LOSSY in so many words."""
+    out = tmp_path / 'out.pdf'
+    before_pages = _decoded_pages(born_imgs)
+    mask_before = [b for f, b, s in _images(born_imgs).values() if s == 'mask']
+    res = owm.lossless_rewrite(born_imgs, out, min_savings=0.01, jpeg_quality=85)
+    assert res['ok'], res
+    j = res['stats']['jpeg']
+    assert j['jpeg'] == 3 and j['quality'] == 85, j
+    assert j['min_psnr'] >= owm._IMG_JPEG_MIN_PSNR, j
+    imgs = _images(out)
+    assert sorted(f for f, _, s in imgs.values() if s != 'mask') == ['/DCTDecode'] * 3
+    masks = [(f, b) for f, b, s in imgs.values() if s == 'mask']
+    assert masks == [('/FlateDecode', mask_before[0])], 'the alpha mask was altered'
+    assert _decoded_pages(out) == before_pages, 'page content changed'
+    assert 'LOSSY' in res['note'] and 'JPEG q85' in res['note'], res['note']
+    with pikepdf.open(str(out)) as p:
+        x = p.pages[0].obj['/Resources']['/XObject']['/Im0']
+        assert '/DecodeParms' not in x and x.Width == 320 and x.Height == 240
+        assert x.ColorSpace == '/DeviceRGB'
+
+
+def test_recompress_leaves_already_small_images_alone(tmp_path):
+    """A flat image Flate already crushes would be BIGGER as JPEG: keep it, count it."""
+    import numpy as np
+    src = U.make_born_digital_pdf(tmp_path / 'flat.pdf', npages=1)
+    with pikepdf.open(str(src), allow_overwriting_input=True) as p:
+        a = np.full((200, 200, 3), 255, np.uint8)
+        img = p.make_stream(zlib.compress(a.tobytes(), 9))
+        img.stream_dict.update(pikepdf.Dictionary(Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
+                               Width=200, Height=200, ColorSpace=pikepdf.Name.DeviceRGB,
+                               BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode))
+        p.pages[0].obj['/Resources']['/XObject'] = pikepdf.Dictionary(Im0=img)
+        p.pages[0].contents_add(p.make_stream(b'q 100 0 0 100 0 0 cm /Im0 Do Q'))
+        st = owm._recompress_images(p, 85)
+    assert st['jpeg'] == 0 and st['kept'] == 1, st
+
+
+def test_compress_one_reports_a_lossy_rewrite_as_such(born_imgs, tmp_path):
+    """The report must never call a JPEG'd file a lossless rewrite."""
+    dest = tmp_path / 'out' / 'x.pdf'
+    res = owm.compress_one(str(born_imgs), str(dest), 200, ocr=False,
+                           lossless_min_savings=0.01, lossless_min_mb=0.0)
+    assert res.get('err') is None, res
+    assert res['action'] == 'compressed', res
+    assert res['reason'] == owm.REASON_IMAGES, res
+    assert 'losslessly' not in res['note'] and 'LOSSY' in res['note'], res['note']
+
+
+def test_lossy_guard_still_catches_a_missing_image(born_imgs, tmp_path):
+    """Comparing image GEOMETRY instead of bytes must not blind the guard: an image that
+    disappears from a page still fails verification."""
+    base = owm._lossless_fingerprint(born_imgs, exact_images=False)
+    bad = tmp_path / 'bad.pdf'
+    with pikepdf.open(str(born_imgs)) as p:
+        del p.pages[0].obj['/Resources']['/XObject']['/Im0']
+        p.save(str(bad))
+    assert owm._lossless_verify(base, bad, exact_images=False), 'a dropped image passed'
+
+
+def test_preview_mentions_recompress_by_default(born_imgs):
+    res = owm.preview_one(str(born_imgs), 200, True, 10, 0.02, 150, 60, 0.25, 0.30, 0.6,
+                          ocr=False)
+    assert res['action'] == 'born_digital', res
+    assert 'as JPEG q85' in res['note'], res['note']

@@ -34,7 +34,7 @@ reported as `encrypted: none of the known passwords fit`, never as unreadable or
 It is a real change to the file, so it is recorded per file in the report's `note` column. Page
 content is untouched and still audited — a permission flag cannot change what a page draws. On
 the [lossless lane](lossless.md), where bytes are not what these files buy, a decrypted file is
-exempt from `--lossless-min-savings`: the bar is only *not bigger than the source*. On a 26-file
+exempt from the 3% minimum saving: the bar is only *not bigger than the source*. On a 26-file
 measurement the median was 3.6% smaller with 11 under the 3% default, so a size bar would have
 left half of them encrypted for a rounding error.
 

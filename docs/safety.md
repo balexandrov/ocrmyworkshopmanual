@@ -48,7 +48,7 @@ Two rules keep the audit honest in both directions:
 
 For an independent second opinion, `helpers/` has two auditors that deliberately share no code
 with the tool — `verify_run.py` (colour from rendered pixels, text by word recall, structure via
-pypdf) and `verify_lossless.py` ([Lossless rewrite](lossless.md#sweeping-an-existing-archive)).
+pypdf) and `verify_lossless.py` ([Born-digital optimisation](lossless.md#sweeping-an-existing-archive)).
 
 ## Resilience
 

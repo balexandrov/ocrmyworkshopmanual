@@ -10,9 +10,9 @@ any tree of scanned documents. For each page it decides the right treatment, com
 **JBIG2** where that helps, keeps photos as images, and adds an invisible OCR text layer.
 
 - Clean black-and-white scans → **~8–12% of the original size**, crisp and full-text searchable
-- **Born-digital** (vector/text) PDFs are never rasterised — they get a
-  [lossless re-store](docs/lossless.md) instead: same operators, same pixels, fewer bytes
-  (**−62%** on a 513 MB Subaru manual)
+- **Born-digital** (vector/text) PDFs are never rasterised — they are
+  [optimised](docs/lossless.md) instead: re-stored, duplicate images merged, screenshot-style
+  images re-encoded as JPEG (**−62%** on a 513 MB Subaru manual, **−72%** on a browser-printed one)
 - Safe to point at a **mixed tree**; every output is verified against its source before it ships
 
 **Contents:** [Features](#features) · [Install](#install) · [Quick start](#quick-start) ·
@@ -31,7 +31,8 @@ any tree of scanned documents. For each page it decides the right treatment, com
 - **Generic, self-contained JBIG2** that renders everywhere, including Chrome/Edge; photo pages
   get paper whitening, edge trim, descreen and a tone curve
 - **Never grows a file** — a sample pre-check skips compression that wouldn't pay
-- **[Lossless rewrite](docs/lossless.md)** for born-digital PDFs — no page rendered, fewer bytes
+- **[Born-digital optimisation](docs/lossless.md)** — no page rendered: streams re-stored,
+  duplicate images merged, losslessly stored images re-encoded as JPEG
 
 **Searchable text** — [OCR](docs/ocr.md)
 - OCR reads the **original** page images and the text is grafted onto the compressed pages, so
@@ -100,7 +101,7 @@ ocrmyworkshopmanual --version
 
 The `jbig2topdf.py` wrapper ships in `tools/`. If a tool isn't on PATH, point at it with
 `JBIG2_GS` (Ghostscript) or `JBIG2_BIN` (jbig2). `--no-ocr` drops the Tesseract requirement.
-**Optional:** `pip install zopfli` enables `--lossless-zopfli`. `pip install rapidocr onnxruntime`
+**Optional:** `pip install zopfli` enables `--born-digital max`. `pip install rapidocr onnxruntime`
 enables `--ocr-engine paddle`; install `onnxruntime-directml` (Windows, any DirectX 12 GPU) or
 `onnxruntime-gpu` (CUDA) *instead of* `onnxruntime` to run it on a GPU. The models are downloaded
 on first use.
@@ -132,7 +133,7 @@ python ocrmyworkshopmanual.py "M:\manuals" --in-place
 
 # Lossless pass over the big born-digital PDFs a past run copied untouched
 python helpers/lossless_candidates.py --min-mb 50
-python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr
+python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT --no-ocr --born-digital lossless
 ```
 
 > Point `src` at a folder and the whole tree is walked into **one** global worker pool — every
@@ -147,7 +148,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 |---|---|---|
 | `src` (positional) | — | Source folder tree (recursed into one global pool). Omit only with `--from-list` |
 | `--dest DIR` | `"<src> (COMPRESSED)"` | Output root |
-| `--in-place` | off | **Overwrite** each PDF with its result. Non-PDFs, structure and already-optimal files untouched. Born-digital files are never rasterised but *are* [re-stored losslessly](docs/lossless.md) (`--no-lossless` to opt out). Destructive — back up first |
+| `--in-place` | off | **Overwrite** each PDF with its result. Non-PDFs, structure and already-optimal files untouched. Born-digital files are never rasterised but *are* [optimised](docs/lossless.md), images included (`--born-digital copy` to opt out). Destructive — back up first |
 | `--dpi N` | `200` | Render resolution (native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel. OCR threads come from the same budget and follow how many files are still in flight, so the last file of a batch gets the cores the batch no longer needs |
 | `--language L` | `auto` | Tesseract language(s). `auto` detects each file's script from the image — Latin→`eng`, Cyrillic→`rus+eng`, CJK→`jpn+eng` — and adds any pack the file's existing text layer proves it needs. Or pass a spec: `eng+fra+spa+deu` |
@@ -168,11 +169,8 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--no-fix-spaces` | off | Leave [box-shaped spaces](docs/cleanup.md#box-spaces) as they are. The fix is on by default and costs one font walk on a file without the fault |
 | `--no-merge-fonts` | off | Leave [per-page font subsets](docs/cleanup.md#per-page-font-subsets-pdffontspy) as they are. Merging is on by default and costs one font walk on a file with none |
 | `--no-fix-links` | off | Don't [rewrite browser-dead cross-file links](docs/links.md). The rewrite is on by default: `/GoToR` and `/Launch` become relative `/URI`, in annotations and bookmarks. Internal `/GoTo` is never touched, so re-runs are no-ops |
-| `--no-lossless` | off | Don't [re-store](docs/lossless.md) born-digital PDFs — copy them byte-for-byte |
-| `--lossless-keep-xmp` | off | Compress the per-illustration authoring XMP instead of deleting it (costs about half the saving; keeps artwork provenance) |
-| `--lossless-zopfli` | off | Re-Deflate every stream with zopfli: standard Deflate output, normal read speed, ~700× the encoder time, ~12% more. One-time passes, not routine runs. Needs `pip install zopfli` |
-| `--lossless-min-savings F` | `0.03` | Discard the rewrite unless it's at least this much smaller |
-| `--lossless-min-mb N` | `--min-compress-mb` | Size floor for the lossless lane alone. Lower it to sweep small born-digital files without letting the raster path re-image small scans |
+| `--born-digital LEVEL` | `full` | How to [optimise](docs/lossless.md) a born-digital PDF (never rasterised): `copy` byte-for-byte · `lossless` re-store streams and objects, drop authoring XMP, merge duplicate images — every page decodes identically · `full` + JPEG q85 for losslessly stored images (252 → 67 MB on a browser-printed manual) · `max` + zopfli, ~700× the CPU, needs `pip install zopfli` |
+| `--born-digital-min-mb N` | `--min-compress-mb` | Size floor for born-digital optimisation alone. Lower it to sweep small born-digital files without letting the raster path re-image small scans |
 | `--dry-run` | off | Preview only: classify, project, report; write nothing |
 | `--timeout SECS` | `600` | **Stall** timeout, not a time budget: max seconds a step may make no progress before it's treated as hung. OCR is deliberately unbounded. `0` = disable |
 | `--retry-failed CSV` | — | Reprocess only the files a previous report marked FAILED |
@@ -201,7 +199,8 @@ flagging.
    Each stage audits its own rewrite and only changes what the later stages *read*; nothing is
    written over the original until the finished file has been verified.
 1. **Safety check** — a born-digital (vector/text) PDF is never rendered, binarized or
-   OCR'd. It is copied byte-for-byte or [re-stored losslessly](docs/lossless.md). A corrupt one
+   OCR'd. It is [optimised](docs/lossless.md) — re-stored, images deduplicated and JPEG'd — or,
+   when that gains nothing, copied byte-for-byte. A corrupt one
    is repaired rather than reproduced unreadable.
 2. **Render** the page (Ghostscript, interpolated, at the page's own source resolution).
 3. **Classify** it into a page type and apply that type's strategy:
@@ -237,7 +236,7 @@ failed check keeps the original and says why. See [Safety](docs/safety.md).
 |---|---|
 | [Source clean-up](docs/cleanup.md) | encrypted PDFs, re-distributor stamps, box-shaped spaces, per-page font subsets, stripping named lines |
 | [OCR](docs/ocr.md) | the two engines and how they measured, carried OCR layers, awkward sources, stamp-aware text checks, when OCR fails |
-| [Lossless rewrite](docs/lossless.md) | re-storing born-digital PDFs smaller, why it can't damage a file, sweeping an existing archive |
+| [Born-digital optimisation](docs/lossless.md) | making born-digital PDFs smaller without rendering a page, what is verified, sweeping an existing archive |
 | [Browser links](docs/links.md) | why `/GoToR` is dead in browsers, what the rewrite handles, why it never searches the tree |
 | [Safety](docs/safety.md) | born-digital detection, output verification, resilience (timeouts, repair, duplicates, crashes) |
 | [Working with a large archive](docs/archive.md) | in-place mode, the size floors and what they cost, finding what to compress |
@@ -257,7 +256,7 @@ language = "eng+deu"
 jpeg_quality = 60
 min_free_gb = 5.0
 # no_ocr = true
-# lossless_min_mb = 5
+# born_digital_min_mb = 5
 ```
 
 See `ocrmyworkshopmanual.example.toml` for a fuller template.
