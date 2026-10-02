@@ -725,6 +725,35 @@ class CombineFailed(Exception):
     above all do not delete the sources on the strength of it."""
 
 
+def part_outline(pdf: Path) -> list:
+    """[(depth, title, 0-based page within the part), ...] -- a part's OWN outline, in order.
+
+    With --outline tree a part's bookmarks belong under the part's own entry. Left to the merge,
+    pypdf files them at the root instead, beside the file entries: measured on a 2024 Subaru WRX
+    set of 10 chapter PDFs, 84 of their top-level bookmarks landed beside the 10 file entries and
+    the chapter structure was gone. Entries whose destination does not resolve to a page are
+    left out (they would point nowhere in the merge either)."""
+    out = []
+    try:
+        r = PdfReader(win_long(pdf))
+
+        def walk(items, depth):
+            for it in items:
+                if isinstance(it, list):
+                    walk(it, depth + 1)
+                    continue
+                try:
+                    pg = r.get_destination_page_number(it)
+                except Exception:
+                    pg = None
+                if pg is not None and pg >= 0:
+                    out.append((depth, str(it.title), pg))
+        walk(r.outline, 0)
+    except Exception:
+        return []
+    return out
+
+
 def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, tree: dict = None) -> int:
     """Merge `files` (images and/or PDFs), in the given order, into out_pdf. Returns the
     page count. Raises CombineFailed if an input cannot be read or merged, or if the
@@ -740,7 +769,9 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
     is still checked against the REOPENED result at the end.
 
     `tree` (see `tree_bookmarks`) does the same for a nested outline: index -> [(level, title)];
-    each item hangs under the last item one level up."""
+    each item hangs under the last item one level up. A part's own outline (`part_outline`)
+    then hangs under that part's entry, its levels shifted below it and its pages offset by
+    where the merge put the part."""
     want, bad = (0, []) if not verify else expected_pages(files)
     if bad:
         # EVERY unreadable input, by FULL path, one per line — never a count plus the first.
@@ -754,9 +785,12 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
     marks = []
     for i, p in enumerate(files):
         first = len(w.pages)      # the index the next appended page will land at
+        nested = bool(tree and i in tree and is_pdf(p))
         try:
             if is_pdf(p):
-                w.append(win_long(p))
+                # with a tree, the part's own outline is placed below its entry (further down),
+                # not imported at the root by the merge
+                w.append(win_long(p), import_outline=not nested)
             else:
                 w.append(io.BytesIO(_image_to_pdf_bytes(p)))
         except Exception as ex:
@@ -765,6 +799,9 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
             marks.append((0, bookmarks[i], first, p))
         if tree and i in tree:
             marks.extend((lvl, title, first, p) for lvl, title in tree[i])
+            if nested:
+                base = tree[i][-1][0]          # the part's own entry
+                marks.extend((base + 1 + d, title, first + pg, p) for d, title, pg in part_outline(p))
     # Page indices come from the merge, not from a prediction: a section whose first part is a
     # 9-page PDF must not have its bookmark land 8 pages early. An index past the end can only
     # mean that input contributed NO pages — a 0-page PDF, which `expected_pages` counts as 0
@@ -995,8 +1032,12 @@ def main():
                      if r.expected else ''))
     if tree:
         want_items = sum(len(v) for v in tree.values())
+        inner = sum(len(part_outline(f)) for i, f in enumerate(files) if i in tree and is_pdf(f))
         got_items = outline_count(out_pdf)
-        print(f'Bookmarks: {got_items} of {want_items} tree item(s) present in the output')
+        print(f'Bookmarks: {got_items} of {want_items + inner} present in the output '
+              f'({want_items} tree item(s), {inner} from the parts\' own outlines, nested under them)')
+        if got_items != want_items + inner:
+            print('  WARNING: outline count differs -- navigation only, no page is affected')
     if marks:
         # Read back out of the finished file, like the page count. A missing bookmark is
         # reported as what it is — lost navigation — and never as lost pages.

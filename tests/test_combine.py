@@ -473,6 +473,39 @@ def test_the_tree_outline_bookmarks_every_folder_and_every_document(tmp_path):
                      (0, 'Engine'): 4, (1, '2GR-FSE ENGINE CONTROL'): 4, (2, 'P0101'): 4}
 
 
+def test_the_tree_outline_nests_each_parts_own_bookmarks_under_it(tmp_path):
+    """A part that brings its own outline keeps it -- under the part's entry, not beside it.
+    Left to the merge, pypdf files a part's bookmarks at the root, so a set of chapter PDFs with
+    Subaru's four-level outlines came out as 94 top-level entries and the chapters were gone."""
+    root = tmp_path / 'WRX'
+    root.mkdir()
+    _pdf(root / '1. Body.pdf', npages=2)
+    eng = _pdf(root / '2. Engine.pdf', npages=3)
+    w = PdfWriter(clone_from=str(eng))
+    top = w.add_outline_item('ENGINE SECTION', 0)
+    w.add_outline_item('Timing chain', 2, parent=top)
+    w.add_outline_item('SPECIFICATIONS', 1)
+    with open(eng, 'wb') as f:
+        w.write(f)
+    files = CM.collect(root, recursive=True)
+    tree = CM.tree_bookmarks(files, root)
+    out = tmp_path / 'WRX.pdf'
+    assert CM.combine(files, out, tree=tree) == 5
+    r = PdfReader(str(out))
+    got = []
+
+    def walk(items, depth):
+        for it in items:
+            if isinstance(it, list):
+                walk(it, depth + 1)
+            else:
+                got.append((depth, str(it.title), r.get_destination_page_number(it) + 1))
+    walk(r.outline, 0)
+    assert got == [(0, '1. Body', 1), (0, '2. Engine', 3), (1, 'ENGINE SECTION', 3),
+                   (2, 'Timing chain', 5), (1, 'SPECIFICATIONS', 4)]
+    assert CM.part_outline(eng) == [(0, 'ENGINE SECTION', 0), (1, 'Timing chain', 2), (0, 'SPECIFICATIONS', 1)]
+
+
 def test_a_flat_folder_gets_no_bookmarks(tmp_path):
     """So every non-recursive run — the default, and what the Explorer menu uses — produces
     exactly the PDF it produced before this existed."""

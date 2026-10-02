@@ -5,6 +5,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — `--outline tree` keeps each part's own bookmarks under the part
+
+A part that brought its own outline had it filed at the root by the merge, beside the file
+entries, so the tree lost the structure it was asked to keep. Measured on a 2024 Subaru WRX set
+of 10 chapter PDFs: 84 of their top-level bookmarks landed beside the 10 file entries (94 at the
+top), and a GR Corolla set's 625 document bookmarks beside its 11 files. Each part's outline now
+hangs under the part's own entry, levels shifted below it, pages offset by where the merge put
+the part; the run's read-back counts both and warns if they differ. Parts without an outline, and
+the default `--outline sections`, are unchanged.
+
 ### Fixed — a stamp's companion line is taken only from beside the stamp
 
 A line qualified as a stamp's companion by sitting next to it on the first sampled pages, and was
