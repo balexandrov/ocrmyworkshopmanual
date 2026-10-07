@@ -172,3 +172,83 @@ def test_keep_original_path_also_uses_it(tmp_path, paddle_engine, monkeypatch):
     assert res['ocr_state'] == owm.OCR_NEW, res
     assert '(engine paddle)' in res['note'], res['note']
     assert 'Scan page 1 line' in (PdfReader(str(out)).pages[0].extract_text() or '')
+
+
+@needs_paddle
+def test_the_engine_is_rebuilt_every_few_pages(tmp_path, monkeypatch):
+    """One engine's memory only grows (36.9 GB over a 432-page manual), so it is dropped
+    every `_RECYCLE_EVERY` pages and the next page builds a fresh one."""
+    from PIL import Image
+    built = []
+
+    class FakeEngine:
+        def __init__(self, params=None):
+            built.append(self)
+
+        def __call__(self, src):
+            class R:
+                boxes = txts = scores = None
+            return R()
+
+    monkeypatch.setattr(paddle, 'RapidOCR', FakeEngine)
+    monkeypatch.setattr(paddle, '_engine', None)
+    monkeypatch.setattr(paddle, '_pages_done', 0)
+    png = tmp_path / 'p.png'
+    Image.new('L', (200, 300), 255).save(png, dpi=(300, 300))
+    n = paddle._RECYCLE_EVERY
+    for _ in range(2 * n + 1):
+        paddle.ocr_page(png)
+    assert len(built) == 3, 'a fresh engine after each block of pages, and only then'
+    monkeypatch.setattr(paddle, '_engine', None)
+
+
+@needs_paddle
+def test_on_a_gpu_nothing_touches_the_engine_concurrently(tmp_path, monkeypatch):
+    """Building, calling and tearing down an engine all use the GPU; with recycling, any two
+    of them overlapping crashed DirectML (0xC0000005) on a 1,071-page manual."""
+    import threading
+    import time
+    from PIL import Image
+    state = {'active': 0, 'most': 0}
+    guard = threading.Lock()
+
+    def touch():
+        with guard:
+            state['active'] += 1
+            state['most'] = max(state['most'], state['active'])
+        time.sleep(0.002)
+        with guard:
+            state['active'] -= 1
+
+    class FakeEngine:
+        def __init__(self, params=None):
+            touch()
+
+        def __call__(self, src):
+            touch()
+
+            class R:
+                boxes = txts = scores = None
+            return R()
+
+        def __del__(self):
+            touch()
+
+    monkeypatch.setattr(paddle, 'RapidOCR', FakeEngine)
+    monkeypatch.setattr(paddle, '_providers', lambda: (True, False))
+    monkeypatch.setattr(paddle, '_engine', None)
+    monkeypatch.setattr(paddle, '_pages_done', 0)
+    png = tmp_path / 'p.png'
+    Image.new('L', (200, 300), 255).save(png, dpi=(300, 300))
+
+    def worker():
+        for _ in range(3 * paddle._RECYCLE_EVERY):
+            paddle.ocr_page(png)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    monkeypatch.setattr(paddle, '_engine', None)
+    assert state['most'] == 1, 'engine build, call and teardown must never overlap on a GPU'

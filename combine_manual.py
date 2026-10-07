@@ -576,6 +576,135 @@ def tree_bookmarks(files, folder: Path) -> dict:
     return marks
 
 
+class PlanError(Exception):
+    """A --plan file that does not describe the folder exactly: refused before anything is merged."""
+
+
+Plan = namedtuple('Plan', 'files tree sel left_out')
+"""What a --plan file asks for. `files` may name one file more than once; `sel` maps an index into
+`files` to the 0-based pages that row takes (absent: all of them); `left_out` is
+[(file, [0-based pages])] the plan names as deliberately not merged."""
+
+
+def _page_list(spec: str, n: int, where: str) -> list:
+    """`3` / `2-5` / `1,4-6` (1-based, as printed by any viewer) -> 0-based indices, in the order
+    given. `0` is no pages at all: a bookmark only, opening at the next page merged; `prev` is a
+    bookmark only, opening at the page merged last (returned as [-1])."""
+    if spec.strip() == '0':
+        return []
+    if spec.strip() == 'prev':
+        return [-1]
+    out = []
+    for part in spec.replace(' ', '').split(','):
+        m = re.fullmatch(r'(\d+)(?:-(\d+))?', part)
+        if not m:
+            raise PlanError(f'{where}: bad page list {spec!r}')
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if not 1 <= lo <= hi <= n:
+            raise PlanError(f'{where}: pages {part} outside 1..{n}')
+        out.extend(range(lo - 1, hi))
+    return out
+
+
+def _n_taken(pages: list) -> int:
+    """Pages a plan row merges: none for a bookmark-only row (`0` -> [], `prev` -> [-1])."""
+    return sum(1 for x in pages if x >= 0)
+
+
+def read_plan(plan: Path, folder: Path) -> Plan:
+    """The page order and every bookmark title, given explicitly by a --plan CSV.
+
+    For a set whose names carry neither. A seller's export of a scanned Japanese manual numbers
+    files and subfolders in two separate series -- `1.部品配置図.pdf` beside the folder
+    `1.自己診断の方法` -- while the printed folios put all four numbered files (2-3 .. 2-18) before
+    both folders (2-19 ..); no sort of the names can know that. And the names are the only
+    outline the set has, in a language its readers may not read.
+
+    Columns `path,title` and optionally `pages`; `path` is relative to `folder`, either slash. A
+    FILE row places that file -- or, with `pages` (`3`, `2-5`, `1,4-6`, 1-based), those pages of
+    it -- next in page order, under one bookmark. `pages` = `0` is a bookmark with no pages of its
+    own, opening at the next page merged: a topic whose only printed page it shares with the
+    next topic, kept once under that one; `pages` = `prev` is the same, opening at the page merged
+    last -- where the topic that keeps the page comes first. A FOLDER row only titles that
+    folder's bookmark.
+    An empty title keeps the name. The title `-` marks pages deliberately NOT merged. Page rows
+    exist because the same seller saved one printed page in two files where a topic ends and the
+    next begins on it, and once packed a duplicate, the code list and a memo page into the file of
+    the code that follows them.
+
+    Refused, never guessed: a path that does not exist, a page claimed twice, a page of any file
+    under `folder` that no row accounts for (a page dropped silently is the failure this tool's
+    page count exists to prevent), and an order that splits a folder in two -- its bookmark can
+    open only one run of pages."""
+    import csv
+    with open(plan, encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.DictReader(f))
+    if rows and not {'path', 'title'} <= set(rows[0]):
+        raise PlanError(f'{plan}: the header must name the columns path,title[,pages]')
+    titles, files, row_titles, sel, left_out, claimed = {}, [], [], {}, [], {}
+    for n, r in enumerate(rows, 2):
+        rel = Path(r['path'].replace('\\', '/'))
+        p = folder / rel
+        title = (r['title'] or '').strip()
+        spec = (r.get('pages') or '').strip()
+        where = f'{plan}:{n}'
+        if p.is_dir():
+            titles[rel.parts] = title
+            continue
+        if not p.is_file():
+            raise PlanError(f'{where}: no such file or folder: {p}')
+        total = page_count(p) if is_pdf(p) else 1
+        pages = _page_list(spec, total, where) if spec else list(range(total))
+        own = [x for x in pages if x >= 0]           # a `prev` row claims no page of its own
+        mine = claimed.setdefault(rel.parts, set())
+        twice = mine.intersection(own)
+        if twice:
+            raise PlanError(f'{where}: page(s) {sorted(x + 1 for x in twice)} of {rel} claimed twice')
+        mine.update(own)
+        if pages == [-1] and (title == '-' or not files):
+            raise PlanError(f'{where}: "prev" needs a page merged before it')
+        if title == '-':
+            if not pages:
+                raise PlanError(f'{where}: "-" leaves pages out, so it needs a page list')
+            left_out.append((p, pages))
+            continue
+        if spec:
+            sel[len(files)] = pages
+        files.append(p)
+        row_titles.append(title)
+    short = []
+    for p in collect(folder, recursive=True):
+        got = claimed.get(p.relative_to(folder).parts, set())
+        total = page_count(p) if is_pdf(p) else 1
+        if len(got) < total:
+            short.append(f'{p.relative_to(folder)}'
+                         + (f' (pages {sorted(set(range(1, total + 1)) - {x + 1 for x in got})})'
+                            if got else ''))
+    if short:
+        raise PlanError(f'{len(short)} page file(s) under {folder} are not wholly in the plan:'
+                        + ''.join(f'\n       {x}' for x in short))
+
+    tree, opened, closed = {}, [], set()
+    for i, p in enumerate(files):
+        parts = p.relative_to(folder).parts
+        dirs = [parts[:d + 1] for d in range(len(parts) - 1)]
+        keep = 0                           # how much of the open folder path this row shares
+        while keep < len(opened) and keep < len(dirs) and opened[keep] == dirs[keep]:
+            keep += 1
+        closed.update(opened[keep:])
+        opened = opened[:keep]
+        items = []
+        for d in dirs[keep:]:
+            if d in closed:
+                raise PlanError(f'the plan splits the folder {Path(*d)}: '
+                                f'{p.relative_to(folder)} comes after other folders\' pages')
+            opened.append(d)
+            items.append((len(d) - 1, titles.get(d) or d[-1]))
+        items.append((len(parts) - 1, row_titles[i] or p.stem))
+        tree[i] = items
+    return Plan(files, tree, sel, left_out)
+
+
 def bookmark_preview(files, marks: dict) -> list:
     """[(title, 1-based page), ...] PREDICTED from the inputs' page counts — for --dry-run,
     which merges nothing. An image is one page and a PDF contributes its own count, exactly
@@ -754,7 +883,8 @@ def part_outline(pdf: Path) -> list:
     return out
 
 
-def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, tree: dict = None) -> int:
+def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, tree: dict = None,
+            sel: dict = None) -> int:
     """Merge `files` (images and/or PDFs), in the given order, into out_pdf. Returns the
     page count. Raises CombineFailed if an input cannot be read or merged, or if the
     result does not carry exactly the sum of the inputs' pages.
@@ -771,8 +901,15 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
     `tree` (see `tree_bookmarks`) does the same for a nested outline: index -> [(level, title)];
     each item hangs under the last item one level up. A part's own outline (`part_outline`)
     then hangs under that part's entry, its levels shifted below it and its pages offset by
-    where the merge put the part."""
+    where the merge put the part.
+
+    `sel` (from a --plan) maps an index into `files` to the 0-based pages taken from it; the
+    count that guards the merge then counts those pages, not the whole file. A part merged in
+    pieces brings no outline of its own: its page offsets would no longer hold."""
+    sel = sel or {}
     want, bad = (0, []) if not verify else expected_pages(files)
+    if verify and sel:
+        want -= sum(page_count(files[i]) - _n_taken(pg) for i, pg in sel.items())
     if bad:
         # EVERY unreadable input, by FULL path, one per line — never a count plus the first.
         # These are the files the run has to be fixed by hand, and a manual is combined from
@@ -785,9 +922,16 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
     marks = []
     for i, p in enumerate(files):
         first = len(w.pages)      # the index the next appended page will land at
-        nested = bool(tree and i in tree and is_pdf(p))
+        nested = bool(tree and i in tree and is_pdf(p)) and i not in sel
         try:
-            if is_pdf(p):
+            if i in sel:
+                if sel[i] == [-1]:         # `prev`: a bookmark only, at the page merged last
+                    first = len(w.pages) - 1
+                    if first < 0:
+                        raise CombineFailed(f'{p}: a "prev" bookmark with no page before it')
+                elif sel[i]:               # empty: a bookmark only, at the next page merged
+                    w.append(win_long(p), pages=sel[i], import_outline=False)
+            elif is_pdf(p):
                 # with a tree, the part's own outline is placed below its entry (further down),
                 # not imported at the root by the merge
                 w.append(win_long(p), import_outline=not nested)
@@ -868,6 +1012,20 @@ def main():
                          "'tree' bookmarks every folder at every depth and every file by its name, "
                          'nested -- for an export of one PDF per document, whose folder and file '
                          'names are the only structure it has')
+    ap.add_argument('--plan', type=Path, default=None,
+                    help='CSV (path,title) giving the page order and every bookmark title '
+                         'explicitly; implies --recursive and a tree outline. For a set whose '
+                         'names do not sort into the printed order, or are not in the '
+                         "reader's language. Every page file under the folder must be listed")
+    ap.add_argument('--output', type=Path, default=None,
+                    help='write the combined PDF here instead of beside the folder, named '
+                         'after it')
+    ap.add_argument('--ocr-engine', default=None,
+                    help="OCR engine for the compress step ('tesseract' or 'paddle'); passed "
+                         'straight to ocrmyworkshopmanual.py')
+    ap.add_argument('--replace-text', action='store_true',
+                    help="drop the parts' own invisible OCR layer and OCR every page afresh; "
+                         'passed straight to ocrmyworkshopmanual.py')
     ap.add_argument('--no-compress', action='store_true',
                     help='produce the raw combined PDF only; skip the compress + OCR step')
     ap.add_argument('--language', default='auto',
@@ -882,7 +1040,21 @@ def main():
     if not folder.is_dir():
         sys.exit(f'ERROR: not a folder: {folder}')
 
-    files = collect(folder, recursive=args.recursive)
+    plan_tree, sel = None, {}
+    if args.plan:
+        args.recursive = True
+        try:
+            plan = read_plan(args.plan, folder)
+        except PlanError as ex:
+            sys.exit(f'ERROR: {ex}\n       nothing written.')
+        files, plan_tree, sel = plan.files, plan.tree, plan.sel
+        if plan.left_out:
+            # named in full: these pages are in the folder and NOT in the output, on purpose
+            print(f'{sum(len(pg) for _, pg in plan.left_out)} page(s) left out by the plan:')
+            for p, pg in plan.left_out:
+                print(f'  {p.relative_to(folder)}  page(s) {", ".join(str(x + 1) for x in pg)}')
+    else:
+        files = collect(folder, recursive=args.recursive)
     if not files:
         sys.exit(f'ERROR: no image or PDF files {"under" if args.recursive else "directly in"} '
                  f'{folder}' + ('' if args.recursive else
@@ -891,7 +1063,8 @@ def main():
     # Duplicates are resolved BEFORE ordering: a page's identity is what decides which copy of
     # it to merge, and that does not depend on where it sits in the sequence.
     n_found = len(files)
-    files, dups = dedupe_pages(files)
+    # A plan names every file it wants, once: nothing in it is a stray rescan to drop.
+    files, dups = (files, []) if plan_tree else dedupe_pages(files)
     n_dropped = sum(len(g.drop) for g in dups)
     n_review = sum(1 for g in dups if not g.drop)
 
@@ -902,9 +1075,9 @@ def main():
                       f'so doc-id order was NOT applied]' if missing else
                       '  [order: publisher doc id]')
 
-    tree = tree_bookmarks(files, folder) if args.outline == 'tree' else None
+    tree = plan_tree or (tree_bookmarks(files, folder) if args.outline == 'tree' else None)
     marks = {} if tree is not None else section_bookmarks(files, folder)
-    out_pdf = folder.parent / (folder.name + '.pdf')
+    out_pdf = args.output or folder.parent / (folder.name + '.pdf')
     n_img = sum(1 for p in files if not is_pdf(p))
     n_pdf = len(files) - n_img
     print(f'{len(files)} files ({n_img} image, {n_pdf} pdf) -> {out_pdf}{order_note}')
@@ -919,7 +1092,8 @@ def main():
         # under --recursive the bare name is ambiguous (every subfolder has a
         # `1. General Description.pdf`), so show the path relative to the folder
         label = p.relative_to(folder) if args.recursive else p.name
-        print(f'  {i:>4}. {label}')
+        pick = f'  [page(s) {", ".join(str(x + 1) for x in sel[i - 1])}]' if i - 1 in sel else ''
+        print(f'  {i:>4}. {label}{pick}')
 
     # After the page order, not before it: on a 1200-page manual anything printed first is
     # scrolled off the screen by the order dump, and these are the lines to act on.
@@ -927,6 +1101,7 @@ def main():
 
     if args.dry_run:
         want, bad = expected_pages(files)
+        want -= sum(page_count(files[i]) - _n_taken(pg) for i, pg in sel.items())
         if marks:
             print('\nBookmarks (predicted):')
             for title, page in bookmark_preview(files, marks):
@@ -1003,6 +1178,10 @@ def main():
                     print(f'  --skip-unrecoverable: leaving out {len(broken)} part(s)'
                           + (f', ~{lost} page(s)' if lost else '')
                           + ' — the files stay on disk, untouched')
+                    if plan_tree:
+                        sys.exit('ERROR: --skip-unrecoverable cannot leave parts out of a --plan '
+                                 'order; take them out of the plan instead.\n'
+                                 f'       {folder} is untouched.')
                     if tree is not None:                       # indices shifted; recompute
                         tree = tree_bookmarks(files, folder)
                     else:
@@ -1010,7 +1189,7 @@ def main():
 
         print(f'\nCombining -> {out_pdf} ...', flush=True)
         try:
-            pages = combine(files, out_pdf, bookmarks=marks, tree=tree)
+            pages = combine(files, out_pdf, bookmarks=marks, tree=tree, sel=sel)
         except CombineFailed as ex:
             sys.exit(f'ERROR: combine refused: {ex}\n'
                      f'       {folder} is untouched — do NOT delete it.')
@@ -1032,7 +1211,8 @@ def main():
                      if r.expected else ''))
     if tree:
         want_items = sum(len(v) for v in tree.values())
-        inner = sum(len(part_outline(f)) for i, f in enumerate(files) if i in tree and is_pdf(f))
+        inner = sum(len(part_outline(f)) for i, f in enumerate(files)
+                    if i in tree and is_pdf(f) and i not in sel)
         got_items = outline_count(out_pdf)
         print(f'Bookmarks: {got_items} of {want_items + inner} present in the output '
               f'({want_items} tree item(s), {inner} from the parts\' own outlines, nested under them)')
@@ -1058,7 +1238,9 @@ def main():
         env['TESSDATA_PREFIX'] = args.tessdata
     print(f'\nCompressing + OCR ({args.language}) in place via {TOOL.name} ...', flush=True)
     r = subprocess.run([sys.executable, str(TOOL), str(out_pdf),
-                        '--in-place', '--language', args.language], env=env)
+                        '--in-place', '--language', args.language]
+                       + (['--ocr-engine', args.ocr_engine] if args.ocr_engine else [])
+                       + (['--replace-text'] if args.replace_text else []), env=env)
     if r.returncode != 0:
         sys.exit(f'ERROR: compress/OCR step failed (exit {r.returncode}); '
                  f'the raw combined PDF is still at {out_pdf}')

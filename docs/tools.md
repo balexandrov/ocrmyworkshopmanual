@@ -14,6 +14,7 @@ python combine_manual.py FOLDER --dry-run              # print the page order, w
 python combine_manual.py FOLDER --no-compress          # raw combined PDF only
 python combine_manual.py FOLDER --recursive            # include subfolders, add bookmarks
 python combine_manual.py FOLDER --recursive --outline tree   # bookmark every folder and file
+python combine_manual.py FOLDER --plan plan.csv --output OUT.pdf --ocr-engine paddle   # order + titles given
 python combine_manual.py FOLDER --skip-unrecoverable   # combine readable parts, name the rest
 python combine_manual.py FOLDER --no-repair            # refuse instead of repairing
 ```
@@ -45,6 +46,20 @@ python combine_manual.py FOLDER --no-repair            # refuse instead of repai
   has (a Lexus IS350 TIS export: 3,456 documents under system/subject folders, which one bookmark
   per top folder left unfindable). Titles are names on disk and no pages are added; the finished
   file is read back and the run prints how many of the outline items it carries.
+- `--plan plan.csv` gives the **page order and every bookmark title explicitly** (columns
+  `path,title[,pages]`, paths relative to the folder; a file row places that file, a folder row
+  only titles it). For a set whose names carry neither: a seller's export of a scanned Japanese
+  manual numbers files and subfolders in two separate series, so `1.部品配置図.pdf` and the folder
+  `1.自己診断の方法` both claim position 1 while the printed folios put the files first, and its
+  names are Japanese where the readers want English. `pages` (`3`, `2-5`, `1,4-6`, 1-based, in
+  the order given) takes only those pages, so one file can be merged in pieces; `0` and `prev`
+  are a bookmark with no page of its own, on the next or the last page merged (a topic whose
+  only printed page it shares with the next one); the title `-` names pages deliberately left
+  out, listed in the output. Refused before anything is written: a page of any file under the
+  folder that no row accounts for, a page claimed twice, a path or page that does not exist, a
+  `prev` with nothing before it, and an order that splits a folder into two runs. No page is
+  deduplicated by the tool under a plan. `--output` writes the result somewhere other than
+  beside the folder; `--ocr-engine` and `--replace-text` are passed to the compress step.
 - **The result is verified before the tool exits**: it must reopen and carry exactly the sum of
   its inputs' page counts, counted over the pages actually merged. Staged to a `.part` and moved
   into place only once that passes.

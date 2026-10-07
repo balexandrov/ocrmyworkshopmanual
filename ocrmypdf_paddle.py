@@ -66,6 +66,16 @@ _lock = threading.Lock()
 # recognition calls queue on it; page rendering and PDF assembly around them still overlap.
 _gpu_lock = threading.Lock()
 
+# The engine is rebuilt every this many pages, because one engine's memory only ever grows.
+# Measured on DirectML (GTX 1060): ~5.8 GB private after the first 300 dpi page, then +120 MB
+# for each further page of a new size, never returned -- with onnxruntime's CPU arena off (as
+# RapidOCR ships it) and with its memory-pattern optimisation off alike. Over a real book
+# OCRmyPDF's process grew 85 MB a page on 300 dpi scans and ~490 MB a page on high-resolution
+# ones: 36.9 GB on a 432-page manual, 1.4 GB of 47.9 left free. Dropping the engine returns it
+# all (6.9 GB -> 0.8 GB) and a rebuild takes ~2 s, about 1.5% of ten pages' recognition.
+_RECYCLE_EVERY = 10
+_pages_done = 0
+
 
 def _providers() -> tuple[bool, bool]:
     """(use_dml, use_cuda): whichever GPU provider this onnxruntime build offers."""
@@ -98,6 +108,30 @@ def _get_engine():
                 params['EngineConfig.onnxruntime.inter_op_num_threads'] = 1
             _engine = RapidOCR(params=params)
         return _engine
+
+
+def _count_page():
+    """Drop the engine after every `_RECYCLE_EVERY` pages, so the next page builds a fresh
+    one. On a GPU this runs under `_gpu_lock`, so no other page is inside the engine and it
+    is torn down here; on the CPU a thread still inside the old engine keeps its own
+    reference, and the old engine's memory goes when the last such call returns."""
+    global _engine, _pages_done
+    with _lock:
+        _pages_done += 1
+        if _pages_done % _RECYCLE_EVERY:
+            return
+        _engine = None
+    import gc
+    gc.collect()
+
+
+def _recognise(src):
+    """Run the engine on one page, then count the page (which may drop the engine)."""
+    engine = _get_engine()
+    r = engine(src)
+    del engine
+    _count_page()
+    return r
 
 
 def _line(quad, text: str, score: float) -> OcrElement:
@@ -135,12 +169,15 @@ def ocr_page(input_file: Path, page_number: int = 0,
     page = OcrElement(ocr_class=OcrClass.PAGE,
                       bbox=BoundingBox(left=0, top=0, right=width, bottom=height),
                       dpi=dpi, page_number=page_number)
-    engine = _get_engine()
-    if _gpu:
+    if any(_providers()):
+        # Building, using and dropping an engine all touch the GPU, so all of it queues on
+        # the lock. Recycling with only the recognition call locked crashed DirectML with an
+        # access violation (0xC0000005) after ~100 rebuilds on a 1,071-page manual: a new
+        # session was created, or an old one torn down, while another page was mid-call.
         with _gpu_lock:
-            r = engine(src)
+            r = _recognise(src)
     else:
-        r = engine(src)
+        r = _recognise(src)
     if r.boxes is None:
         return page, ''
     if scale < 1.0:

@@ -155,6 +155,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--ocr-engine E` | `tesseract` | `tesseract` or `paddle` (PaddleOCR PP-OCRv6 — [OCR engines](docs/ocr.md#ocr-engines)). A file in a language `paddle` does not read still goes to Tesseract, and the report note says so |
 | `--paddle-dpi N` | `0` | With `--ocr-engine paddle`: read pages scanned finer than N dpi at N — faster, and the text layer is still mapped onto the full page. `0` = native resolution, the most accurate |
 | `--no-ocr` | off | Skip the searchable text layer |
+| `--replace-text` | off | Drop the invisible OCR layer a scan already carries and OCR every page afresh, for a set whose old OCR is worse than this run's. Visible text is never touched; sampled pages must render the same without the layer, else the file fails |
 | `--sauvola-k F` | `0.30` | Threshold sensitivity (lower = bolder ink, higher = thinner) |
 | `--min-size N` | `10` | Drop black speckles smaller than N px (an area at 300 dpi, scaled by dpi²) |
 | `--no-despeckle` | off | Skip speckle removal |

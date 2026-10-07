@@ -734,6 +734,8 @@ def _validate_numeric_args(args) -> str:
         (args.paddle_dpi >= 0, '--paddle-dpi must be >= 0 (0 = native resolution)'),
         (not args.paddle_dpi or args.ocr_engine == 'paddle',
          '--paddle-dpi only applies with --ocr-engine paddle'),
+        (not (args.replace_text and args.no_ocr),
+         '--replace-text needs OCR; it cannot be combined with --no-ocr'),
     ]
     bad = [msg for ok, msg in checks if not ok]
     return '; '.join(bad) if bad else None
@@ -1512,6 +1514,47 @@ def _page_geometry(page) -> tuple:
     return w_in, h_in, bw, bh
 
 
+def _stencil_only_pages(src_p: Path) -> list:
+    """1-based numbers of the pages whose every image is an /ImageMask stencil.
+
+    ocrmypdf does not count a stencil as a renderable image, so such a page reads as 0 dpi
+    to it. With an engine that hands it a ready OCR tree (the paddle plugin) it then builds
+    the text layer at that dpi and divides by it: measured on a 26-page dealer-CD part whose
+    six pages had been re-saved by Illustrator (the scan wrapped in a `/Layer` marked-content
+    block, its 1-bit image turned into a stencil), `ZeroDivisionError` in ocrmypdf's fpdf
+    renderer, the whole file FAILED with no text layer. Tesseract is not affected: its hOCR
+    carries the raster's dpi, which ocrmypdf prefers there."""
+    import pikepdf
+    out = []
+
+    def kinds(res, depth=0):
+        got = []
+        if res is None or depth > _FORM_MAX_DEPTH:
+            return got
+        xo = res.get('/XObject') or {}
+        for name in list(xo.keys()):
+            x = xo[name]
+            sub = x.get('/Subtype')
+            if sub == '/Image':
+                got.append(bool(x.get('/ImageMask', False)))
+            elif sub == '/Form':
+                got += kinds(x.get('/Resources'), depth + 1)
+        return got
+
+    try:
+        with pikepdf.open(str(src_p)) as p:
+            for k, page in enumerate(p.pages):
+                try:
+                    masks = kinds(_inherited_resources(page.obj))
+                except Exception:
+                    continue
+                if masks and all(masks):
+                    out.append(k + 1)
+    except Exception:
+        return []
+    return out
+
+
 def _ocrmypdf_raster_mp(src_p: Path, sample: int = 40) -> tuple:
     """(worst_megapixels, page_no, native_dpi) that ocrmypdf would rasterise for OCR.
 
@@ -1739,7 +1782,15 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     # at each page's own native dpi, and graft the text onto the untouched original.
     if preserve_images or has_vector:
         worst_mp, worst_pg, native = _ocrmypdf_raster_mp(src_p)
-        if worst_mp > _OCR_RASTER_BUDGET_MP:
+        # The same render-and-graft route also takes a file ocrmypdf would read as 0 dpi on
+        # some page under the paddle engine -- see `_stencil_only_pages`.
+        stencils = (_stencil_only_pages(src_p)
+                    if OCR_ENGINE == 'paddle' and worst_mp <= _OCR_RASTER_BUDGET_MP else [])
+        if worst_mp > _OCR_RASTER_BUDGET_MP or stencils:
+            why = (f'{len(stencils)} pg hold their scan as a stencil mask, which ocrmypdf'
+                   f' reads as 0 dpi' if stencils else
+                   f'page {worst_pg} declares a box ocrmypdf would rasterise to'
+                   f' {worst_mp:.0f} MP')
             with _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
                 got, nnote = _ocr_donor_from_render(src_p, work, language, timeout, jobs)
             if got is None:
@@ -1753,8 +1804,7 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                 return None, language, (' (OCR FAILED - native-render graft onto the'
                                         ' untouched source failed: ' + repr(ex) + ')')
             return shipped, language, (
-                f' (lang:{language}, OCR at native ~{native:.0f} dpi: page {worst_pg}'
-                f' declares a box ocrmypdf would rasterise to {worst_mp:.0f} MP)' + nnote)
+                f' (lang:{language}, OCR at native ~{native:.0f} dpi: {why})' + nnote)
     # Budget from THIS file's page count, held for the whole call. `--jobs` cannot be changed
     # on a running process, so a number sampled from queue state here is frozen for however
     # long the file takes — hours, on the manuals that need the threads most.
@@ -2202,6 +2252,116 @@ def _carried_text_pages(pdf: Path, boiler=frozenset()) -> set:
     except Exception:
         return set()
     return out
+
+
+def _strip_invisible_ops(page):
+    """The page's content with every text object that draws ONLY invisible (Tr 3) glyphs
+    removed, or None if there is no such object. A text object that shows any glyph visibly
+    is kept whole: dropping one show operator out of it would move the glyphs after it,
+    since each one advances the text matrix. Text in a Form XObject is not touched.
+
+    Text state (Tr, Tf, Tc ...) outlives ET, so a block kept AFTER a dropped one could have
+    been relying on state the dropped one set. Such a page is left whole (None) rather than
+    reconstructed; the caller counts it as still carrying text."""
+    import pikepdf
+    try:
+        ops = pikepdf.parse_content_stream(page)
+    except Exception:
+        return None
+    keep, block, stack, tr, dropped = [], None, [], 0, 0
+    visible = False
+    for operands, op in ops:
+        o = str(op)
+        if block is not None:
+            block.append((operands, op))
+            if o == 'Tr':
+                try:
+                    tr = int(operands[0])
+                except Exception:
+                    visible = True              # unreadable mode: keep the block, the safe side
+            elif o in _TEXT_SHOW_OPS and tr != _TR_INVISIBLE:
+                visible = True
+            elif o == 'ET':
+                if visible:
+                    if dropped:
+                        return None
+                    keep.extend(block)
+                else:
+                    dropped += 1
+                block = None
+            continue
+        if o == 'BT':
+            block, visible = [(operands, op)], False
+            continue
+        if o == 'q':
+            stack.append(tr)
+        elif o == 'Q':
+            tr = stack.pop() if stack else 0
+        elif o == 'Tr':
+            try:
+                tr = int(operands[0])
+            except Exception:
+                pass
+        keep.append((operands, op))
+    if block is not None:                         # unterminated BT: leave the page alone
+        return None
+    if not dropped:
+        return None
+    return pikepdf.unparse_content_stream(keep)
+
+
+def _strip_text_layer(src_p: Path, out: Path) -> dict:
+    """Write `src_p` to `out` without its invisible text layer, for --replace-text.
+
+    For a set whose existing OCR layer is worse than what this tool would write. Measured on
+    a 1998 Japanese service manual from a dealer CD (432 pages): an old engine's layer, one
+    `BT 3 Tr ... ET` per page, read the kanji as Latin noise on a sixth of its pages and was
+    missing from 54. Carried or kept, that layer ships; only removing it first gets every page
+    OCR'd. Since the layer draws nothing, the pages must render exactly as before -- checked on
+    a spread of pages, and the rewrite is refused (`err`) if any differs.
+
+    Returns {'pages': n changed, 'left': pages still carrying text, 'err': str or None}."""
+    import pikepdf
+    from PIL import Image, ImageChops
+    res = {'pages': 0, 'left': 0, 'err': None}
+    try:
+        with pikepdf.open(str(src_p)) as p:
+            for page in p.pages:
+                data = _strip_invisible_ops(page)
+                if data is None:
+                    continue
+                page.obj.Contents = p.make_stream(data)
+                res['pages'] += 1
+            if not res['pages']:
+                return res
+            out.parent.mkdir(parents=True, exist_ok=True)
+            p.save(str(out))
+    except Exception as ex:
+        res['err'] = f'{ex.__class__.__name__}: {ex}'
+        return res
+    n = _page_count(out)
+    if n != _page_count(src_p):
+        res['err'] = f'page count {_page_count(src_p)} -> {n}'
+        return res
+    tmp = Path(tempfile.mkdtemp(prefix='rt_'))
+    try:
+        for i in _lossless_sample_pages(n):
+            a, b = tmp / 'a.png', tmp / 'b.png'
+            if not (_render_page_gray(src_p, i + 1, a, 50) and _render_page_gray(out, i + 1, b, 50)):
+                res['err'] = f'page {i + 1}: could not render to compare'
+                return res
+            with Image.open(a) as ia, Image.open(b) as ib:
+                if ia.size != ib.size or ImageChops.difference(ia, ib).getbbox() is not None:
+                    res['err'] = f'page {i + 1}: renders differently without its text layer'
+                    return res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        res['left'] = sum(1 for pg in PdfReader(str(out)).pages
+                          if (pg.extract_text() or '').strip())
+    except Exception:
+        pass
+    return res
 
 
 def _carried_text_xobject(pdf, page, dst_box):
@@ -3678,6 +3838,25 @@ def _mergefonts_source(src_p: Path, work: Path) -> tuple:
     return out, res, None
 
 
+def _replacetext_source(src_p: Path, work: Path) -> tuple:
+    """(path_to_read, result, error) for --replace-text. Returns `src_p` untouched when no
+    page carries a separable invisible layer. See `_strip_text_layer`."""
+    out = work / 'textstripped' / src_p.name
+    res = _strip_text_layer(src_p, out)
+    if res['err']:
+        return src_p, res, res['err']
+    return (out if res['pages'] else src_p), res, None
+
+
+def _replacetext_note(res) -> str:
+    if not res or not res['pages']:
+        return ''
+    note = f' (source text layer dropped on {res["pages"]} pg)'
+    if res['left']:
+        note += f' ({res["left"]} pg still carry text and keep it)'
+    return note
+
+
 def _lossless_sample_pages(n: int, want: int = 12) -> list:
     """Deterministic spread of page indices to fingerprint: both ends plus an even spread.
     Deterministic so the same file verifies identically on every run."""
@@ -4652,7 +4831,8 @@ def _compress_one(src: str, dest: str, dpi: int,
                   lossless_min_mb: float = None,
                   dedupe_images: bool = True, recompress_images: int = RECOMPRESS_IMAGES_Q,
                   decrypt: bool = True, dewatermark: bool = True,
-                  fix_spaces: bool = True, merge_fonts: bool = True) -> dict:
+                  fix_spaces: bool = True, merge_fonts: bool = True,
+                  replace_text: bool = False) -> dict:
     """Render -> classify each page into a PageType -> per-type strategy -> merge -> OCR.
 
     PAGE-TYPE ROUTER: classify_page() sorts each page into LINE/BLANK (bitonal),
@@ -4725,6 +4905,18 @@ def _compress_one(src: str, dest: str, dpi: int,
                 dnote += f' (font-merge scan skipped: {ferr})'
         dnote += pdffonts.note_for(ff_res)
         dewatermarked = dewatermarked or bool(ff_res and ff_res.get('fonts') and not ff_res.get('err'))
+        # THEN, with --replace-text, drop the source's own invisible text layer, so every
+        # path below sees an image-only scan and OCRs every page (see `_strip_text_layer`).
+        # Unlike the passes above, a failure here IS a file failure: the run was asked for a
+        # new layer, and shipping the old one instead would hand back what it was told to
+        # replace while reporting success.
+        if replace_text and ocr:
+            src_p, rt_res, rterr = _replacetext_source(src_p, work)
+            if rterr:
+                return {'src': src_p.name, 'orig': orig, 'new': 0,
+                        'err': f'--replace-text: {rterr} — original kept'}
+            dnote += _replacetext_note(rt_res)
+            dewatermarked = dewatermarked or bool(rt_res['pages'])
         # How many pages the SOURCE has. Everything downstream is verified against this,
         # never against the rendered count: on a corrupt PDF, rendering (or the repair
         # fallback) can silently yield fewer pages, and verifying the output against that
@@ -5290,7 +5482,7 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                  min_compress_mb: float = None, lossless: bool = True,
                  recompress_images: int = RECOMPRESS_IMAGES_Q,
                  dewatermark: bool = True, fix_spaces: bool = True,
-                 merge_fonts: bool = True) -> dict:
+                 merge_fonts: bool = True, replace_text: bool = False) -> dict:
     """Predict what compress_one WOULD do to a file, WITHOUT writing anything. Used by
     --dry-run so a huge collection can be previewed (born-digital? scanned? projected
     size?) before committing to a full run. Uses the same born-digital check, the same
@@ -5333,6 +5525,14 @@ def _preview_one(src: str, dpi: int, despeckle: bool, min_size: int,
                               f'{len(_faces)} face(s))')
             except Exception as ex:
                 wnote += f' (font-merge scan skipped: {ex.__class__.__name__})'
+        if replace_text and ocr:
+            # Stripped into the scratch dir and predicted from there, because the layer
+            # decides everything that follows (`has_text`, born-digital, which OCR runs).
+            src_p, rt_res, rterr = _replacetext_source(src_p, work)
+            if rterr:
+                return {'src': Path(src).name, 'orig': orig, 'new': 0,
+                        'err': f'--replace-text: {rterr}'}
+            wnote += _replacetext_note(rt_res).replace(' dropped', ' would be dropped')
         born, bsig = looks_born_digital(src_p)
         if born:
             # A born-digital row used to predict only "would copy untouched", which is no
@@ -5852,6 +6052,12 @@ def main():
                     help='descreen grayscale photo pages: gaussian sigma (scaled to dpi) that merges '
                          'halftone dot grain into smooth tone — less dithering + smaller (0 = off; default 0.6)')
     ap.add_argument('--no-ocr', action='store_true', help='skip the searchable OCR text layer')
+    ap.add_argument('--replace-text', action='store_true',
+                    help='drop the invisible text layer a scan already carries and OCR every '
+                         'page afresh, for a set whose old OCR is worse than this run would '
+                         'write. Only a layer that draws nothing is removed (sampled pages must '
+                         'render the same without it, else the file FAILS); visible text is '
+                         'never touched. Default: keep an existing layer, OCR what lacks one')
     ap.add_argument('--verbose', action='store_true',
                     help='also echo each PDF-library warning to the console, prefixed with the '
                          'file it came from. They always go to the report .csv `warnings` '
@@ -6090,7 +6296,8 @@ def main():
           f'{"fix-links" if not args.no_fix_links else "links as-is"}, '
           f'{"de-watermark" if not args.no_dewatermark else "watermarks as-is"}, '
           f'{"fix-spaces" if not args.no_fix_spaces else "spaces as-is"}, '
-          f'{"merge-fonts" if not args.no_merge_fonts else "fonts as-is"}')
+          f'{"merge-fonts" if not args.no_merge_fonts else "fonts as-is"}'
+          f'{", replace-text" if args.replace_text else ""}')
     # The thresholds that decide compress-vs-keep. They used to be recorded only in the
     # report .log header; with the report being a per-file table, the console is where the
     # run's settings live, so print all of them rather than most of them.
@@ -6179,6 +6386,7 @@ def main():
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,
                                   merge_fonts=not args.no_merge_fonts,
+                                  replace_text=args.replace_text,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
@@ -6197,6 +6405,7 @@ def main():
                                   dewatermark=not args.no_dewatermark,
                                   fix_spaces=not args.no_fix_spaces,
                                   merge_fonts=not args.no_merge_fonts,
+                                  replace_text=args.replace_text,
                                   fix_links=not args.no_fix_links,
                                   verbose=args.verbose): (s, d)
                         for s, d in jobs}
@@ -6353,6 +6562,12 @@ def main():
              'what --retry-failed reads)')
     if interrupted:
         sys.exit(130)   # conventional exit code for Ctrl-C
+    # A FAILED file is the tool keeping the original, which is right -- but a caller that
+    # only sees the exit status must hear about it. It used to exit 0 whatever happened:
+    # combine_manual.py announced "Done" over a 432-page combined manual that came back
+    # byte-identical (no OCR added, 54 pages without text), and a build shipped it.
+    if fail:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

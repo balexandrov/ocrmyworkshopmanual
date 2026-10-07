@@ -473,6 +473,180 @@ def test_the_tree_outline_bookmarks_every_folder_and_every_document(tmp_path):
                      (0, 'Engine'): 4, (1, '2GR-FSE ENGINE CONTROL'): 4, (2, 'P0101'): 4}
 
 
+def _plan(path: Path, rows) -> Path:
+    import csv
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['path', 'title'])
+        w.writerows(rows)
+    return path
+
+
+def _seller_set(root: Path) -> Path:
+    """The shape of a seller's export of a scanned Japanese manual: files and subfolders
+    numbered in two separate series, while the printed folios put every file first."""
+    ov = root / '1.システム概要'
+    _pdf(ov / '1.自己診断の方法' / '1.チェックエンジンランプによる方法.pdf')
+    _pdf(ov / '1.部品配置図.pdf', npages=2)
+    _pdf(ov / '2.入出力図.pdf', npages=4)
+    return ov
+
+
+def test_a_plan_sets_the_order_and_every_title(tmp_path):
+    """--plan: the order no sort of the names can find (files 1-2 print before folder 1),
+    and English titles over Japanese names. A folder row only titles; a file row places."""
+    root = tmp_path / 'book'
+    _seller_set(root)
+    _pdf(root / 'まえがき.pdf')
+    plan = _plan(tmp_path / 'plan.csv', [
+        ('まえがき.pdf', 'Foreword'),
+        ('1.システム概要', 'System Overview'),
+        ('1.システム概要/1.部品配置図.pdf', 'Component Locations'),
+        ('1.システム概要\\2.入出力図.pdf', 'ECU Input/Output Diagram'),
+        ('1.システム概要/1.自己診断の方法', 'Self-Diagnosis Procedure'),
+        ('1.システム概要/1.自己診断の方法/1.チェックエンジンランプによる方法.pdf', ''),
+    ])
+    files, tree, sel, left_out = CM.read_plan(plan, root)
+    assert sel == {} and left_out == []
+    assert [p.name for p in files] == ['まえがき.pdf', '1.部品配置図.pdf', '2.入出力図.pdf',
+                                       '1.チェックエンジンランプによる方法.pdf']
+    assert [it for i in sorted(tree) for it in tree[i]] == [
+        (0, 'Foreword'), (0, 'System Overview'), (1, 'Component Locations'),
+        (1, 'ECU Input/Output Diagram'), (1, 'Self-Diagnosis Procedure'),
+        (2, '1.チェックエンジンランプによる方法')]          # an empty title keeps the name
+    out = tmp_path / 'book.pdf'
+    assert CM.combine(files, out, tree=tree) == 8
+    assert CM.outline_count(out) == 6
+
+
+def test_a_plan_that_leaves_a_page_file_out_is_refused(tmp_path):
+    root = tmp_path / 'book'
+    _seller_set(root)
+    plan = _plan(tmp_path / 'plan.csv', [('1.システム概要/1.部品配置図.pdf', 'A'),
+                                         ('1.システム概要/2.入出力図.pdf', 'B')])
+    with pytest.raises(CM.PlanError, match='not wholly in the plan'):
+        CM.read_plan(plan, root)
+
+
+def test_a_plan_that_splits_a_folder_is_refused(tmp_path):
+    """A folder's bookmark can open one run of pages only, so its pages must stay together."""
+    root = tmp_path / 'book'
+    ov = _seller_set(root)
+    _pdf(root / '2.その他.pdf')
+    plan = _plan(tmp_path / 'plan.csv', [
+        ('1.システム概要/1.部品配置図.pdf', ''), ('2.その他.pdf', ''),
+        ('1.システム概要/2.入出力図.pdf', ''),
+        ('1.システム概要/1.自己診断の方法/1.チェックエンジンランプによる方法.pdf', '')])
+    with pytest.raises(CM.PlanError, match='splits the folder'):
+        CM.read_plan(plan, root)
+
+
+def test_a_plan_naming_a_missing_or_repeated_file_is_refused(tmp_path):
+    root = tmp_path / 'book'
+    _seller_set(root)
+    with pytest.raises(CM.PlanError, match='no such file'):
+        CM.read_plan(_plan(tmp_path / 'p1.csv', [('nope.pdf', '')]), root)
+    with pytest.raises(CM.PlanError, match='claimed twice'):
+        CM.read_plan(_plan(tmp_path / 'p2.csv', [('1.システム概要/2.入出力図.pdf', '')] * 2), root)
+
+
+def _plan3(path: Path, rows) -> Path:
+    import csv
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['path', 'title', 'pages'])
+        w.writerows(rows)
+    return path
+
+
+def test_plan_pages_split_a_muddled_part_and_leave_out_a_duplicate(tmp_path):
+    """The seller packed a duplicate of the page before, the code list and the code's own pages
+    into one file: rows with `pages` take each piece where the book prints it, under its own
+    bookmark, and `-` leaves the duplicate out -- named, never silent."""
+    root = tmp_path / 'book'
+    _pdf(root / '1.method.pdf')                                  # printed 7-7
+    _pdf(root / 'codes' / '1.code11.pdf', npages=5)              # 7-7 (dup), 7-8, 7-10..7-12
+    plan = _plan3(tmp_path / 'plan.csv', [
+        ('1.method.pdf', 'Self-Diagnosis', ''),
+        ('codes', 'Diagnosis by Trouble Code', ''),
+        ('codes/1.code11.pdf', 'Trouble Code List', '2'),
+        ('codes/1.code11.pdf', 'Code 11', '3-5'),
+        ('codes/1.code11.pdf', '-', '1'),
+    ])
+    files, tree, sel, left_out = CM.read_plan(plan, root)
+    assert sel == {1: [1], 2: [2, 3, 4]}
+    assert [(p.name, pg) for p, pg in left_out] == [('1.code11.pdf', [0])]
+    assert [it for i in sorted(tree) for it in tree[i]] == [
+        (0, 'Self-Diagnosis'), (0, 'Diagnosis by Trouble Code'), (1, 'Trouble Code List'),
+        (1, 'Code 11')]
+    out = tmp_path / 'book.pdf'
+    assert CM.combine(files, out, tree=tree, sel=sel) == 5      # 6 pages in, 1 left out
+    assert CM.outline_count(out) == 4
+
+
+def test_a_bookmark_only_row_opens_on_the_shared_page(tmp_path):
+    """One printed page ends topic A and starts topic B, and the seller saved it in both files.
+    Kept once (in B), A's bookmark has no page of its own and opens on that shared page."""
+    root = tmp_path / 'book'
+    _pdf(root / '1.a.pdf')                       # the shared page only
+    _pdf(root / '2.b.pdf', npages=2)             # the shared page, then B's own
+    plan = _plan3(tmp_path / 'plan.csv', [('1.a.pdf', 'A', '0'), ('2.b.pdf', 'B', ''),
+                                          ('1.a.pdf', '-', '1')])
+    files, tree, sel, left_out = CM.read_plan(plan, root)
+    out = tmp_path / 'book.pdf'
+    assert CM.combine(files, out, tree=tree, sel=sel) == 2
+    r = PdfReader(str(out))
+    assert [(str(it.title), r.get_destination_page_number(it)) for it in r.outline] == [('A', 0), ('B', 0)]
+
+
+def test_a_prev_row_opens_on_the_page_merged_last(tmp_path):
+    """Page 2 opens two topics, A's own and the first of folder F, saved in both files: kept in A,
+    F's first topic gets a bookmark on it with `prev` -- the next page is F's second topic's."""
+    root = tmp_path / 'book'
+    _pdf(root / '1.a.pdf', npages=2)                 # A, then the shared page
+    _pdf(root / 'F' / '1.first.pdf')                 # the shared page only
+    _pdf(root / 'F' / '2.second.pdf')
+    plan = _plan3(tmp_path / 'plan.csv', [
+        ('1.a.pdf', 'A', ''), ('F', 'Folder', ''), ('F/1.first.pdf', 'First', 'prev'),
+        ('F/2.second.pdf', 'Second', ''), ('F/1.first.pdf', '-', '1')])
+    files, tree, sel, left_out = CM.read_plan(plan, root)
+    out = tmp_path / 'book.pdf'
+    assert CM.combine(files, out, tree=tree, sel=sel) == 3
+    r = PdfReader(str(out))
+    got = []
+
+    def walk(items):
+        for it in items:
+            if isinstance(it, list):
+                walk(it)
+            else:
+                got.append((str(it.title), r.get_destination_page_number(it)))
+    walk(r.outline)
+    assert got == [('A', 0), ('Folder', 1), ('First', 1), ('Second', 2)]
+
+
+def test_a_prev_row_with_nothing_before_it_is_refused(tmp_path):
+    root = tmp_path / 'book'
+    _pdf(root / 'a.pdf')
+    with pytest.raises(CM.PlanError, match='prev'):
+        CM.read_plan(_plan3(tmp_path / 'plan.csv', [('a.pdf', 'A', 'prev'), ('a.pdf', 'A', '1')]), root)
+
+
+def test_a_plan_that_leaves_a_page_unaccounted_for_is_refused(tmp_path):
+    root = tmp_path / 'book'
+    _pdf(root / 'a.pdf', npages=3)
+    plan = _plan3(tmp_path / 'plan.csv', [('a.pdf', 'A', '1-2')])
+    with pytest.raises(CM.PlanError, match=r'pages \[3\]'):
+        CM.read_plan(plan, root)
+
+
+def test_a_plan_page_outside_the_file_is_refused(tmp_path):
+    root = tmp_path / 'book'
+    _pdf(root / 'a.pdf', npages=2)
+    with pytest.raises(CM.PlanError, match='outside 1..2'):
+        CM.read_plan(_plan3(tmp_path / 'plan.csv', [('a.pdf', 'A', '1-3')]), root)
+
+
 def test_the_tree_outline_nests_each_parts_own_bookmarks_under_it(tmp_path):
     """A part that brings its own outline keeps it -- under the part's entry, not beside it.
     Left to the merge, pypdf files a part's bookmarks at the root, so a set of chapter PDFs with

@@ -5,6 +5,51 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — the paddle engine's memory no longer grows with the book
+
+One RapidOCR engine's memory only ever grew: measured on DirectML (GTX 1060), ~5.8 GB after the
+first 300 dpi page, then +120 MB for each page of a new size, never returned -- with
+onnxruntime's CPU arena off (as RapidOCR ships it) and with its memory-pattern optimisation off
+alike. OCRmyPDF's process reached 36.9 GB on a 432-page manual, leaving 1.4 GB of 47.9 free, and
+~490 MB a page on high-resolution scans. The plugin now rebuilds its engine every 10 pages:
+dropping it returns everything (6.9 -> 0.8 GB), a rebuild takes ~2 s (about 1.5% of ten pages),
+and a 1,071-page manual ran with at least 34 GB free throughout. On a GPU, building, calling and
+tearing down the engine all hold the one GPU lock: with only the call locked, DirectML crashed
+(0xC0000005) after ~100 rebuilds, a session created or destroyed while another page was mid-call.
+
+### Added — `combine_manual.py --plan`, `--output`, `--ocr-engine`
+
+`--plan plan.csv` gives the page order and every bookmark title explicitly, for a set whose file
+names carry neither: a seller's export of a scanned Japanese manual numbered its files and its
+subfolders in two separate series, and its names were Japanese where the readers wanted English.
+A row can take only some pages of a file, place a bookmark with no page of its own (`0`, `prev`),
+or name pages deliberately left out (`-`); a plan that leaves any page unaccounted for, claims one
+twice, or splits a folder is refused before anything is written. `--output` writes the result
+elsewhere; `--ocr-engine` is passed to the compress step. Written for a 27-book dealer CD.
+
+### Added — `--replace-text` (and `combine_manual.py --replace-text`)
+
+Drops the invisible (Tr 3) text layer a scan already carries, so every page is OCR'd afresh,
+instead of keeping or carrying that layer. For a set whose old OCR is the worse one: measured on
+a 432-page Japanese service manual from a dealer CD, the old engine's layer read kanji as Latin
+noise on a sixth of its pages and was missing from 54; on a 26-page part the new layer reads
+Japanese on 26 pages against 16. Only text objects whose every glyph is invisible are removed,
+and the file fails rather than ship if a sampled page renders differently without them.
+
+### Fixed — a scan stored as a stencil mask fails no more under `--ocr-engine paddle`
+
+A page whose only image is an `/ImageMask` stencil reads as 0 dpi to ocrmypdf, and with an
+engine that hands it an OCR tree it builds the text layer at that dpi: `ZeroDivisionError`, the
+whole file FAILED. Measured on the same CD, whose pages had been re-saved by Illustrator — 53 of
+432 pages in one book, 19-22 in three others. Such a file is now OCR'd from the tool's own
+native-resolution render and the text grafted onto the untouched original, the route already
+taken for pages ocrmypdf would rasterise too large.
+
+### Fixed — a run with a FAILED file exits 1
+
+It exited 0 whatever happened, so a caller that reads only the exit status — `combine_manual.py`
+among them — reported success over a file that had been left untouched.
+
 ### Fixed — `--outline tree` keeps each part's own bookmarks under the part
 
 A part that brought its own outline had it filed at the root by the merge, beside the file
