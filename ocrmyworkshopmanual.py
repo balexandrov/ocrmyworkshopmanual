@@ -1851,7 +1851,11 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
                 if x.strip()]
         why = _exit_meaning(r.returncode)
         if tail:
-            why += ': ' + tail[-1][:200]
+            # Both ends of a long line: DirectML's message is a source path first and its
+            # cause last ("8007000E Not enough memory resources..."), so a 200-character
+            # head named a file in Microsoft's build tree and no cause, three runs running.
+            last = tail[-1]
+            why += ': ' + (last if len(last) <= 400 else f'{last[:160]} ... {last[-240:]}')
         if not out.exists():
             why += ' (no output file)'
         elif not out.stat().st_size:
@@ -2254,11 +2258,65 @@ def _carried_text_pages(pdf: Path, boiler=frozenset()) -> set:
     return out
 
 
+# Operators a Form may use and still paint nothing when its only glyphs are Tr 3: graphics
+# and text state, colour, marked content, and path construction ended by `n` (no paint).
+_NO_PAINT_OPS = frozenset(('q', 'Q', 'cm', 'w', 'J', 'j', 'M', 'd', 'ri', 'i', 'gs',
+                           'CS', 'cs', 'SC', 'SCN', 'sc', 'scn', 'G', 'g', 'RG', 'rg', 'K', 'k',
+                           'm', 'l', 'c', 'v', 'y', 'h', 're', 'n', 'W', 'W*')) | _TEXT_KEEP_OPS
+
+
+def _invisible_form(x) -> bool:
+    """True if Form XObject `x` draws nothing but invisible (Tr 3) glyphs -- the shape of the
+    text layer OCRmyPDF writes (`q /OCR-... Do Q`, measured on this tool's own output). A
+    Form that paints anything, draws another XObject, or uses a Type 3 font (whose glyph
+    procedures Tr does not govern) is not one. Unsure answers False, the safe side."""
+    import pikepdf
+    try:
+        if x.get('/Subtype') != '/Form':
+            return False
+        fonts = (x.get('/Resources') or {}).get('/Font') or {}
+        if any(fonts[n].get('/Subtype') == '/Type3' for n in fonts.keys()):
+            return False
+        tr, stack, shown = 0, [], 0
+        for operands, op in pikepdf.parse_content_stream(x):
+            o = str(op)
+            if o == 'q':
+                stack.append(tr)
+            elif o == 'Q':
+                tr = stack.pop() if stack else 0
+            elif o == 'Tr':
+                tr = int(operands[0])
+            elif o in _TEXT_SHOW_OPS:
+                if tr != _TR_INVISIBLE:
+                    return False
+                shown += 1
+            elif o not in _NO_PAINT_OPS:
+                return False
+        return shown > 0
+    except Exception:
+        return False
+
+
+def _invisible_form_names(page) -> set:
+    """Names of the page's Form XObjects that draw only invisible text (`_invisible_form`)."""
+    res = _inherited_resources(page.obj)
+    xo = res.get('/XObject') if res is not None else None
+    if not xo:
+        return set()
+    return {str(n) for n in xo.keys() if _invisible_form(xo[n])}
+
+
 def _strip_invisible_ops(page):
     """The page's content with every text object that draws ONLY invisible (Tr 3) glyphs
     removed, or None if there is no such object. A text object that shows any glyph visibly
     is kept whole: dropping one show operator out of it would move the glyphs after it,
-    since each one advances the text matrix. Text in a Form XObject is not touched.
+    since each one advances the text matrix.
+
+    A Form XObject is dropped (its `Do`) only when it draws nothing but invisible text: that is
+    how OCRmyPDF stores its layer, so without this --replace-text could not replace a layer
+    this tool wrote itself (measured: a re-run on its own Japanese wiring manual reported
+    'had text, OCR skipped' on every page). `Do` restores the graphics state, text state
+    included, so dropping one changes nothing that follows it.
 
     Text state (Tr, Tf, Tc ...) outlives ET, so a block kept AFTER a dropped one could have
     been relying on state the dropped one set. Such a page is left whole (None) rather than
@@ -2266,9 +2324,10 @@ def _strip_invisible_ops(page):
     import pikepdf
     try:
         ops = pikepdf.parse_content_stream(page)
+        forms = _invisible_form_names(page)
     except Exception:
         return None
-    keep, block, stack, tr, dropped = [], None, [], 0, 0
+    keep, block, stack, tr, dropped, dropped_forms = [], None, [], 0, 0, 0
     visible = False
     for operands, op in ops:
         o = str(op)
@@ -2293,6 +2352,9 @@ def _strip_invisible_ops(page):
         if o == 'BT':
             block, visible = [(operands, op)], False
             continue
+        if o == 'Do' and operands and str(operands[0]) in forms:
+            dropped_forms += 1
+            continue
         if o == 'q':
             stack.append(tr)
         elif o == 'Q':
@@ -2305,9 +2367,25 @@ def _strip_invisible_ops(page):
         keep.append((operands, op))
     if block is not None:                         # unterminated BT: leave the page alone
         return None
-    if not dropped:
+    if not (dropped or dropped_forms):
         return None
     return pikepdf.unparse_content_stream(keep)
+
+
+def _prune_invisible_forms(pdf, page, data: bytes):
+    """Remove from the page's /XObject the invisible-text Forms its new content `data` no
+    longer draws, so the old layer does not travel on as dead bytes. The resources are copied
+    first: they can be inherited or shared with other pages, which keep theirs."""
+    import pikepdf
+    gone = {n for n in _invisible_form_names(page)
+            if not re.search(re.escape(n.encode()) + rb'\s+Do\b', data)}
+    if not gone:
+        return
+    res = _inherited_resources(page.obj)
+    new_res = pikepdf.Dictionary({k: v for k, v in res.items()})
+    new_res['/XObject'] = pikepdf.Dictionary(
+        {k: v for k, v in res['/XObject'].items() if str(k) not in gone})
+    page.obj['/Resources'] = pdf.make_indirect(new_res)
 
 
 def _strip_text_layer(src_p: Path, out: Path) -> dict:
@@ -2331,6 +2409,7 @@ def _strip_text_layer(src_p: Path, out: Path) -> dict:
                 if data is None:
                     continue
                 page.obj.Contents = p.make_stream(data)
+                _prune_invisible_forms(p, page, data)
                 res['pages'] += 1
             if not res['pages']:
                 return res

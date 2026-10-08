@@ -89,9 +89,20 @@ def test_paddle_dpi_reads_smaller_but_maps_back_to_the_full_page(tmp_path, monke
         w, h = im.size
     seen, real = [], paddle._get_engine
 
+    class Spy:
+        """Records what the page call is given; everything else reaches the real engine."""
+        def __init__(self, engine):
+            self.engine = engine
+
+        def __call__(self, x):
+            seen.append(getattr(x, 'size', None))
+            return self.engine(x)
+
+        def __getattr__(self, name):
+            return getattr(self.engine, name)
+
     def spy():
-        engine = real()
-        return lambda x: (seen.append(getattr(x, 'size', None)), engine(x))[1]
+        return Spy(real())
     monkeypatch.setattr(paddle, '_get_engine', spy)
     full, _ = paddle.ocr_page(png)
     half, t_half = paddle.ocr_page(png, max_dpi=150)
@@ -199,6 +210,70 @@ def test_the_engine_is_rebuilt_every_few_pages(tmp_path, monkeypatch):
     for _ in range(2 * n + 1):
         paddle.ocr_page(png)
     assert len(built) == 3, 'a fresh engine after each block of pages, and only then'
+    monkeypatch.setattr(paddle, '_engine', None)
+
+
+def _faulting_engine(fail_on_gpu: int):
+    """A fake RapidOCR whose GPU engines raise onnxruntime's error for the first
+    `fail_on_gpu` calls in all; CPU engines always work. Records which kind ran."""
+    from rapidocr.inference_engine.onnxruntime.main import ONNXRuntimeError
+    log = {'gpu_fail': fail_on_gpu, 'built': [], 'ran': []}
+
+    class FakeEngine:
+        def __init__(self, params=None):
+            self.gpu = bool(params['EngineConfig.onnxruntime.use_dml'])
+            log['built'].append('gpu' if self.gpu else 'cpu')
+
+        def __call__(self, src):
+            if self.gpu and log['gpu_fail']:
+                log['gpu_fail'] -= 1
+                raise ONNXRuntimeError('[ONNXRuntimeError] : 1 : FAIL : 887A0006 The GPU will '
+                                       'not respond to more commands')
+            log['ran'].append('gpu' if self.gpu else 'cpu')
+
+            class R:
+                boxes = txts = scores = None
+            return R()
+    return FakeEngine, log
+
+
+@needs_paddle
+@pytest.mark.parametrize('faults, ran, built', [
+    (1, ['gpu'], ['gpu', 'gpu']),                     # retried on a fresh engine
+    (2, ['cpu'], ['gpu', 'gpu', 'cpu']),              # then read on the CPU
+])
+def test_a_gpu_fault_costs_the_page_a_retry_not_the_file(tmp_path, monkeypatch, faults, ran, built):
+    """DirectML failed a whole 69-page manual on one page, three runs out of three."""
+    from PIL import Image
+    fake, log = _faulting_engine(faults)
+    monkeypatch.setattr(paddle, 'RapidOCR', fake)
+    monkeypatch.setattr(paddle, '_providers', lambda: (True, False))
+    monkeypatch.setattr(paddle, '_engine', None)
+    monkeypatch.setattr(paddle, '_pages_done', 0)
+    png = tmp_path / 'p.png'
+    Image.new('L', (200, 300), 255).save(png, dpi=(300, 300))
+    paddle.ocr_page(png)
+    assert (log['ran'], log['built']) == (ran, built)
+    monkeypatch.setattr(paddle, '_engine', None)
+
+
+@needs_paddle
+def test_an_error_that_is_not_the_gpus_still_fails_the_page(tmp_path, monkeypatch):
+    from PIL import Image
+
+    class Broken:
+        def __init__(self, params=None):
+            pass
+
+        def __call__(self, src):
+            raise ValueError('a bug, not the GPU')
+    monkeypatch.setattr(paddle, 'RapidOCR', Broken)
+    monkeypatch.setattr(paddle, '_providers', lambda: (True, False))
+    monkeypatch.setattr(paddle, '_engine', None)
+    png = tmp_path / 'p.png'
+    Image.new('L', (200, 300), 255).save(png, dpi=(300, 300))
+    with pytest.raises(ValueError):
+        paddle.ocr_page(png)
     monkeypatch.setattr(paddle, '_engine', None)
 
 

@@ -5,6 +5,31 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — `--ocr-engine paddle` reads text turned a quarter, and lays it on the label
+
+Labels running up or down a diagram -- wire colours and notes beside the wires of a wiring
+diagram -- were mostly lost. Measured on a Japanese wiring diagram, four "(セダン)" labels each
+starting with a "BrY" wire colour: the text layer held two, one read upside down as "(5.64)",
+both as 5x7 pt boxes beside the label, and no "BrY". Four causes, each fixed:
+
+- **Read upside down.** RapidOCR turns a tall crop counter-clockwise and only turns it back when
+  the direction classifier is over 90% sure; on a small label it was 0.866 or less, and the
+  upside-down reading scored *higher* than the right one, so no score could catch it. A tall
+  crop is now classified both ways up and read whichever way looks more upright.
+- **Not found.** The detector, trained on level text, found two of the four labels, cut short.
+  Each page is now also detected turned a quarter clockwise, where such labels are level text,
+  and the lines found there are merged in -- only if at least 0.6 of the page's line height
+  thick (real labels measured 0.63-0.89, columns of connector pin cells read sideways as one
+  "line" 0.24-0.56), and never over a confident upright reading they do not contain. On five
+  non-diagram pages it found nothing to add. It costs a detection pass: 7-14 s a page on a
+  GTX 1060, against 9-29 s for the upright pass.
+- **Dropped.** A label read upside down scored low and the engine discarded it, box and all,
+  before it could be re-read; the score cut now applies after the re-read.
+- **Misplaced in the layer.** Every tall line was laid as reading top to bottom, and OCRmyPDF's
+  renderer stretches a word to its box's *page* width and turns a line about its top-left
+  corner: a 35 pt label's text covered 9 pt of it, and a top-to-bottom label sat one thickness
+  to its left. Lines now carry their real direction, and the plugin compensates for both.
+
 ### Fixed — the paddle engine's memory no longer grows with the book
 
 One RapidOCR engine's memory only ever grew: measured on DirectML (GTX 1060), ~5.8 GB after the

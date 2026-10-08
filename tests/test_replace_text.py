@@ -108,6 +108,67 @@ def test_a_mixed_block_is_kept_whole(tmp_path):
         assert owm._strip_invisible_ops(p.pages[0]) is None
 
 
+def _add_form_layer(pdf_path, form_ops: bytes, name='/OCR-layer'):
+    """Draw `form_ops` on every page from a Form XObject, appended as its own content stream
+    -- how OCRmyPDF stores its text layer (`q /OCR-... Do Q`, measured on its output)."""
+    import pikepdf
+    with pikepdf.open(str(pdf_path), allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            mb = [float(v) for v in page.mediabox]
+            form = pikepdf.Stream(pdf, form_ops)
+            form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+            form.BBox = pikepdf.Array(mb)
+            form.Resources = pikepdf.Dictionary()
+            U._add_font(pdf, form.Resources, '/F1')
+            page.obj.Resources.XObject[name] = pdf.make_indirect(form)
+            page.contents_add(pikepdf.Stream(pdf, f'q {name} Do Q'.encode()), prepend=False)
+        pdf.save()
+    return pdf_path
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_a_layer_in_a_form_like_ocrmypdfs_own_is_stripped(tmp_path):
+    """Re-run with --replace-text on its own output, the tool used to keep the layer and
+    report 'had text, OCR skipped': OCRmyPDF's layer lives in a Form, which was not touched."""
+    import pikepdf
+    src = _add_form_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=2),
+                          b'BT 3 Tr /F1 11 Tf 60 700 Td (old layer words) Tj ET')
+    assert all('old layer words' in t for t in _texts(src))
+    out = tmp_path / 'out.pdf'
+    res = owm._strip_text_layer(src, out)
+    assert res == {'pages': 2, 'left': 0, 'err': None}
+    with pikepdf.open(str(out)) as p:
+        assert all('/OCR-layer' not in p.pages[i].obj.Resources.XObject for i in range(2)), \
+            'the dropped layer does not travel on as dead bytes'
+
+
+def test_a_form_that_paints_is_kept(tmp_path):
+    import pikepdf
+    src = _add_form_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=1),
+                          b'BT 3 Tr /F1 11 Tf 60 700 Td (words) Tj ET 0 0 10 10 re f')
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+    src2 = _add_form_layer(U.make_scan_pdf(tmp_path / 'src2.pdf', npages=1),
+                           b'BT 0 Tr /F1 11 Tf 60 700 Td (shown) Tj ET')
+    with pikepdf.open(str(src2)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_no_ocr is not None, reason=str(_no_ocr))
+def test_replace_text_replaces_the_tools_own_layer(tmp_path):
+    src = _add_form_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=2),
+                          b'BT 3 Tr /F1 11 Tf 60 700 Td (old layer words) Tj ET')
+    out = tmp_path / 'out.pdf'
+    res = owm.compress_one(str(src), str(out), 200, ocr=True, language='eng',
+                           replace_text=True)
+    assert not res.get('err'), res
+    assert 'source text layer dropped on 2 pg' in res['note'], res['note']
+    texts = _texts(out)
+    assert all('Scan page' in t for t in texts), 'every page carries the new OCR'
+    assert not any('old layer words' in t for t in texts), 'the old layer must be gone'
+
+
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 @pytest.mark.skipif(_no_ocr is not None, reason=str(_no_ocr))
 def test_replace_text_ocrs_the_page_instead_of_keeping_its_layer(tmp_path):
