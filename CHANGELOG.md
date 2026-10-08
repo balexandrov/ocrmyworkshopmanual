@@ -30,6 +30,31 @@ both as 5x7 pt boxes beside the label, and no "BrY". Four causes, each fixed:
   corner: a 35 pt label's text covered 9 pt of it, and a top-to-bottom label sat one thickness
   to its left. Lines now carry their real direction, and the plugin compensates for both.
 
+The turned pass detects on the page shrunk within `Global.max_side_len`, as the engine's own call
+does, and crops from the full page: detecting a 9652x6785 scan at full size ran the GPU out of
+memory (DirectML 8007000E) and failed the whole manual.
+
+### Fixed — `--replace-text` replaces a layer this tool wrote itself
+
+OCRmyPDF stores its text layer in a Form XObject (`q /OCR-... Do Q`), and only invisible text in
+the page's own content stream was dropped. Re-run on its own output, every page reported "had
+text, OCR skipped" and the old layer shipped. A Form that draws nothing but invisible (Tr 3)
+glyphs is now dropped too, and pruned from the page's resources; a Form that paints anything is
+kept, and the existing render comparison still guards every rewrite.
+
+### Fixed — one GPU fault no longer fails the whole file (`--ocr-engine paddle`)
+
+A fault inside onnxruntime on one page -- measured on DirectML, a 69-page manual of 600-800 dpi
+scans failed three runs out of three with "The GPU will not respond to more commands"
+(887A0006, the driver logging resets) -- failed the file. The page is now retried on a fresh
+engine, and if that faults too, read on the CPU. Any other error still fails the page.
+
+### Fixed — an OCR failure's reason keeps the end of a long message
+
+The report kept the first 200 characters of ocrmypdf's last stderr line. DirectML's message
+starts with a source path in Microsoft's build tree and ends with the cause, so the report named
+a file and no cause. A long line now keeps both ends.
+
 ### Fixed — the paddle engine's memory no longer grows with the book
 
 One RapidOCR engine's memory only ever grew: measured on DirectML (GTX 1060), ~5.8 GB after the
