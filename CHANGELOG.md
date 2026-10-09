@@ -5,6 +5,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — paddle no longer drops vertical lines it turns the wrong way up, or reads table rules as text
+
+The check that picks which way up a vertical line reads (added for turned wiring-diagram
+labels) is sometimes wrong on real tategaki. A line it gets wrong is not misread but
+**dropped**: read upside down it scores under the 0.5 cut. Measured on a Japanese diagnosis
+table, the column header "ライン圧ソレノイド" read "メハく" at 0.26 and vanished, where it reads
+0.84 the way it was cropped. Both views are now recognised, and a line whose chosen side
+falls under the cut while the other side clears it takes the other side. A line whose
+chosen side already clears the cut keeps its reading.
+
+Ruled and dotted lines in tables were read as text: "wwwwww" along table rules, "………" and
+"____" leaders. On one diagnosis table page that came to ~490 characters of junk. A level
+line at least twice as long as it is thick, and thinner than half the page's median line
+thickness, is now dropped. Measured on 15 pages of 200 dpi Japanese service and diagnosis
+scans: 178 such lines at 0.21-0.48 of the median, the thinnest real text at 0.61.
+
 ### Fixed — a paddle page read across a GPU reset no longer ships empty
 
 A GPU driver reset does not always fail the call it happens during. Measured in a test-suite

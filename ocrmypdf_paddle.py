@@ -224,7 +224,33 @@ def _recognise(src, engine=None):
     if out is None:
         return None
     keep = [i for i, s in enumerate(out[2]) if s >= _TEXT_SCORE]
+    out = tuple([part[i] for i in keep] for part in out)
+    keep = _not_rules(out[0], out[1], out[3])
     return tuple([part[i] for i in keep] for part in out)
+
+
+# A level "line" thinner than this fraction of the page's median line thickness is a ruled or
+# dotted line read as text, not text. Measured on 15 pages of Japanese service and diagnosis
+# manuals (200 dpi 1-bit scans, as OCRmyPDF renders them): 178 such lines -- "wwwwww" along
+# table rules, "………" and "____" leaders -- at 0.21-0.48; the thinnest real text at 0.61
+# ("BT0614M"), Japanese labels from 0.71. Thickness is a level line's height and a vertical
+# line's width, so a page of turned tables, whose level lines are mostly digit scraps, still
+# measures against its real text.
+_THIN_LINE = 0.5
+
+
+def _not_rules(boxes, txts, up):
+    """Indices of the lines to keep: all but level lines at least twice as long as they are
+    thick and thinner than `_THIN_LINE` of the page's median line. A one-glyph line (an arrow,
+    a "1") is never dropped -- it is not long, however thin."""
+    bb = [_aabb(q) for q in boxes]
+    thick = sorted((b[3] - b[1]) if u is None else (b[2] - b[0])
+                   for b, t, u in zip(bb, txts, up) if len(t.strip()) >= 2)
+    if not thick:
+        return list(range(len(boxes)))
+    cut = _THIN_LINE * thick[len(thick) // 2]
+    return [i for i, (b, u) in enumerate(zip(bb, up))
+            if not (u is None and b[3] - b[1] < cut and b[2] - b[0] >= 2 * (b[3] - b[1]))]
 
 
 def _is_vertical(quad) -> bool:
@@ -267,6 +293,34 @@ def _right_way_up(engine, crops):
     return [f if t else c for c, f, t in zip(crops, flips, turned)], turned
 
 
+def _read_right_way_up(engine, crops):
+    """(texts, scores, turned) for vertical crops: each read the way `_right_way_up` picks,
+    unless that reading falls under `_TEXT_SCORE` while the other way up clears it.
+
+    The comparison is not always right on real tategaki, and a line it gets wrong is not
+    misread but DROPPED: its upside-down reading scores low and `_recognise` cuts it. Measured
+    on a Japanese diagnosis table (column headers printed top to bottom): "ライン圧ソレノイド"
+    picked upside down read "メハく" at 0.26 and vanished, where RapidOCR's own rule had read
+    it at 0.84. Only a line that would otherwise be lost is changed, so a label the comparison
+    gets right keeps its reading -- e.g. "(セダン)", whose wrong side scores 0.818, over the cut."""
+    if not crops:
+        return [], [], []
+    from rapidocr.ch_ppocr_rec.typings import TextRecInput
+    picked, turned = _right_way_up(engine, crops)
+    other = [np.ascontiguousarray(np.rot90(c, 2)) for c in picked]
+    rec = engine.text_rec(TextRecInput(img=picked + other))
+    n = len(picked)
+    txts, scores, out_turned = [], [], []
+    for i in range(n):
+        j = i
+        if rec.scores[i] < _TEXT_SCORE <= rec.scores[n + i]:
+            j = n + i
+        txts.append(rec.txts[j])
+        scores.append(float(rec.scores[j]))
+        out_turned.append(turned[i] != (j != i))
+    return txts, scores, out_turned
+
+
 def _orient_vertical(engine, img, r):
     """Re-read every vertical line the right way up, and say which way it runs.
 
@@ -274,7 +328,6 @@ def _orient_vertical(engine, img, r):
     reads bottom to top upside down, and only turns it back when the direction classifier is
     over 90% sure (see `_right_way_up`). A crop it reads upside down turned over is a label
     reading bottom to top."""
-    from rapidocr.ch_ppocr_rec.typings import TextRecInput
     from rapidocr.utils.process_img import get_rotate_crop_image
     boxes, txts, scores = list(r.boxes), list(r.txts), list(r.scores)
     up = [None] * len(boxes)
@@ -282,10 +335,8 @@ def _orient_vertical(engine, img, r):
     if not idx:
         return boxes, txts, scores, up
     crops = [get_rotate_crop_image(img, np.array(boxes[i], dtype=np.float32)) for i in idx]
-    crops, turned = _right_way_up(engine, crops)
-    rec = engine.text_rec(TextRecInput(img=crops))
-    for i, t, txt, sc in zip(idx, turned, rec.txts, rec.scores):
-        txts[i], scores[i], up[i] = txt, float(sc), t
+    for i, txt, sc, t in zip(idx, *_read_right_way_up(engine, crops)):
+        txts[i], scores[i], up[i] = txt, sc, t
     return boxes, txts, scores, up
 
 
@@ -303,7 +354,6 @@ def _turned_lines(engine, img):
     does it, and the boxes are scaled back to crop from the full page. Measured: detecting on
     a 9652x6785 scan at full size ran the GPU out of memory (DirectML 8007000E) and failed
     the whole manual."""
-    from rapidocr.ch_ppocr_rec.typings import TextRecInput
     from rapidocr.utils.process_img import get_rotate_crop_image
     H = img.shape[0]
     turned_img = np.ascontiguousarray(np.rot90(img, -1))       # clockwise
@@ -317,10 +367,8 @@ def _turned_lines(engine, img):
     if not level:
         return []
     crops = [get_rotate_crop_image(turned_img, np.array(q, dtype=np.float32)) for q in level]
-    crops, flipped = _right_way_up(engine, crops)
-    rec = engine.text_rec(TextRecInput(img=crops))
     out = []
-    for q, f, txt, sc in zip(level, flipped, rec.txts, rec.scores):
+    for q, txt, sc, f in zip(level, *_read_right_way_up(engine, crops)):
         # turned point (x, y) came from page point (y, H - 1 - x)
         page_q = [(float(y), float(H - 1 - x)) for x, y in q]
         # level and upright on the clockwise-turned page = reads bottom to top on the page

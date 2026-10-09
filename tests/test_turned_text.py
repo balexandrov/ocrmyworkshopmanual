@@ -162,3 +162,70 @@ def test_the_merge_takes_labels_and_refuses_stacked_cells():
     assert 'BrY(セダン)' in txts and 'B' not in txts, 'the label replaces its scrap'
     assert '72' not in txts, 'too thin for this page'
     assert 'N3' not in txts and '2' in txts, 'a sure upright reading stands'
+
+
+class _FakeEngine:
+    """Classifier and recogniser keyed on where a crop's marker pixel sits: (0, 0) as cropped,
+    bottom-right once turned over. `cls_flip` says which view the classifier prefers."""
+
+    def __init__(self, as_cropped, turned_over, cls_flip):
+        self.read = {False: as_cropped, True: turned_over}
+        self.cls_flip = cls_flip
+
+    @staticmethod
+    def _over(img):
+        return bool(img[-1, -1].any())
+
+    def text_cls(self, crops):
+        from types import SimpleNamespace
+        return SimpleNamespace(cls_res=[('180' if self._over(c) == self.cls_flip else '0', 0.9)
+                                        for c in crops])
+
+    def text_rec(self, inp):
+        from types import SimpleNamespace
+        got = [self.read[self._over(c)] for c in inp.img]
+        return SimpleNamespace(txts=[t for t, _ in got], scores=[s for _, s in got])
+
+
+def _marked_crop():
+    import numpy as np
+    c = np.zeros((32, 320, 3), np.uint8)
+    c[0, 0] = 255
+    return c
+
+
+@needs_paddle
+def test_a_vertical_line_the_comparison_turns_wrong_is_not_lost():
+    """Measured on a diagnosis table's tategaki header: picked upside down, "ライン圧ソレノイド"
+    read "メハく" at 0.26 and was cut, where it reads 0.84 the way it was cropped."""
+    eng = _FakeEngine(('ライン圧ソレノイド', 0.84), ('メハく', 0.26), cls_flip=False)
+    # cls_flip=False: the classifier calls the as-cropped view upside down, so it is turned over
+    txts, scores, turned = paddle._read_right_way_up(eng, [_marked_crop()])
+    assert txts == ['ライン圧ソレノイド'] and scores == [0.84]
+    assert turned == [False], 'read as cropped: top to bottom'
+
+
+@needs_paddle
+def test_a_vertical_line_the_comparison_turns_right_keeps_its_reading():
+    """The "(セダン)" label: its wrong side scores 0.818, over the cut, so the comparison's
+    pick stands even though the two scores alone could not tell them apart."""
+    eng = _FakeEngine(('(5.64)', 0.818), ('(セタン)', 0.823), cls_flip=False)
+    txts, scores, turned = paddle._read_right_way_up(eng, [_marked_crop()])
+    assert txts == ['(セタン)'] and turned == [True]
+
+
+@needs_paddle
+def test_ruled_and_dotted_lines_are_not_text():
+    """Measured on 200 dpi diagnosis tables: table rules and leaders read as "wwwwww" / "………"
+    at 0.21-0.48 of the page's median line thickness, real text from 0.61."""
+    boxes = [_q(0, 0, 300, 30), _q(0, 50, 300, 80), _q(0, 100, 200, 130),      # text, 30 thick
+             _q(400, 0, 430, 300),                                              # vertical, 30 wide
+             _q(0, 200, 140, 207),                                              # rule, 7 thick
+             _q(0, 300, 200, 310),                                              # leader, 10 thick
+             _q(0, 400, 11, 409),                                               # a thin "→"
+             _q(0, 500, 100, 519)]                                              # small text, 0.63
+    txts = ['Level one', 'Level two', 'Level three', 'ソレノイド', 'wwwwww', '………', '→', 'BT0614M']
+    up = [None, None, None, False, None, None, None, None]
+    kept = [txts[i] for i in paddle._not_rules(boxes, txts, up)]
+    assert 'wwwwww' not in kept and '………' not in kept
+    assert kept == ['Level one', 'Level two', 'Level three', 'ソレノイド', '→', 'BT0614M']
