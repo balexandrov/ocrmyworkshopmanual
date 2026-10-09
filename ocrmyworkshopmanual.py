@@ -312,31 +312,37 @@ _OCR_WORKERS = 0
 _OCR_REMAINING = None
 _OCR_TOKENS = None
 
-# Which engine reads the page images: 'tesseract' (ocrmypdf's own) or 'paddle' (the
-# `ocrmypdf_paddle` plugin shipped beside this file). Set by `main` and by `_init_worker`,
-# because the pool is processes and a child does not inherit a parent's module globals.
+# Which engine reads the page images: 'tesseract' (ocrmypdf's own), or one of the plugins
+# shipped beside this file -- 'paddle' (`ocrmypdf_paddle`) or 'yomitoku'
+# (`ocrmypdf_yomitoku`). Set by `main` and by `_init_worker`, because the pool is processes
+# and a child does not inherit a parent's module globals.
 OCR_ENGINE = 'tesseract'
 PADDLE_DPI = 0                  # --paddle-dpi: 0 = read pages at their native resolution
 PADDLE_PLUGIN = Path(__file__).with_name('ocrmypdf_paddle.py')
+YOMITOKU_PLUGIN = Path(__file__).with_name('ocrmypdf_yomitoku.py')
+ENGINE_PLUGINS = {'paddle': PADDLE_PLUGIN, 'yomitoku': YOMITOKU_PLUGIN}
 
 
 def _engine_args(language: str) -> tuple:
     """(extra ocrmypdf arguments, note) for OCR_ENGINE on a file resolved to `language`.
 
-    A file whose language the paddle model does not read (Cyrillic, most notably) goes to
+    A file whose language the plugin's model does not read (Cyrillic, most notably) goes to
     Tesseract instead, and the note says so. The alternative is OCR in the wrong script,
     which replaces a missing text layer with noise — or no layer at all when ocrmypdf
     refuses the language."""
-    if OCR_ENGINE != 'paddle':
+    if OCR_ENGINE not in ENGINE_PLUGINS:
         return [], ''
-    from ocrmypdf_paddle import LANGUAGES
+    if OCR_ENGINE == 'paddle':
+        from ocrmypdf_paddle import LANGUAGES
+    else:
+        from ocrmypdf_yomitoku import LANGUAGES
     other = [p for p in language.split('+') if p not in LANGUAGES]
     if other:
-        return [], f' (engine tesseract: paddle does not read {"+".join(other)})'
-    if PADDLE_DPI:
-        return (['--plugin', str(PADDLE_PLUGIN), '--paddle-dpi', str(PADDLE_DPI)],
-                f' (engine paddle @{PADDLE_DPI} dpi)')
-    return ['--plugin', str(PADDLE_PLUGIN)], ' (engine paddle)'
+        return [], f' (engine tesseract: {OCR_ENGINE} does not read {"+".join(other)})'
+    plugin = ['--plugin', str(ENGINE_PLUGINS[OCR_ENGINE])]
+    if OCR_ENGINE == 'paddle' and PADDLE_DPI:
+        return plugin + ['--paddle-dpi', str(PADDLE_DPI)], f' (engine paddle @{PADDLE_DPI} dpi)'
+    return plugin, f' (engine {OCR_ENGINE})'
 
 
 def _installed_langs() -> set:
@@ -667,16 +673,21 @@ def _ocrmypdf_ok():
 
 
 def _paddle_error() -> str:
-    """'' if ocrmypdf can load the paddle plugin, else why not.
+    """'' if ocrmypdf can load the paddle plugin, else why not."""
+    return _plugin_error(PADDLE_PLUGIN)
+
+
+def _plugin_error(plugin: Path) -> str:
+    """'' if ocrmypdf can load the engine plugin `plugin`, else why not.
 
     Asked of the ocrmypdf this tool will actually run, not of this interpreter: OCRMYPDF can
     be a console script from another environment, and a package installed here would then
     prove nothing. The plugin imports its dependencies when loaded, so `--version` with it
     loaded is the whole test."""
-    if not PADDLE_PLUGIN.exists():
-        return f'{PADDLE_PLUGIN.name} is missing beside {Path(__file__).name}'
+    if not plugin.exists():
+        return f'{plugin.name} is missing beside {Path(__file__).name}'
     try:
-        r = subprocess.run(OCRMYPDF + ['--plugin', str(PADDLE_PLUGIN), '--version'],
+        r = subprocess.run(OCRMYPDF + ['--plugin', str(plugin), '--version'],
                            capture_output=True, text=True, timeout=120)
     except Exception as ex:
         return repr(ex)
@@ -712,6 +723,14 @@ def check_tools(want_ocr: bool, ocr_engine: str = 'tesseract'):
                         'Install `pip install rapidocr onnxruntime` into the environment '
                         'ocrmypdf runs from (onnxruntime-directml or onnxruntime-gpu instead '
                         'of onnxruntime to use a GPU).')
+        if ocr_engine == 'yomitoku':
+            why = _plugin_error(YOMITOKU_PLUGIN)
+            if why:
+                return (f'--ocr-engine yomitoku: ocrmypdf cannot load the plugin ({why}). '
+                        'Install `pip install yomitoku` into the environment ocrmypdf runs '
+                        'from; for an NVIDIA GPU install a CUDA build of torch first '
+                        '(pytorch.org). YomiToku is free for non-commercial use only '
+                        '(CC BY-NC-SA 4.0).')
     return None
 
 
@@ -1519,12 +1538,13 @@ def _stencil_only_pages(src_p: Path) -> list:
     """1-based numbers of the pages whose every image is an /ImageMask stencil.
 
     ocrmypdf does not count a stencil as a renderable image, so such a page reads as 0 dpi
-    to it. With an engine that hands it a ready OCR tree (the paddle plugin) it then builds
-    the text layer at that dpi and divides by it: measured on a 26-page dealer-CD part whose
-    six pages had been re-saved by Illustrator (the scan wrapped in a `/Layer` marked-content
-    block, its 1-bit image turned into a stencil), `ZeroDivisionError` in ocrmypdf's fpdf
-    renderer, the whole file FAILED with no text layer. Tesseract is not affected: its hOCR
-    carries the raster's dpi, which ocrmypdf prefers there."""
+    to it. With an engine that hands it a ready OCR tree (the paddle and yomitoku plugins)
+    it then builds the text layer at that dpi and divides by it: measured (paddle) on a
+    26-page dealer-CD part whose six pages had been re-saved by Illustrator (the scan
+    wrapped in a `/Layer` marked-content block, its 1-bit image turned into a stencil),
+    `ZeroDivisionError` in ocrmypdf's fpdf renderer, the whole file FAILED with no text
+    layer. Tesseract is not affected: its hOCR carries the raster's dpi, which ocrmypdf
+    prefers there."""
     import pikepdf
     out = []
 
@@ -1636,7 +1656,7 @@ def _ocr_failed_err(why: str) -> str:
     the original, so a file without one is not finished: the original is kept and the row
     says why."""
     opts = ['clear the cause and re-run it with --retry-failed <report>.csv']
-    if OCR_ENGINE == 'paddle':
+    if OCR_ENGINE in ENGINE_PLUGINS:
         opts.append('--ocr-engine tesseract to OCR it with Tesseract instead')
     opts.append('--no-ocr to process it without a text layer')
     why = why.replace('(OCR FAILED - ', '(').strip()
@@ -1784,9 +1804,9 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     if preserve_images or has_vector:
         worst_mp, worst_pg, native = _ocrmypdf_raster_mp(src_p)
         # The same render-and-graft route also takes a file ocrmypdf would read as 0 dpi on
-        # some page under the paddle engine -- see `_stencil_only_pages`.
+        # some page under a plugin engine -- see `_stencil_only_pages`.
         stencils = (_stencil_only_pages(src_p)
-                    if OCR_ENGINE == 'paddle' and worst_mp <= _OCR_RASTER_BUDGET_MP else [])
+                    if OCR_ENGINE in ENGINE_PLUGINS and worst_mp <= _OCR_RASTER_BUDGET_MP else [])
         if worst_mp > _OCR_RASTER_BUDGET_MP or stencils:
             why = (f'{len(stencils)} pg hold their scan as a stencil mask, which ocrmypdf'
                    f' reads as 0 dpi' if stencils else
@@ -6137,7 +6157,7 @@ def main():
                          'explicit spec to override, e.g. eng or eng+fra+spa+deu — a source whose '
                          'existing text layer proves another script still gets that pack added, '
                          'because OCR\'ing Cyrillic as English replaces real text with noise')
-    ap.add_argument('--ocr-engine', choices=('tesseract', 'paddle'), default='tesseract',
+    ap.add_argument('--ocr-engine', choices=('tesseract', 'paddle', 'yomitoku'), default='tesseract',
                     help="engine that reads the page images (default tesseract). 'paddle' is "
                          'PaddleOCR PP-OCRv6 via the ocrmypdf_paddle plugin: measured on '
                          'Japanese wiring manuals it found 25 of 28 diagram labels where '
@@ -6146,7 +6166,12 @@ def main():
                          'goes to Tesseract, and the report note says so. Needs '
                          '`pip install rapidocr onnxruntime` (or onnxruntime-directml / '
                          'onnxruntime-gpu to run on a GPU, ~6x faster). Language detection '
-                         'still uses Tesseract, so it stays installed either way')
+                         "still uses Tesseract, so it stays installed either way. 'yomitoku' "
+                         'is YomiToku via the ocrmypdf_yomitoku plugin, Japanese and English '
+                         'only: measured on 16 pages of Japanese service manuals it read 343 of '
+                         '354 hand-checked strings where paddle read 307, at 1.3 s a page '
+                         'against 3.6. Needs `pip install yomitoku` (a CUDA build of torch for '
+                         'an NVIDIA GPU); free for non-commercial use only (CC BY-NC-SA 4.0)')
     ap.add_argument('--paddle-dpi', type=int, default=0, metavar='DPI',
                     help='with --ocr-engine paddle: read pages scanned finer than DPI at DPI, '
                          'which is faster; the text layer is still mapped onto the full page. '

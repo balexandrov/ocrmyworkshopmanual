@@ -48,6 +48,37 @@ line whose box doesn't fit its text, and vertical text would silently vanish fro
 engine's availability is checked at startup through the ocrmypdf the tool will actually run, so a
 missing package fails the run up front rather than every file in turn.
 
+### YomiToku, for Japanese
+
+`--ocr-engine yomitoku` reads pages with [YomiToku](https://github.com/kotaro-kinoshita/yomitoku),
+a Japanese-only OCR on PyTorch, through the `ocrmypdf_yomitoku.py` plugin. Measured on 16 pages
+of 1998–2002 Japanese service, diagnosis, body-repair and wiring manuals (200–400 dpi scans),
+against 354 strings read off the page images by eye — a string counts when it appears verbatim:
+
+| | printed lines (109) | table cells (136) | diagram labels (109) | all (354) | s/page |
+|---|---|---|---|---|---|
+| **YomiToku 0.15** (`yomitoku`) | **104** | **133** | **106** | **343** | **1.3** (CUDA) |
+| PaddleOCR PP-OCRv6 (`paddle`) | 83 | 125 | 99 | 307 | 3.6 (DirectML) |
+| NDLOCR-Lite 1.2 | 91 | 89 | 29 | 209 | 1.4 (CPU) |
+
+Paddle reads Chinese and Japanese with one model and puts simplified-Chinese forms into Japanese
+words (交换 for 交換, 電压 for 電圧, 基準值 for 基準値); YomiToku makes single-kana slips instead
+(サプ for サブ). YomiToku garbles a page printed sideways — a connector table read 28 of 40 as it
+lies — so a page whose text reads mostly vertical is also read turned a quarter each way, and a
+turned reading that is clearly more confident replaces it: that table then reads 40 of 40 (the
+page takes three reads, 6.2 s). Without the turn YomiToku scores 331.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # NVIDIA GPU; skip for CPU
+pip install yomitoku
+python ocrmyworkshopmanual.py SRC --ocr-engine yomitoku
+```
+
+It needs **Python 3.13 or older**: every YomiToku since 0.5.2 declares `<3.14`, and pip on 3.14
+quietly installs 0.4.1, which the plugin refuses. It reads Japanese and English; any other
+language goes to Tesseract. YomiToku is licensed **CC BY-NC-SA 4.0 — non-commercial use only**;
+it is an optional dependency, not part of this repository.
+
 ## Carried OCR layers
 
 A scan that a desktop engine already made searchable used to be re-OCR'd on the compress path,

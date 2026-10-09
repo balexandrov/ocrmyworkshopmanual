@@ -6,6 +6,7 @@ CLAUDE.local.md
 __pycache__/
 *.pyc
 .venv/
+.venv*/
 venv/
 *.egg-info/
 

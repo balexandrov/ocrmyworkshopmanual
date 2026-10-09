@@ -40,6 +40,8 @@ any tree of scanned documents. For each page it decides the right treatment, com
 - **Per-file language detection** (`--language auto`)
 - **A second engine for Japanese and Chinese**: `--ocr-engine paddle` (PaddleOCR PP-OCRv6), which
   found 25 of 28 diagram labels on Japanese wiring manuals where Tesseract found 14
+- **A Japanese-only engine**: `--ocr-engine yomitoku` (YomiToku), which read 343 of 354
+  hand-checked strings on Japanese service manuals where paddle read 307 — non-commercial use only
 - **An existing OCR layer is carried** onto the compressed pages instead of being re-OCR'd
 - A file whose OCR fails is **FAILED**, never shipped without a text layer
 
@@ -71,7 +73,8 @@ any tree of scanned documents. For each page it decides the right treatment, com
   folders worth compressing; `helpers/` builds work lists, audits a pass and promotes results
 - `pdflinks.py`, `pdfspaces.py`, `pdffonts.py`, `pdfwatermark.py` run each clean-up stage on its
   own; `pdfrepair.py` gives pages back fonts/images/graphics states their content uses but their
-  resources lack; `ocrmypdf_paddle.py` is the paddle engine as a plain OCRmyPDF plugin
+  resources lack; `ocrmypdf_paddle.py` and `ocrmypdf_yomitoku.py` are the paddle and yomitoku
+  engines as plain OCRmyPDF plugins
 - Windows right-click menus: compress a PDF, compress a folder in place, combine a folder
 
 ---
@@ -104,7 +107,10 @@ The `jbig2topdf.py` wrapper ships in `tools/`. If a tool isn't on PATH, point at
 **Optional:** `pip install zopfli` enables `--born-digital max`. `pip install rapidocr onnxruntime`
 enables `--ocr-engine paddle`; install `onnxruntime-directml` (Windows, any DirectX 12 GPU) or
 `onnxruntime-gpu` (CUDA) *instead of* `onnxruntime` to run it on a GPU. The models are downloaded
-on first use.
+on first use. `pip install yomitoku` enables `--ocr-engine yomitoku` — on **Python 3.13 or
+older** (no YomiToku since 0.5.2 installs on 3.14), with a CUDA build of
+[torch](https://pytorch.org) installed first to run it on an NVIDIA GPU. YomiToku is licensed
+CC BY-NC-SA 4.0: free for non-commercial use only.
 
 ---
 
@@ -152,7 +158,7 @@ python ocrmyworkshopmanual.py --from-list reports/lossless_list.txt --dest OUT -
 | `--dpi N` | `200` | Render resolution (native scan dpi is usually ~200–220) |
 | `--workers N` | one per **physical** core | Files in parallel. OCR threads come from the same budget and follow how many files are still in flight, so the last file of a batch gets the cores the batch no longer needs |
 | `--language L` | `auto` | Tesseract language(s). `auto` detects each file's script from the image — Latin→`eng`, Cyrillic→`rus+eng`, CJK→`jpn+eng` — and adds any pack the file's existing text layer proves it needs. Or pass a spec: `eng+fra+spa+deu` |
-| `--ocr-engine E` | `tesseract` | `tesseract` or `paddle` (PaddleOCR PP-OCRv6 — [OCR engines](docs/ocr.md#ocr-engines)). A file in a language `paddle` does not read still goes to Tesseract, and the report note says so |
+| `--ocr-engine E` | `tesseract` | `tesseract`, `paddle` (PaddleOCR PP-OCRv6) or `yomitoku` (YomiToku, Japanese) — [OCR engines](docs/ocr.md#ocr-engines). A file in a language the engine does not read still goes to Tesseract, and the report note says so |
 | `--paddle-dpi N` | `0` | With `--ocr-engine paddle`: read pages scanned finer than N dpi at N — faster, and the text layer is still mapped onto the full page. `0` = native resolution, the most accurate |
 | `--no-ocr` | off | Skip the searchable text layer |
 | `--replace-text` | off | Drop the invisible OCR layer a scan already carries and OCR every page afresh, for a set whose old OCR is worse than this run's. Visible text is never touched; sampled pages must render the same without the layer, else the file fails |

@@ -5,6 +5,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `--ocr-engine yomitoku`: a Japanese-only engine that reads more than paddle
+
+`ocrmypdf_yomitoku.py` runs [YomiToku](https://github.com/kotaro-kinoshita/yomitoku) as an
+OCRmyPDF plugin, alongside the paddle one. Measured on 16 pages of 1998–2002 Japanese service,
+diagnosis, body-repair and wiring manuals, against 354 strings read off the page images by eye:
+343 found verbatim, against 307 for paddle and 209 for NDLOCR-Lite, at 1.3 s a page on CUDA
+against paddle's 3.6 on DirectML. Paddle's misses are dominated by simplified-Chinese forms in
+Japanese words (交换, 電压, 基準值); YomiToku's by single-kana slips (サプ for サブ).
+
+YomiToku garbles a page printed sideways — a connector table read 28 of 40 as it lies — so a
+page whose text reads at least half vertical is also read turned a quarter each way, and a turned
+reading 1.25× as confident replaces it: that table then reads 40 of 40. Upright pages measured
+0–3% vertical and never pay for the extra reads.
+
+No recognition-score cut, unlike paddle: correctly read lines scored as low as 0.23.
+
+YomiToku needs Python 3.13 or older (every release since 0.5.2 declares `<3.14`; pip on 3.14
+quietly installs 0.4.1, which the plugin refuses to load), and is licensed CC BY-NC-SA 4.0 —
+non-commercial use only. It is an optional dependency (`pip install .[yomitoku]`).
+
 ### Fixed — paddle no longer drops vertical lines it turns the wrong way up, or reads table rules as text
 
 The check that picks which way up a vertical line reads (added for turned wiring-diagram
