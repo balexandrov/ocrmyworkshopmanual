@@ -78,7 +78,7 @@ any tree of scanned documents. For each page it decides the right treatment, com
 
 ## Install
 
-**Python 3.10+** (3.11+ for `--config`/TOML, which needs stdlib `tomllib`):
+**Python 3.11+**:
 
 ```bash
 pip install -r requirements.txt
@@ -285,7 +285,7 @@ deciding what each *page* is, then proving the decision cost nothing.
 
 - Best on scanned line-art/text; photo-heavy documents stay larger (they must, to keep the
   photos). Colour/photo-heavy files may be kept as-is.
-- Developed and in daily use on Windows; CI runs the suite on Linux (Ubuntu, Python 3.10/3.11).
+- Developed and in daily use on Windows; CI runs the suite on Linux (Ubuntu, Python 3.11/3.14).
   macOS isn't automated yet — reports welcome.
 
 ## Contributing

@@ -32,7 +32,7 @@ tuning harness. Read that before touching `classify_page()`, the binarization
 pipeline, or the photo strategy — changes there should come with matrix
 numbers, not just "looked fine."
 
-CI (`.github/workflows/ci.yml`) runs the same suite on Python 3.10 and 3.11 on
+CI (`.github/workflows/ci.yml`) runs the same suite on Python 3.11 and 3.14 on
 every push and PR. It needs Ghostscript + jbig2enc, which it builds the same
 way the dev container does (no Debian/Ubuntu apt package ships the `jbig2`
 CLI, only the library — verified against the actual package repos, and worth

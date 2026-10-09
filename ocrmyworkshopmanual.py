@@ -96,6 +96,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections import Counter, namedtuple
 from pathlib import Path
 from typing import NamedTuple
@@ -5917,11 +5918,7 @@ def _apply_config_defaults(ap: argparse.ArgumentParser) -> None:
     """Load a TOML config of default option values and fold them into the parser
     (so an explicit CLI flag still overrides). Uses --config if given, else
     ./ocrmyworkshopmanual.toml when present. Keys are long option names with dashes
-    as underscores (e.g. `dpi = 300`, `no_ocr = true`, `dest = "OUT"`).
-    tomllib is stdlib only from Python 3.11+; the import is deferred to here (only
-    once a config file is actually in play) so a run with no config file works fine
-    on 3.10, and a run that DOES need one gets a clear error instead of crashing on
-    startup regardless of whether --config was ever used."""
+    as underscores (e.g. `dpi = 300`, `no_ocr = true`, `dest = "OUT"`)."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', type=Path)
     known, _ = pre.parse_known_args()
@@ -5931,13 +5928,6 @@ def _apply_config_defaults(ap: argparse.ArgumentParser) -> None:
         return
     if not path.exists():
         print(f'ERROR: config file not found: {path}', file=sys.stderr); sys.exit(1)
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        print('ERROR: reading a TOML config file needs Python 3.11+ (tomllib is stdlib '
-              'there); either upgrade Python or drop the --config / ocrmyworkshopmanual.toml '
-              'and pass options on the command line instead.', file=sys.stderr)
-        sys.exit(1)
     try:
         with open(path, 'rb') as f:
             cfg = tomllib.load(f)

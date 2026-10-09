@@ -5,6 +5,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — Python 3.11 is now the minimum
+
+ocrmypdf 17 requires 3.11, so on 3.10 pip quietly installed ocrmypdf 16.13 instead. That
+older version writes a text layer that pypdf reads back double-spaced ("Scan  page  1"),
+which failed two `--replace-text` tests in the 3.10 CI job: they look for the phrase
+"Scan page". 3.10 also reaches end of life in October 2026. With it gone, `tomllib` is
+always available, so the "needs 3.11+" fallback for `--config` and its test skips are
+removed too.
+
 ### Fixed — `--ocr-engine paddle` reads text turned a quarter, and lays it on the label
 
 Labels running up or down a diagram -- wire colours and notes beside the wires of a wiring

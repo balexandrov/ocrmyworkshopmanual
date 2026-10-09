@@ -20,9 +20,7 @@ and forgetting the metadata now fails here, next to the code, instead of in some
 install.
 """
 import pathlib
-import sys
-
-import pytest
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -31,10 +29,6 @@ NOT_SHIPPED = {'conftest'}
 
 
 def _declared():
-    try:
-        import tomllib
-    except ModuleNotFoundError:                    # 3.10: tomllib arrived in 3.11
-        pytest.skip('tomllib needs Python 3.11+')
     with open(ROOT / 'pyproject.toml', 'rb') as fh:
         return set(tomllib.load(fh)['tool']['setuptools']['py-modules'])
 
@@ -57,10 +51,6 @@ def test_py_modules_does_not_name_something_that_is_gone():
 
 def test_the_entry_points_name_modules_that_are_shipped():
     """A console script pointing at an unshipped module fails the same way, at run time."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        pytest.skip('tomllib needs Python 3.11+')
     with open(ROOT / 'pyproject.toml', 'rb') as fh:
         scripts = tomllib.load(fh)['project'].get('scripts', {})
     declared = _declared()

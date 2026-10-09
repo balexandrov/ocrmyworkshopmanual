@@ -12,15 +12,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 is the tool's stated floor; 3.11 is the floor for --config
-        # (tomllib is stdlib only from 3.11+) -- both are exercised here so a
-        # regression in either compatibility path is caught.
-        python-version: ["3.10", "3.11"]
+        # 3.11 is the floor: ocrmypdf 17 requires it, and on 3.10 pip silently
+        # resolves ocrmypdf 16, whose text layer extracts with doubled spaces --
+        # a different product from the one every real install gets. 3.14 is what
+        # development runs on.
+        python-version: ["3.11", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
