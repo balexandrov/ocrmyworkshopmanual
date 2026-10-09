@@ -14,6 +14,16 @@ which failed two `--replace-text` tests in the 3.10 CI job: they look for the ph
 always available, so the "needs 3.11+" fallback for `--config` and its test skips are
 removed too.
 
+### Fixed — paddle labels reading top to bottom sat beside the label on ocrmypdf 17.13
+
+ocrmypdf 17.13.0 fixed two renderer quirks that the paddle plugin had been bending its
+boxes to cancel: a turned word squeezed into the line's thickness, and a top-to-bottom line
+laid one thickness left of its box. With both fixed upstream, the plugin's correction moved
+the text one thickness *right*. Measured on a drawn label with ink at x 410-417 pt, the
+layer sat at 419-428. The plugin now passes the label's own box, and ocrmypdf 17.13 is the
+minimum. The layout test now reads glyph positions from the rendered PDF instead of the
+plugin's boxes, so a future renderer change shows up there.
+
 ### Fixed — `--ocr-engine paddle` reads text turned a quarter, and lays it on the label
 
 Labels running up or down a diagram -- wire colours and notes beside the wires of a wiring

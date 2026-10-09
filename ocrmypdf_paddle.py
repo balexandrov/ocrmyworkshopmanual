@@ -366,24 +366,16 @@ def _line(quad, text: str, score: float, up: bool | None = None) -> OcrElement:
     # A vertical line is a horizontal one turned a quarter: top to bottom is 90 degrees
     # clockwise, 270 counter-clockwise in hOCR's convention; bottom to top is 90.
     angle = None
-    word_box = box
     if len(text) > 1 and h > _VERTICAL_RATIO * w:
         angle = 90.0 if up else 270.0
-        # OCRmyPDF's renderer (16.x, fpdf_renderer) stretches a word to its box's width ACROSS
-        # THE PAGE, even on a turned line, so a label running up a diagram was squeezed into
-        # its own thickness: measured, "BrY(セダン)" on a 35 pt label covered 9 pt of it. The
-        # word's page-x extent is read for nothing else on a turned line (its place along the
-        # line comes from its page-y extent), so it is set to the line's length.
-        word_box = BoundingBox(left=box.left, top=box.top, right=box.left + h, bottom=box.bottom)
-        if not up:
-            # The renderer turns a line about its box's top-left corner, so a line reading
-            # top to bottom is laid one thickness LEFT of its box: measured on a drawn label
-            # with ink at x 410-417 pt, the layer sat at 396-408. Shifting the box right by
-            # its width lands it on the label; the width, the length and the place along the
-            # line are unchanged.
-            box = BoundingBox(left=box.left + w, top=box.top, right=box.right + w, bottom=box.bottom)
-            word_box = BoundingBox(left=box.left, top=box.top, right=box.left + h, bottom=box.bottom)
-    word = OcrElement(ocr_class=OcrClass.WORD, bbox=word_box, text=text, confidence=float(score))
+    # The line and its word carry the label's true box. Before OCRmyPDF 17.13 the renderer
+    # squeezed a turned word into its page-x thickness and laid a top-to-bottom line one
+    # thickness LEFT of its box, and this plugin bent the boxes to cancel both. 17.13 fixed
+    # both upstream (word width read along page y; baseline from the corner the rotation
+    # lands on), so the bent boxes then double-corrected: measured on a drawn label with ink
+    # at x 410.4-416.9 pt, 17.12.1 laid the layer at 410.1-419.3 and 17.13.0 at 421.8-431.0,
+    # beside it. Hence the ocrmypdf>=17.13 floor in pyproject.toml.
+    word = OcrElement(ocr_class=OcrClass.WORD, bbox=box, text=text, confidence=float(score))
     return OcrElement(ocr_class=OcrClass.LINE, bbox=box, textangle=angle, children=[word])
 
 

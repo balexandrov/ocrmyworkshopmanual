@@ -1,7 +1,7 @@
 numpy
 scipy
 Pillow
-ocrmypdf
+ocrmypdf>=17.13
 pypdf
 img2pdf
 fonttools

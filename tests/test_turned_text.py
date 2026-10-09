@@ -78,19 +78,26 @@ def test_turned_labels_reach_the_text_layer(tmp_path):
 
 @needs_paddle
 def test_turned_labels_sit_on_their_label_in_the_layer(tmp_path):
-    """Each turned line's text starts inside its label's column. Measured before: a label
-    reading top to bottom was laid one thickness left of its ink (396-408 pt vs 410-417)."""
+    """Each turned line's glyphs lie across its label's column and run its length, as the
+    rendered layer has them -- not as the plugin's boxes say, since what the renderer makes
+    of a box has changed between OCRmyPDF releases. Measured: OCRmyPDF 16.x squeezed a 35 pt
+    label's text into 9 pt of it; before 17.13 a label reading top to bottom was laid one
+    thickness left of its ink (396-408 pt vs 410-417); and on 17.13.0 the plugin's old
+    correction for that put it one thickness right (419-428)."""
     import img2pdf
     import numpy as np
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTChar
     from PIL import Image
     png = _turned_page(tmp_path / 'p.png')
     ink = np.array(Image.open(png)) < 128
     k = 300 / 72
-    lower = ink[ink.shape[0] // 2:, :]
-    cols = np.nonzero(lower.any(axis=0))[0]
-    mid = ink.shape[1] // 2
-    drawn = {'BRAKE': (cols[cols < mid].min() / k, cols[cols < mid].max() / k),
-             'OIL': (cols[cols >= mid].min() / k, cols[cols >= mid].max() / k)}
+    h, mid = ink.shape[0], ink.shape[1] // 2
+    ink[:h // 2] = False
+    drawn = {}
+    for key, sel, off in (('BRAKE', ink[:, :mid], 0), ('OIL', ink[:, mid:], mid)):
+        rows, cols = np.nonzero(sel.any(axis=1))[0], np.nonzero(sel.any(axis=0))[0] + off
+        drawn[key] = ((cols.min() / k, cols.max() / k), ((h - rows.max()) / k, (h - rows.min()) / k))
     src = tmp_path / 'in.pdf'
     src.write_bytes(img2pdf.convert(str(png), dpi=300))
     out = tmp_path / 'out.pdf'
@@ -98,29 +105,39 @@ def test_turned_labels_sit_on_their_label_in_the_layer(tmp_path):
                         '-l', 'eng', '--output-type', 'pdf', '-q', str(src), str(out)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-2000:]
-    starts = {}
+    chars = []
 
-    def visit(text, cm, tm, font, size):
-        for key in drawn:
-            if key in text and key not in starts:
-                starts[key] = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
-    PdfReader(str(out)).pages[0].extract_text(visitor_text=visit)
-    for key, (x0, x1) in drawn.items():
-        assert key in starts, f'{key} label not in the layer'
-        assert x0 - 3 <= starts[key] <= x1 + 3, f'{key}: text at x {starts[key]:.0f}, label {x0:.0f}-{x1:.0f}'
+    def walk(o):
+        if isinstance(o, LTChar):
+            chars.append(o)
+        elif hasattr(o, '__iter__'):
+            for c in o:
+                walk(c)
+    for p in extract_pages(str(out)):
+        walk(p)
+    half = mid / k
+    for key, ((x0, x1), (y0, y1)) in drawn.items():
+        cs = [c for c in chars if not c.upright and c.get_text().strip()
+              and (c.x0 < half) == (key == 'BRAKE')]
+        assert cs, f'{key} label not in the layer'
+        gx0, gx1 = min(c.x0 for c in cs), max(c.x1 for c in cs)
+        gy0, gy1 = min(c.y0 for c in cs), max(c.y1 for c in cs)
+        across = min(gx1, x1) - max(gx0, x0)
+        assert across >= 0.5 * (x1 - x0), f'{key}: text at x {gx0:.0f}-{gx1:.0f}, label {x0:.0f}-{x1:.0f}'
+        along = min(gy1, y1) - max(gy0, y0)
+        assert along >= 0.8 * (y1 - y0), f'{key}: text at y {gy0:.0f}-{gy1:.0f}, label {y0:.0f}-{y1:.0f}'
 
 
 @needs_paddle
-def test_a_turned_word_is_stretched_along_the_line_not_across_it():
-    """OCRmyPDF stretches a word to its box's page width even on a turned line; measured,
-    a 35 pt label's text covered 9 pt. The word's page width is therefore the line's length."""
-    tall = paddle._line([(0, 0), (40, 0), (40, 400), (0, 400)], 'BrY(セダン)', 0.9, up=True)
-    assert tall.textangle == 90.0
-    word = tall.children[0].bbox
-    assert word.right - word.left == 400
-    assert (word.top, word.bottom) == (0, 400), 'its place along the line is unchanged'
+def test_a_turned_line_carries_its_true_box():
+    """The plugin hands OCRmyPDF the label's own box and lets the renderer turn it (see
+    `_line`); a box bent to cancel one release's renderer misplaces it on the next."""
+    tall = paddle._line([(0, 0), (40, 0), (40, 400), (0, 400)], 'BrY(セダン)', 0.9, up=False)
+    assert tall.textangle == 270.0
+    assert tall.children[0].bbox == tall.bbox
+    assert (tall.bbox.left, tall.bbox.top, tall.bbox.right, tall.bbox.bottom) == (0, 0, 40, 400)
     level = paddle._line([(0, 0), (400, 0), (400, 40), (0, 40)], 'BrY(セダン)', 0.9)
-    assert level.children[0].bbox == level.bbox
+    assert level.textangle is None and level.children[0].bbox == level.bbox
 
 
 def _q(x0, y0, x1, y1):
