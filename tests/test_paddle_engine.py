@@ -257,6 +257,87 @@ def test_a_gpu_fault_costs_the_page_a_retry_not_the_file(tmp_path, monkeypatch, 
     monkeypatch.setattr(paddle, '_engine', None)
 
 
+def _silently_reset_engine(reset_gpu: int, provider='DmlExecutionProvider'):
+    """A fake RapidOCR whose first `reset_gpu` GPU engines read a page WITHOUT an error but
+    leave their device reset, so every later call on their sessions raises -- as a page read
+    across an NVIDIA driver reset came back empty and error-free. `provider` is the one its
+    sessions report first: a session onnxruntime fell back to the CPU for reports the CPU."""
+    from types import SimpleNamespace
+    log = {'reset': reset_gpu, 'built': [], 'ran': []}
+
+    class Session:
+        def __init__(self, dead):
+            self.dead = dead
+
+        def get_providers(self):
+            return [provider, 'CPUExecutionProvider']
+
+        def get_inputs(self):
+            return [SimpleNamespace(name='x', shape=['N', 3, 'H', 'W'])]
+
+        def run(self, names, feed):
+            assert feed['x'].shape == (1, 3, 64, 64)
+            if self.dead:
+                raise RuntimeError('887A0006 The GPU will not respond to more commands')
+
+    class FakeEngine:
+        def __init__(self, params=None):
+            self.gpu = bool(params['EngineConfig.onnxruntime.use_dml'])
+            dead = self.gpu and log['reset'] > 0
+            log['reset'] -= self.gpu
+            self.kind = 'gpu' if self.gpu else 'cpu'
+            log['built'].append(self.kind)
+            self.text_det = SimpleNamespace(session=SimpleNamespace(session=Session(dead)))
+            self.text_cls = None
+
+        def __call__(self, src):
+            log['ran'].append(self.kind)
+
+            class R:
+                boxes = txts = scores = None
+            return R()
+    return FakeEngine, log
+
+
+@needs_paddle
+@pytest.mark.parametrize('resets, provider, built', [
+    (1, 'DmlExecutionProvider', ['gpu', 'gpu']),            # untrusted read, then a fresh engine
+    (2, 'DmlExecutionProvider', ['gpu', 'gpu', 'cpu']),     # then read on the CPU
+    (1, 'CPUExecutionProvider', ['gpu']),                    # fell back to the CPU: trusted as read
+])
+def test_a_page_read_across_a_gpu_reset_is_read_again(tmp_path, monkeypatch, resets, provider, built):
+    """Measured: a page read across a driver reset came back with no text and no error, and the
+    file was reported OCR'd with an empty layer; the reset showed only in the NEXT call."""
+    from PIL import Image
+    fake, log = _silently_reset_engine(resets, provider)
+    monkeypatch.setattr(paddle, 'RapidOCR', fake)
+    monkeypatch.setattr(paddle, '_providers', lambda: (True, False))
+    monkeypatch.setattr(paddle, '_engine', None)
+    monkeypatch.setattr(paddle, '_pages_done', 0)
+    png = tmp_path / 'p.png'
+    Image.new('L', (200, 300), 255).save(png, dpi=(300, 300))
+    paddle.ocr_page(png)
+    assert log['built'] == built and log['ran'] == built, 'one read per engine, the last one kept'
+    monkeypatch.setattr(paddle, '_engine', None)
+
+
+@needs_paddle
+@pytest.mark.skipif(paddle is None or not any(paddle._providers()), reason='no GPU provider')
+def test_a_healthy_gpu_engine_passes_its_own_check(tmp_path):
+    """The check runs every loaded model on a made-up input; one that a real model refuses
+    (the classifier's pooling rejects 32 x 32) would have every page read three times."""
+    src = U.make_scan_pdf(tmp_path / 's.pdf', npages=1)
+    png = tmp_path / 'p.png'
+    assert U.render_gray(src, 1, 300, png)
+    paddle.ocr_page(png)
+    engine = paddle._get_engine()
+    if engine.text_det is None:                     # recycled just now: read on a fresh one
+        paddle.ocr_page(png)
+        engine = paddle._get_engine()
+    assert engine.text_det is not None and engine.text_rec is not None
+    assert paddle._gpu_healthy(engine)
+
+
 @needs_paddle
 def test_an_error_that_is_not_the_gpus_still_fails_the_page(tmp_path, monkeypatch):
     from PIL import Image

@@ -5,6 +5,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a paddle page read across a GPU reset no longer ships empty
+
+A GPU driver reset does not always fail the call it happens during. Measured in a test-suite
+run, a page read across an NVIDIA reset (System log event 153 in the same second) came back
+with no text and no error. The file was reported as OCR'd with an empty layer, and only the
+*next* call raised 887A0006 ("The GPU will not respond to more commands"). After each GPU
+page the plugin now runs one tiny inference on every model session the engine loaded. If
+any of them fails, the page is treated like a GPU fault: it is retried on a fresh engine,
+then on the CPU. That costs ~73 ms a page on a GTX 1060. A session onnxruntime quietly built
+on the CPU after a reset ("Falling back to CPUExecutionProvider") reads correctly and is
+trusted as it is.
+
 ### Changed — Python 3.11 is now the minimum
 
 ocrmypdf 17 requires 3.11, so on 3.10 pip quietly installed ocrmypdf 16.13 instead. That

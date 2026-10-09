@@ -142,20 +142,53 @@ def _recognise_on_gpu(src):
     of 600-800 dpi A3 scans: DirectML failed the WHOLE file on one page -- 'Not enough memory
     resources' (8007000E), and after that was fixed 'The GPU will not respond to more
     commands' (887A0006, the driver logging resets) -- three runs out of three, while the
-    same pages read one at a time went through. One page now costs seconds, not the book."""
-    try:
-        return _recognise(src)
-    except Exception as ex:
-        if not _is_gpu_fault(ex):
-            raise
-        _drop_engine()
-    try:
-        return _recognise(src)
-    except Exception as ex:
-        if not _is_gpu_fault(ex):
-            raise
+    same pages read one at a time went through. One page now costs seconds, not the book.
+
+    A page that comes back without an error is still kept only once `_gpu_healthy` says the
+    engine survived reading it; a read across a GPU reset counts as a fault."""
+    for _ in range(2):
+        engine = _get_engine()
+        try:
+            out = _recognise(src, engine)
+        except Exception as ex:
+            if not _is_gpu_fault(ex):
+                raise
+        else:
+            if _gpu_healthy(engine):
+                return out
+        del engine
         _drop_engine()
     return _recognise(src, RapidOCR(params=_engine_params(False, False)))
+
+
+def _gpu_healthy(engine) -> bool:
+    """Whether a page the engine has just read can be trusted: every model session it loaded
+    still answers. A GPU reset does not always fail the call it lands in -- measured in a
+    test-suite run, a 300 dpi page read across one (an NVIDIA driver reset, System log event
+    153 in the same second) came back with NO text and no error, and a file OCR'd that way
+    was reported as OCR'd with an empty layer. Every later call on the reset device fails with
+    887A0006 'The GPU will not respond to more commands', so one tiny run per session right
+    after the page ties the fault to that page: measured ~73 ms for the three sessions on a
+    GTX 1060 once warm, against seconds a page. A session onnxruntime quietly built on the
+    CPU instead ('EP Error ... Falling back to CPUExecutionProvider', which every new session
+    in a process gets once its GPU has been reset) reads correctly and is not probed."""
+    gpu = {'DmlExecutionProvider', 'CUDAExecutionProvider'}
+    try:
+        for name in ('text_det', 'text_cls', 'text_rec'):
+            model = getattr(engine, name, None)
+            if model is None:
+                continue
+            ort = model.session.session
+            if ort.get_providers()[0] not in gpu:
+                continue
+            inp = ort.get_inputs()[0]
+            # Dynamic dimensions as 1 x ... x 64: the classifier's pooling refuses 32 x 32
+            shape = [d if isinstance(d, int) else (1 if i == 0 else 64)
+                     for i, d in enumerate(inp.shape)]
+            ort.run(None, {inp.name: np.zeros(shape, np.float32)})
+    except Exception:
+        return False
+    return True
 
 
 def _count_page():
