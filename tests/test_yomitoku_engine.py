@@ -187,6 +187,39 @@ def test_concurrent_pages_are_serialised(tmp_path):
         assert f'page {n} line' in got[n], (n, got[n][:120])
 
 
+def _hold_gpu_turn(_):
+    """Pool task: the (start, end) of one `_gpu_turn`, held long enough to overlap."""
+    import time
+    with owm._gpu_turn():
+        t0 = time.monotonic()
+        time.sleep(0.6)
+        return t0, time.monotonic()
+
+
+def _turns_in_a_pool(engine):
+    import concurrent.futures as cf
+    import multiprocessing
+    with cf.ProcessPoolExecutor(max_workers=3, initializer=owm._init_worker,
+                                initargs=(1, 0, 3, None, None, engine, 0,
+                                          multiprocessing.Lock())) as ex:
+        list(ex.map(abs, range(6)))             # all three workers up before timing starts
+        return sorted(ex.map(_hold_gpu_turn, range(3)))
+
+
+def test_yomitoku_ocr_takes_turns_across_the_pool():
+    """Each worker's ocrmypdf loads its own model, so OCR calls must not run side by side
+    on one GPU -- but only OCR: the workers stay parallel for everything else."""
+    spans = _turns_in_a_pool('yomitoku')
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), spans
+
+
+def test_other_engines_ocr_in_parallel_across_the_pool():
+    """The lock is not taken for an engine that can run side by side (proves the test above
+    would see an overlap)."""
+    spans = _turns_in_a_pool('tesseract')
+    assert any(a[1] > b[0] for a, b in zip(spans, spans[1:])), spans
+
+
 @needs_yomi
 def test_a_gpu_fault_costs_the_page_a_retry_not_the_file(tmp_path, monkeypatch):
     """A CUDA error on a page drops the engine and reads the page again on a fresh one."""

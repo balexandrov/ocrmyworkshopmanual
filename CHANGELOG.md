@@ -5,6 +5,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — yomitoku OCRs one file at a time across the pool; everything else stays parallel
+
+Each ocrmypdf call loads its own YomiToku model onto the GPU. On an 8 GB card, 3 workers OCR'ing
+at once spilled ~1.1 GB to shared memory and ran ~5 s/page combined, against 2.6 s/page for one.
+`--workers 1` avoided that but serialised the CPU stages too: on 386-page manuals the page
+classifier alone took ~5 s/page on one core before the GPU saw a page. The pool now shares a
+lock held only around the yomitoku ocrmypdf call, so render, classify, JBIG2 and the audit run
+on every worker. Other engines are unaffected.
+
+### Fixed — `--replace-text` strips a text layer drawn under a full-page scan image
+
+ABBYY FineReader Engine 11 stores its layer as plain fill-mode text, then paints an opaque
+full-page image over it. Only invisible (Tr 3) text was recognised, so nothing was stripped and
+the new layer was audited against the old one: an 84-page Japanese manual (83 pages in this
+form) was refused for word recall 0.36. Text covered by an unmasked, unclipped image that spans
+the whole MediaBox is now removed; text drawn after the image, or under a masked, clipped,
+restyled or partial image, is kept, and the render-compare backstop still applies.
+
 ### Added — `--ocr-engine yomitoku`: a Japanese-only engine that reads more than paddle
 
 `ocrmypdf_yomitoku.py` runs [YomiToku](https://github.com/kotaro-kinoshita/yomitoku) as an

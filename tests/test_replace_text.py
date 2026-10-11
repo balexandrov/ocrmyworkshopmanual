@@ -108,6 +108,105 @@ def test_a_mixed_block_is_kept_whole(tmp_path):
         assert owm._strip_invisible_ops(p.pages[0]) is None
 
 
+COVERED = 'old covered words'
+
+
+def _covered_layer(pdf_path, before=b'', image=None):
+    """Every page drawn the way ABBYY FineReader Engine 11 stores its layer: plain fill-mode
+    text first, then the scan painted over the whole page (`q W 0 0 H 0 0 cm /BG Do Q`) --
+    measured on a 1996 Japanese new-model manual, 83 of its 84 pages. `before` goes between
+    the text and the image (a clip, a `gs`); `image(pdf, img)` may alter the image."""
+    import pikepdf
+    with pikepdf.open(str(pdf_path), allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            res = page.obj.Resources
+            U._add_font(pdf, res, '/F1')
+            (iname, img), = list(res.XObject.items())
+            if image:
+                image(pdf, img)
+            mb = [float(v) for v in page.mediabox]
+            page.Contents = pikepdf.Stream(pdf, (
+                f'q BT /F1 11 Tf 1 0 0 1 60 700 Tm ({COVERED}) Tj ET Q q '.encode() + before
+                + f' {mb[2]:g} 0 0 {mb[3]:g} 0 0 cm {iname} Do Q'.encode()))
+        pdf.save()
+    assert COVERED in _texts(pdf_path)[0], 'fixture broken'
+    return pdf_path
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_text_under_a_full_page_image_is_stripped_and_renders_the_same(tmp_path):
+    src = _covered_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=3))
+    out = tmp_path / 'out.pdf'
+    res = owm._strip_text_layer(src, out)        # also re-renders pages and compares
+    assert res == {'pages': 3, 'left': 0, 'err': None}
+    assert not any(t.strip() for t in _texts(out))
+
+
+def test_text_drawn_over_the_image_is_kept(tmp_path):
+    import pikepdf
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=1)
+    _set_ops(src, b'BT /F1 11 Tf 60 700 Td (shown on top) Tj ET ')
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+@pytest.mark.parametrize('before', [b'0 0 100 100 re W n', b'/GS0 gs'],
+                         ids=['clipped', 'graphics-state'])
+def test_text_under_a_clipped_or_restyled_image_is_kept(tmp_path, before):
+    """A clip can leave text showing around it; an ExtGState can make it translucent."""
+    import pikepdf
+    src = _covered_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=1), before=before)
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+def test_text_under_a_masked_image_is_kept(tmp_path):
+    """A soft mask lets whatever is under the image show through."""
+    import pikepdf
+
+    def smask(pdf, img):
+        m = pikepdf.Stream(pdf, bytes([128]))
+        m.Type, m.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+        m.Width, m.Height, m.BitsPerComponent = 1, 1, 8
+        m.ColorSpace = pikepdf.Name.DeviceGray
+        img.SMask = pdf.make_indirect(m)
+    src = _covered_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=1), image=smask)
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+def test_text_beside_an_image_that_does_not_cover_the_page_is_kept(tmp_path):
+    import pikepdf
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=1)
+    with pikepdf.open(str(src), allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        U._add_font(pdf, page.obj.Resources, '/F1')
+        (iname, _), = list(page.obj.Resources.XObject.items())
+        mb = [float(v) for v in page.mediabox]
+        page.Contents = pikepdf.Stream(pdf, (
+            f'BT /F1 11 Tf 60 700 Td (beside) Tj ET '
+            f'q {mb[2]:g} 0 0 {mb[3] / 2:g} 0 0 cm {iname} Do Q').encode())
+        pdf.save()
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_no_ocr is not None, reason=str(_no_ocr))
+def test_replace_text_replaces_a_layer_hidden_under_the_scan(tmp_path):
+    """Before, nothing was stripped, the layer counted as visible text, and the new file was
+    refused by the audit for losing it."""
+    src = _covered_layer(U.make_scan_pdf(tmp_path / 'src.pdf', npages=2))
+    out = tmp_path / 'out.pdf'
+    res = owm.compress_one(str(src), str(out), 200, ocr=True, language='eng',
+                           replace_text=True)
+    assert not res.get('err'), res
+    assert 'source text layer dropped on 2 pg' in res['note'], res['note']
+    texts = _texts(out)
+    assert all('Scan page' in t for t in texts), 'every page carries the new OCR'
+    assert not any(COVERED in t for t in texts), 'the old layer must be gone'
+
+
 def _add_form_layer(pdf_path, form_ops: bytes, name='/OCR-layer'):
     """Draw `form_ops` on every page from a Form XObject, appended as its own content stream
     -- how OCRmyPDF stores its text layer (`q /OCR-... Do Q`, measured on its output)."""

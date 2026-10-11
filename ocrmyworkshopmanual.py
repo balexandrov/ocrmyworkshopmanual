@@ -322,6 +322,15 @@ PADDLE_PLUGIN = Path(__file__).with_name('ocrmypdf_paddle.py')
 YOMITOKU_PLUGIN = Path(__file__).with_name('ocrmypdf_yomitoku.py')
 ENGINE_PLUGINS = {'paddle': PADDLE_PLUGIN, 'yomitoku': YOMITOKU_PLUGIN}
 
+# Engines whose OCR runs one FILE at a time across the whole pool, while every other step
+# (render, classify, binarize, JBIG2, audit) stays parallel. Each ocrmypdf call loads its own
+# YomiToku model onto the GPU: measured on an 8 GB card, 3 workers OCR'ing at once spilled
+# ~1.1 GB to shared memory and ran ~5 s/page combined against 2.6 s/page for one. Yet
+# `--workers 1` serialised everything else too, and on 386-page Sambar manuals the CPU-only
+# page classifier alone took ~5 s/page on one core before the GPU saw a page.
+GPU_SERIAL_ENGINES = {'yomitoku'}
+_GPU_LOCK = None                # set by `_init_worker`: a lock shared by the whole pool
+
 
 def _engine_args(language: str) -> tuple:
     """(extra ocrmypdf arguments, note) for OCR_ENGINE on a file resolved to `language`.
@@ -488,6 +497,20 @@ def _release_threads(n: int) -> None:
 
 
 @contextlib.contextmanager
+def _gpu_turn():
+    """Hold the pool's GPU lock for one OCR call when the engine is in GPU_SERIAL_ENGINES;
+    a no-op otherwise, and outside a pool. Waiting here cannot trip the stall watchdog: OCR
+    runs without one (ocrmypdf reports no progress), and the wait comes before any step
+    that has a watchdog. Take it BEFORE `_threads`, so a waiting file does not sit on a
+    thread budget the running steps could use."""
+    if _GPU_LOCK is None or OCR_ENGINE not in GPU_SERIAL_ENGINES:
+        yield
+        return
+    with _GPU_LOCK:
+        yield
+
+
+@contextlib.contextmanager
 def _threads(want: int):
     """Hold a thread grant for the duration of one step. The release is in a `finally` so a
     crashed, stalled or killed step cannot leak its share and starve the rest of the run."""
@@ -499,7 +522,8 @@ def _threads(want: int):
 
 
 def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=None,
-                 tokens=None, ocr_engine: str = 'tesseract', paddle_dpi: int = 0):
+                 tokens=None, ocr_engine: str = 'tesseract', paddle_dpi: int = 0,
+                 gpu_lock=None):
     """Worker start-up: run below normal priority, tell ocrmypdf how many threads it may
     use in THIS process, and capture library logging so it stops leaking to the shared
     stderr. The pool parallelises across files, so the thread budget is the machine's cores
@@ -515,10 +539,14 @@ def _init_worker(ocr_jobs: int = 1, cores: int = 0, workers: int = 0, remaining=
 
     `tokens` is the matching shared tally of threads already promised to running steps, so
     per-file budgets derived independently in six processes cannot add up to more work than
-    the machine has (see `_claim_threads`)."""
+    the machine has (see `_claim_threads`).
+
+    `gpu_lock` is the pool-wide lock `_gpu_turn` takes around each OCR call of a
+    GPU_SERIAL_ENGINES engine."""
     global OCR_JOBS, _OCR_CORES, _OCR_WORKERS, _OCR_REMAINING, _OCR_TOKENS, OCR_ENGINE
-    global PADDLE_DPI
+    global PADDLE_DPI, _GPU_LOCK
     OCR_ENGINE = ocr_engine
+    _GPU_LOCK = gpu_lock
     PADDLE_DPI = max(0, int(paddle_dpi))
     OCR_JOBS = max(1, int(ocr_jobs))
     _OCR_CORES = max(0, int(cores))
@@ -1725,10 +1753,12 @@ def _ocr_donor_from_render(src_p: Path, work: Path, language: str, timeout: int,
         return None, f' (native-render OCR failed: merge: {ex})'
     out = work / 'native_ocr.pdf'
     eargs, enote = _engine_args(language)
-    r2, _tries = _run_retry(lambda: subprocess.run(
-        OCRMYPDF + eargs + ['--language', language, '--optimize', '0', '--output-type', 'pdf',
-                    '--skip-text', '--quiet', '--jobs', str(jobs), str(merged), str(out)],
-        capture_output=True, text=True))
+    with _gpu_turn():
+        r2, _tries = _run_retry(lambda: subprocess.run(
+            OCRMYPDF + eargs + ['--language', language, '--optimize', '0', '--output-type',
+                                'pdf', '--skip-text', '--quiet', '--jobs', str(jobs),
+                                str(merged), str(out)],
+            capture_output=True, text=True))
     if r2 is None or r2.returncode != 0 or not out.exists() or not out.stat().st_size:
         tail = ''
         if r2 is not None:
@@ -1830,7 +1860,7 @@ def _ocr_source(src_p: Path, work: Path, language: str, has_vector: bool,
     # on a running process, so a number sampled from queue state here is frozen for however
     # long the file takes — hours, on the manuals that need the threads most.
     eargs, enote = _engine_args(language)
-    with _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
+    with _gpu_turn(), _threads(_ocr_jobs_budget(src_p, pages)) as jobs:
         r, tries = _run_retry(lambda: subprocess.run(
             OCRMYPDF + eargs + ['--language', language, '--optimize', '0', '--output-type',
                                 'pdf', mode, '--quiet', '--jobs', str(jobs), str(src_p),
@@ -2327,11 +2357,53 @@ def _invisible_form_names(page) -> set:
     return {str(n) for n in xo.keys() if _invisible_form(xo[n])}
 
 
+def _opaque_image_names(page) -> set:
+    """Names of the page's Image XObjects that paint every pixel of their box: no /SMask,
+    /Mask or /SMaskInData, not an /ImageMask stencil. What such an image covers is hidden."""
+    res = _inherited_resources(page.obj)
+    xo = res.get('/XObject') if res is not None else None
+    if not xo:
+        return set()
+    out = set()
+    for n in xo.keys():
+        try:
+            x = xo[n]
+            if (x.get('/Subtype') == '/Image' and not x.get('/ImageMask', False)
+                    and '/SMask' not in x and '/Mask' not in x
+                    and not int(x.get('/SMaskInData', 0))):
+                out.add(str(n))
+        except Exception:
+            continue
+    return out
+
+
+def _covers_page(ctm, box) -> bool:
+    """Does the unit square, mapped through an axis-aligned `ctm`, cover all of `box`?"""
+    a, b, c, d, e, f = ctm
+    if abs(b) > 1e-6 or abs(c) > 1e-6:
+        return False
+    xs, ys = sorted((e, e + a)), sorted((f, f + d))
+    tol = 1.0
+    return (xs[0] <= box[0] + tol and xs[1] >= box[2] - tol
+            and ys[0] <= box[1] + tol and ys[1] >= box[3] - tol)
+
+
 def _strip_invisible_ops(page):
-    """The page's content with every text object that draws ONLY invisible (Tr 3) glyphs
-    removed, or None if there is no such object. A text object that shows any glyph visibly
-    is kept whole: dropping one show operator out of it would move the glyphs after it,
-    since each one advances the text matrix.
+    """The page's content with every text object that draws nothing removed, or None if
+    there is no such object. A text object draws nothing when it shows ONLY invisible (Tr 3)
+    glyphs, or when an opaque image covering the whole page is painted over it later in the
+    same stream. A text object that shows any glyph that stays visible is kept whole:
+    dropping one show operator out of it would move the glyphs after it, since each one
+    advances the text matrix.
+
+    The covered case is how ABBYY FineReader Engine 11 stores its layer: plain fill-mode
+    text, then the scan drawn on top with `W 0 0 H 0 0 cm /BG Do`. Measured on a 1996
+    Japanese new-model manual (84 pages, 83 of them so): with only Tr 3 recognised, nothing
+    was stripped, the layer counted as visible text, and the re-OCR'd file was refused by
+    the audit for losing it (word recall 0.36). Covered means: an Image XObject with no mask
+    of any kind, drawn axis-aligned over the whole MediaBox, with no clip and no `gs` in
+    force (an ExtGState could make it translucent or blend it). The caller's render check
+    still compares the pages before and after.
 
     A Form XObject is dropped (its `Do`) only when it draws nothing but invisible text: that is
     how OCRmyPDF stores its layer, so without this --replace-text could not replace a layer
@@ -2346,9 +2418,14 @@ def _strip_invisible_ops(page):
     try:
         ops = pikepdf.parse_content_stream(page)
         forms = _invisible_form_names(page)
+        opaque = _opaque_image_names(page)
+        box = [float(v) for v in page.mediabox]
+        box = [min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3])]
     except Exception:
         return None
-    keep, block, stack, tr, dropped, dropped_forms = [], None, [], 0, 0, 0
+    # items: ('op', operands, op) | ['block', ops, visible, dropped]
+    items, block, stack, tr, dropped_forms = [], None, [], 0, 0
+    ctm, clip, gs = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), False, False
     visible = False
     for operands, op in ops:
         o = str(op)
@@ -2362,12 +2439,7 @@ def _strip_invisible_ops(page):
             elif o in _TEXT_SHOW_OPS and tr != _TR_INVISIBLE:
                 visible = True
             elif o == 'ET':
-                if visible:
-                    if dropped:
-                        return None
-                    keep.extend(block)
-                else:
-                    dropped += 1
+                items.append(['block', block, visible, not visible])
                 block = None
             continue
         if o == 'BT':
@@ -2376,18 +2448,45 @@ def _strip_invisible_ops(page):
         if o == 'Do' and operands and str(operands[0]) in forms:
             dropped_forms += 1
             continue
+        if o == 'Do' and operands and str(operands[0]) in opaque and not clip and not gs                 and _covers_page(ctm, box):
+            for it in items:                    # everything painted so far is under it
+                if it[0] == 'block' and it[2]:
+                    it[3] = True
         if o == 'q':
-            stack.append(tr)
+            stack.append((tr, ctm, clip, gs))
         elif o == 'Q':
-            tr = stack.pop() if stack else 0
+            tr, ctm, clip, gs = stack.pop() if stack else (0, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+                                                           False, False)
         elif o == 'Tr':
             try:
                 tr = int(operands[0])
             except Exception:
                 pass
-        keep.append((operands, op))
+        elif o == 'cm':
+            try:
+                a, b, c, d, e, f = (float(v) for v in operands)
+                A, B, C, D, E, F = ctm
+                ctm = (a * A + b * C, a * B + b * D, c * A + d * C, c * B + d * D,
+                       e * A + f * C + E, e * B + f * D + F)
+            except Exception:
+                clip = True                     # unknown placement: treat nothing as covered
+        elif o in ('W', 'W*'):
+            clip = True
+        elif o == 'gs':
+            gs = True
+        items.append(('op', operands, op))
     if block is not None:                         # unterminated BT: leave the page alone
         return None
+    keep, dropped = [], 0
+    for it in items:
+        if it[0] == 'op':
+            keep.append((it[1], it[2]))
+        elif it[3]:
+            dropped += 1
+        else:
+            if dropped:
+                return None
+            keep.extend(it[1])
     if not (dropped or dropped_forms):
         return None
     return pikepdf.unparse_content_stream(keep)
@@ -4665,7 +4764,7 @@ def _ocr_and_place(base: Path, dest_p: Path, src_p: Path, orig: int, work: Path,
             # silent for ~90% of a run), so any wall-clock bound would just kill healthy
             # work on big files — which is exactly how a 6,855-page manual "failed" while
             # OCR'ing correctly. A crash is retried; slowness is simply waited out.
-            with _threads(_ocr_jobs_budget(base, pages)) as ocr_jobs:
+            with _gpu_turn(), _threads(_ocr_jobs_budget(base, pages)) as ocr_jobs:
                 r, tries = _run_retry(lambda: subprocess.run(
                     OCRMYPDF + eargs + ['--language', language, '--optimize', '0',
                                         '--output-type', 'pdf', '--skip-text', '--quiet',
@@ -6467,7 +6566,8 @@ def main():
                                     initializer=_init_worker,
                                     initargs=(_ocr_jobs, _cores, args.workers,
                                               _remaining, _tokens, args.ocr_engine,
-                                              args.paddle_dpi)) as ex:
+                                              args.paddle_dpi,
+                                              multiprocessing.Lock())) as ex:
             if args.dry_run:
                 futs = {ex.submit(preview_one, s, args.dpi,
                                   not args.no_despeckle, args.min_size,
