@@ -21,7 +21,8 @@ WHAT IT LOOKS FOR, in three parts, each of which earned its place by being measu
      consecutive pages. A manual cites a real URL in its body once; it does not cite it
      identically on page after page from one operator.
   3. It is **on a line of its own** — everything else on its baseline comes to almost no
-     text. See `_uncrowded`.
+     text. See `_uncrowded`. Or, on a page that paints an image, its line is the only
+     visible text there is: a line written over a scan. See `_sole_line`.
 
 Dropping any one of them was measured to cause damage. Repetition alone (no marker) takes
 section titles, running footers, `HINT:` labels, wiring-diagram terminal names and at least
@@ -102,8 +103,9 @@ except ImportError:                                     # pragma: no cover
 # `size` is the text's height on the page in points (font size through the text matrix and
 # the CTM), and `ex, ey` where the text position stands after the run -- its end, from the
 # font's widths. Together they are how much paper a run covers, which `strip_lines` needs.
-Run = collections.namedtuple('Run', 'text x y page where op size ex ey',
-                             defaults=(0.0, None, None))
+# `hidden` is text drawn in an invisible render mode (Tr 3 or 7): an OCR layer under a scan.
+Run = collections.namedtuple('Run', 'text x y page where op size ex ey hidden',
+                             defaults=(0.0, None, None, False))
 
 # converted : pages a watermark operator was removed from
 # forms     : form XObjects dropped at the call site
@@ -296,7 +298,7 @@ def _instructions(obj):
         return []
 
 
-def _walk(instructions, resources, ctm, where, page_no, runs, painters, depth=0):
+def _walk(instructions, resources, ctm, where, page_no, runs, painters, depth=0, render=0):
     """Collect text runs in device space, and count painting ops per container.
 
     `painters` collects, per container, the INDEX of every operator that puts marks on
@@ -330,10 +332,12 @@ def _walk(instructions, resources, ctm, where, page_no, runs, painters, depth=0)
             word_sp = _num(args[0])
         elif op == 'Tz' and args:
             h_scale = _num(args[0]) / 100.0
+        if op == 'Tr' and args:
+            render = int(_num(args[0]))
         if op == 'q':
-            stack.append(ctm)
+            stack.append((ctm, render))
         elif op == 'Q':
-            ctm = stack.pop() if stack else ctm
+            ctm, render = stack.pop() if stack else (ctm, render)
         elif op == 'cm' and len(args) == 6:
             ctm = _mul(tuple(_num(a) for a in args), ctm)
         elif op == 'BT':
@@ -388,7 +392,7 @@ def _walk(instructions, resources, ctm, where, page_no, runs, painters, depth=0)
             if text:
                 runs.append(Run(text, dev[4], dev[5], page_no, where, i,
                                 abs(font_size) * (dev[2] ** 2 + dev[3] ** 2) ** 0.5,
-                                end[4], end[5]))
+                                end[4], end[5], render in (3, 7)))
             tm = _mul((1, 0, 0, 1, tx * h_scale, 0), tm)
         elif op in ('Do', 'sh', 'EI'):
             painters[where].add(i)
@@ -403,7 +407,7 @@ def _walk(instructions, resources, ctm, where, page_no, runs, painters, depth=0)
                 if '/Matrix' in xo:
                     sub = tuple(_num(v) for v in xo['/Matrix'])
                 _walk(_instructions(xo), xo.get('/Resources'), _mul(sub, ctm),
-                      ('form', xo.objgen), page_no, runs, painters, depth + 1)
+                      ('form', xo.objgen), page_no, runs, painters, depth + 1, render)
         elif op in ('S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*'):
             painters[where].add(i)
     return ctm
@@ -574,8 +578,8 @@ def detect(pdf, sample=2, give_up=8):
         box, rot = _box(page), _rotation(page)
         kept = _page_entries(page, i, painters)
         per_page[i] = kept
-        alone = _uncrowded(kept)
-        for idx, (run, _krx, _kry, _vert) in enumerate(kept):
+        alone = _alone(kept, scan=lambda: _paints_image(page))
+        for idx, (run, *_where) in enumerate(kept):
             if idx not in alone:
                 continue                           # a URL inside a sentence is not a stamp
             marker = stamp_marker(run.text)
@@ -606,7 +610,8 @@ def detect(pdf, sample=2, give_up=8):
         # does not survive a few pages from the middle and the back of the book.
         for i in _spread(n, _COMPANION_SPREAD, skip=per_page):
             per_page[i] = _page_entries(pdf.pages[i], i, painters)
-        hits += _companions(hits, per_page, sample)
+        hits += _companions(hits, per_page, sample,
+                            scan_of=lambda i: _paints_image(pdf.pages[i]))
     hits.sort(key=lambda c: -len(c.pages))
     return hits, painters
 
@@ -625,16 +630,50 @@ def _spread(n, k, skip=()):
 
 
 def _page_entries(page, page_no, painters):
-    """[(run, rx, ry, vertical)] for one page: each text run with its origin as a fraction
-    of the page AS DISPLAYED, and whether it is drawn up or down the page."""
+    """[(run, rx, ry, vertical, rex)] for one page: each text run with its origin as a
+    fraction of the page AS DISPLAYED, whether it is drawn up or down the page, and where a
+    horizontal run ends (its x fraction after the last glyph; see `_beside`)."""
     box, rot = _box(page), _rotation(page)
     kept = []
     for run in page_runs(page, page_no, painters):
-        dx, dy, w, h = _display(run.x, run.y, box, rot)
-        ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
-        kept.append((run, dx / w if w else 0, dy / h if h else 0,
-                     abs(ey - dy) > abs(ex - dx)))
+        kept.append((run,) + _extent(run, box, rot))
     return kept
+
+
+def _extent(run, box, rot):
+    """(rx, ry, vertical, rex) of one run, as fractions of the page as displayed."""
+    dx, dy, w, h = _display(run.x, run.y, box, rot)
+    ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
+    return (dx / w if w else 0, dy / h if h else 0, abs(ey - dy) > abs(ex - dx),
+            ex / w if w else 0)
+
+
+def _beside(a, b):
+    """Whether two runs, each (rx, ry, vertical, rex), sit beside each other: close enough
+    for one to be part of the other's stamp block.
+
+    Two ways, and the second is the one that was missing. Origins within `_ADJACENT` --
+    a line stacked above or below the stamp, the Mazda 626's nag. Or, for horizontal runs
+    on the SAME LINE, a gap of at most `_ADJACENT` between where one ends and the other
+    starts. Measured on three ManualsLib downloads (Subaru 360, 16-246 pages): the stamp is
+    one line drawn as separate operators -- `Downloaded from ` (x 0.005-0.104), the link
+    `www.Manualslib.com` (0.104-0.220), `manuals search engine` (0.226-0.344) -- so the
+    words touch the link while their ORIGINS sit 0.098 and 0.122 from its origin. Judged
+    origin to origin they were not beside it, and removal would take the link and leave
+    `Downloaded from manuals search engine` on every page.
+
+    A block is written one way, so the two must also read the same way (see `_companions`).
+    """
+    ax, ay, av, aex = a
+    bx, by, bv, bex = b
+    if av != bv:
+        return False
+    if max(abs(ax - bx), abs(ay - by)) <= _ADJACENT:
+        return True
+    if av or abs(ay - by) > _SAME_LINE:
+        return False
+    gap = max(min(ax, aex), min(bx, bex)) - min(max(ax, aex), max(bx, bex))
+    return gap <= _ADJACENT
 
 
 # How close a line has to sit to a confirmed stamp to count as part of it, as a fraction
@@ -659,6 +698,87 @@ _ADJACENT = 0.05
 # prints its URL inside a sentence. 0-3 against 124 is the whole discriminator.
 _SAME_LINE = 0.004
 _LINE_NEIGHBOURS = 16
+
+
+def _alone(entries, scan=None):
+    """Indices of the runs that are not part of the page's own typeset text: on a line of
+    their own (`_uncrowded`), or, on a scan, on the only line of visible text the page has
+    (`_sole_line`).
+
+    `scan` is a callable saying whether the page paints an image. It is called only when
+    the page has a sole line at all, so a normal page never pays for a second parse.
+    """
+    out = _uncrowded(entries)
+    if scan is not None:
+        sole = _sole_line(entries) - out
+        if sole and scan():
+            out |= sole
+    return out
+
+
+def _paints_image(page, depth=3):
+    """Whether a page draws a raster image -- an image XObject, directly or inside a form it
+    invokes, or an inline image. That is what a scanned page is."""
+    def walk(obj, resources, d):
+        xobjects = (resources or {}).get('/XObject') or {}
+        for ins in _instructions(obj):
+            op = str(ins.operator)
+            if op == 'EI':
+                return True
+            if op == 'Do' and ins.operands:
+                try:
+                    xo = xobjects[str(ins.operands[0])]
+                except Exception:
+                    continue
+                sub = str(xo.get('/Subtype', ''))
+                if sub == '/Image':
+                    return True
+                if sub == '/Form' and d > 0 and walk(xo, xo.get('/Resources'), d - 1):
+                    return True
+        return False
+    try:
+        return walk(page, page.get('/Resources'), depth)
+    except Exception:
+        return False
+
+
+def _sole_line(entries):
+    """Indices of the runs on a page's ONLY line of visible text, when it has just one.
+    Asked only of a page that paints an image (`_paints_image`): the rule is about a line
+    written over a scan.
+
+    Measured on three ManualsLib downloads of the Subaru 360 manuals: every page is a scan
+    under an invisible OCR layer (Tr 3), plus one visible line at the foot drawn in pieces --
+    `Downloaded from ` / `www.Manualslib.com` / `manuals search engine`. The stamp's own words
+    put 36 characters on the link's line, and `_uncrowded`'s budget is 16, so the link read
+    as a URL inside a sentence and the file was reported clean.
+
+    The budget could not simply be raised. A sweep of the link-like runs that repeat on the
+    first pages of 50,000 archive PDFs put the publishers' own lines all through the range
+    the stamp sits in: a shock-absorber catalogue's country sites at 16-20 and 45, a
+    distributor's address footer at 23-26, a manual publisher's catalogue at 19, an oil
+    maker's datasheet at 34 -- against the stamp's 36. Counting characters cannot tell them
+    apart. What can: every one of those publisher lines sits on a page of visible typeset
+    text, and the stamp sits on a scan where it is the only thing a reader can see that is
+    text. A publisher does not typeset one line over a picture of its own page; a
+    re-distributor signing a scan does exactly that.
+
+    Hidden runs (an OCR layer) do not count as text on the page, and a vertical run is
+    never on a horizontal one's line. The marker and repeat tests still apply on top.
+
+    The scan condition is not optional. Without it a page carrying nothing but a typeset
+    address line -- `Motul 119 bd ... : www.motul.fr`, the crowding guard's own test case --
+    has one line of visible text too, and the rule handed the maker's address to removal.
+    Two of the four ManualsLib books have no OCR layer at all, so "has hidden text" would
+    not do; what every page of all four has is the scan image.
+    """
+    shown = [i for i, e in enumerate(entries) if not e[0].hidden]
+    if not shown or any(entries[i][3] for i in shown):
+        return set()
+    ys = [entries[i][2] for i in shown]
+    if max(ys) - min(ys) > _SAME_LINE:
+        return set()
+    return set(shown)
 
 
 def _uncrowded(entries):
@@ -706,7 +826,7 @@ def _uncrowded(entries):
     return out
 
 
-def _companions(hits, per_page, sample):
+def _companions(hits, per_page, sample, scan_of=None):
     """The rest of a multi-line stamp: lines that carry no marker of their own.
 
     A stamping tool writes a block, not a line. `looks_like_link` recognises the line with
@@ -728,9 +848,9 @@ def _companions(hits, per_page, sample):
     if not stamp_texts:
         return []
 
-    anchors = {}                                   # page -> [(rx, ry, vertical)] of the stamp
+    anchors = {}                                   # page -> [(rx, ry, vertical, rex)] of the stamp
     for i, runs in per_page.items():
-        spots = [(rx, ry, v) for run, rx, ry, v in runs if run.text in stamp_texts]
+        spots = [spot for run, *spot in runs if run.text in stamp_texts]
         if spots:
             anchors[i] = spots
     if not anchors:
@@ -738,16 +858,16 @@ def _companions(hits, per_page, sample):
 
     near = collections.defaultdict(list)
     for i, spots in anchors.items():
-        alone = _uncrowded(per_page[i])
-        for idx, (run, rx, ry, v) in enumerate(per_page[i]):
+        alone = _alone(per_page[i],
+                       scan=None if scan_of is None else (lambda i=i: scan_of(i)))
+        for idx, (run, *spot) in enumerate(per_page[i]):
             if run.text in stamp_texts or idx not in alone:
                 continue
             # A block is written one way. Measured on a synthetic A442F-shaped page: a
             # vertical margin stamp starting 0.047 from a constant running header made
             # the header its "companion", and removal deleted the header from every page.
-            if any(v == av and max(abs(rx - ax), abs(ry - ay)) <= _ADJACENT
-                   for ax, ay, av in spots):
-                near[run.text].append((i, rx, ry))
+            if any(_beside(spot, a) for a in spots):
+                near[run.text].append((i, spot[0], spot[1]))
 
     out = []
     for text, seen in near.items():
@@ -836,24 +956,16 @@ def flagged_on_page(page, page_no, candidates, spots=None):
     # so that is the only place it is taken from: never by its text alone, anywhere on the
     # page. Matching on text alone deleted a body-text "Result" from the middle of a RAV4
     # printout's page 7,753 because a "Result" had sat beside the stamp on pages 1 and 2.
-    def _spot(run):
-        dx, dy, w, h = _display(run.x, run.y, box, rot)
-        ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
-        return (dx / w if w else 0, dy / h if h else 0, abs(ey - dy) > abs(ex - dx))
-
     anchors = []
     for r in runs:
         m = stamp_marker(r.text)
         if m and any(c.matches(m, r.text) for c in candidates):
-            anchors.append(_spot(r))
-
-    def _beside(run):
-        rx, ry, v = _spot(run)
-        return any(v == av and max(abs(rx - ax), abs(ry - ay)) <= _ADJACENT for ax, ay, av in anchors)
+            anchors.append(_extent(r, box, rot))
 
     for run in runs:
         if any(c.matches_text(run.text) for c in candidates):
-            if _beside(run):
+            spot = _extent(run, box, rot)
+            if any(_beside(spot, a) for a in anchors):
                 _take(run)                         # a companion line of a confirmed stamp
             continue
         link = stamp_marker(run.text)

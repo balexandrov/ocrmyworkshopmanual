@@ -5,6 +5,31 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a stamp written as one line over a scan is found, words and all
+
+ManualsLib downloads carry `Downloaded from www.Manualslib.com manuals search engine` at the
+foot of every page, drawn as separate operators over the scan. Measured on four such books
+(Subaru 360 ×3, a Daihatsu Hijet; 16–268 pages): all were reported clean. The stamp's own words
+put 36 characters on the link's line against the crowding guard's 16, so the link read as a URL
+inside a sentence.
+
+Raising the 16 was measured unsafe. The link-like lines repeating on the first pages of 50,000
+archive PDFs put publishers' own lines all through 16–60: a shock-absorber catalogue's country
+sites, a distributor's address footer, a manual publisher's catalogue, an oil maker's datasheet.
+What does separate them is that every one sits on a page of visible type. A marker now also
+counts as alone when its line is the **only visible text on a page that paints an image**. The
+walker tracks the text render mode for this, so an OCR layer (`Tr` 3/7) is not text a reader
+sees. The image condition is required: without it, a page holding nothing but a typeset address
+line qualifies too, which is the existing Motul test.
+
+Companions were judged origin to origin, so the words either side of the link (origins 0.098 and
+0.122 of the page away, ends touching it) were not "beside" it. Removal would have taken the link
+and left `Downloaded from manuals search engine`. On the stamp's own line, `beside` is now the gap
+between one run's end and the next one's start, in detection and removal alike.
+
+Not removed: the link's underline (a stroked path, and only text and `Do` operators are ever
+deleted) and the page's `/Link` annotation (the audit holds annotation counts).
+
 ### Added — `--ocr-engine yomitoku`: a Japanese-only engine that reads more than paddle
 
 `ocrmypdf_yomitoku.py` runs [YomiToku](https://github.com/kotaro-kinoshita/yomitoku) as an

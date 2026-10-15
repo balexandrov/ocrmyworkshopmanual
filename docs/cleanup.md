@@ -56,11 +56,18 @@ cause damage:
    manual cites a real URL once; it doesn't cite it identically on every page.
 3. **It is on a line of its own.** Without this, `: www.motul.fr` in a lubricant maker's own
    address block passes the other two tests: other text on the line came to 0–3 characters for
-   four real stamps, and 124 for that footer.
+   four real stamps, and 124 for that footer. **Or it is the only visible text on a scan.** A
+   ManualsLib download writes `Downloaded from www.Manualslib.com manuals search engine` as
+   one line over each scanned page, so the link has 36 characters of the stamp's own words
+   beside it. The budget can't simply grow: across the link-like lines repeating in 50,000
+   archive PDFs, publishers' own lines sit all through 16–60. But each of them is on a page
+   of visible type. On a page that paints an image and has one line of visible text (an OCR
+   layer is invisible and doesn't count), that line is the stamp's.
 
-A stamping tool sometimes writes a block, not a line — a nag line beside the URL. Such a
-**companion** line goes only where it sits **beside** the confirmed stamp, on the same reading
-direction, and it must sit there on pages spread through the book, not just the first few. Matched
+A stamping tool sometimes writes a block, not a line — a nag line beside the URL, or words
+either side of it on the same line. Such a **companion** goes only where it sits **beside** the
+confirmed stamp (stacked within reach of it, or on its line with no more than a small gap
+between where one ends and the other starts), on the same reading direction, and it must sit there on pages spread through the book, not just the first few. Matched
 on its text alone, a body-text "Result" that happened to sit by the footer stamp on pages 1 and 2
 of a 42,638-page RAV4 printout was taken from the middle of page 7,753 too; the audit refused the
 file and the stamp stayed on every page.
