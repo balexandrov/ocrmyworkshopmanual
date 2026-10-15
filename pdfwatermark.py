@@ -630,9 +630,9 @@ def _spread(n, k, skip=()):
 
 
 def _page_entries(page, page_no, painters):
-    """[(run, rx, ry, vertical, rex)] for one page: each text run with its origin as a
-    fraction of the page AS DISPLAYED, whether it is drawn up or down the page, and where a
-    horizontal run ends (its x fraction after the last glyph; see `_beside`)."""
+    """[(run, rx, ry, vertical, rex, rey)] for one page: each text run with its origin as a
+    fraction of the page AS DISPLAYED, whether it is drawn up or down the page, and where it
+    ends (the text position after its last glyph; see `_beside`)."""
     box, rot = _box(page), _rotation(page)
     kept = []
     for run in page_runs(page, page_no, painters):
@@ -641,16 +641,16 @@ def _page_entries(page, page_no, painters):
 
 
 def _extent(run, box, rot):
-    """(rx, ry, vertical, rex) of one run, as fractions of the page as displayed."""
+    """(rx, ry, vertical, rex, rey) of one run, as fractions of the page as displayed."""
     dx, dy, w, h = _display(run.x, run.y, box, rot)
     ex, ey, _w, _h = _display(run.ex, run.ey, box, rot)
     return (dx / w if w else 0, dy / h if h else 0, abs(ey - dy) > abs(ex - dx),
-            ex / w if w else 0)
+            ex / w if w else 0, ey / h if h else 0)
 
 
 def _beside(a, b):
-    """Whether two runs, each (rx, ry, vertical, rex), sit beside each other: close enough
-    for one to be part of the other's stamp block.
+    """Whether two runs, each (rx, ry, vertical, rex, rey), sit beside each other: close
+    enough for one to be part of the other's stamp block.
 
     Two ways, and the second is the one that was missing. Origins within `_ADJACENT` --
     a line stacked above or below the stamp, the Mazda 626's nag. Or, for horizontal runs
@@ -662,17 +662,28 @@ def _beside(a, b):
     origin to origin they were not beside it, and removal would take the link and leave
     `Downloaded from manuals search engine` on every page.
 
+    The same holds for a line written up or down the page, along its column. Measured on a
+    268-page ManualsLib Hijet manual: five landscape pages carry the stamp turned a quarter,
+    up the page edge, and with the line test horizontal-only the link went from those pages
+    while `Downloaded from` and `manuals search engine` stayed.
+
     A block is written one way, so the two must also read the same way (see `_companions`).
     """
-    ax, ay, av, aex = a
-    bx, by, bv, bex = b
+    ax, ay, av, aex, aey = a
+    bx, by, bv, bex, bey = b
     if av != bv:
         return False
     if max(abs(ax - bx), abs(ay - by)) <= _ADJACENT:
         return True
-    if av or abs(ay - by) > _SAME_LINE:
-        return False
-    gap = max(min(ax, aex), min(bx, bex)) - min(max(ax, aex), max(bx, bex))
+    if av:                                         # a column: same x, gap along y
+        if abs(ax - bx) > _SAME_LINE:
+            return False
+        a0, a1, b0, b1 = ay, aey, by, bey
+    else:                                          # a line: same y, gap along x
+        if abs(ay - by) > _SAME_LINE:
+            return False
+        a0, a1, b0, b1 = ax, aex, bx, bex
+    gap = max(min(a0, a1), min(b0, b1)) - min(max(a0, a1), max(b0, b1))
     return gap <= _ADJACENT
 
 
@@ -764,7 +775,8 @@ def _sole_line(entries):
     re-distributor signing a scan does exactly that.
 
     Hidden runs (an OCR layer) do not count as text on the page, and a vertical run is
-    never on a horizontal one's line. The marker and repeat tests still apply on top.
+    never on a horizontal one's line; a line written up the page edge (the Hijet's landscape
+    pages) is a column sharing one x. The marker and repeat tests still apply on top.
 
     The scan condition is not optional. Without it a page carrying nothing but a typeset
     address line -- `Motul 119 bd ... : www.motul.fr`, the crowding guard's own test case --
@@ -773,10 +785,14 @@ def _sole_line(entries):
     not do; what every page of all four has is the scan image.
     """
     shown = [i for i, e in enumerate(entries) if not e[0].hidden]
-    if not shown or any(entries[i][3] for i in shown):
+    if not shown:
         return set()
-    ys = [entries[i][2] for i in shown]
-    if max(ys) - min(ys) > _SAME_LINE:
+    ways = {entries[i][3] for i in shown}
+    if len(ways) > 1:
+        return set()
+    axis = 1 if ways.pop() else 2                  # a column shares x; a line shares y
+    at = [entries[i][axis] for i in shown]
+    if max(at) - min(at) > _SAME_LINE:
         return set()
     return set(shown)
 
@@ -1285,11 +1301,29 @@ def _render_audit(src_path, out_path, shots, spots):
                            f'drawn at ({rx:.3f}, {iy:.3f}) -- something else moved')
                 break
 
-    if len(boxes) > 1:
-        spread = max(max(b[k] for b in boxes.values()) - min(b[k] for b in boxes.values())
+    # Consistency is asked among pages whose stamp was DRAWN in the same place. Measured on a
+    # 268-page ManualsLib Hijet manual: five landscape pages carry the stamp up the page edge
+    # instead of across the foot, so their hole is legitimately elsewhere, and comparing them
+    # with the rest refused a correct rewrite. The deleted operators' own origins (`spots`)
+    # say where each page's stamp was; containment above already proves the ink changed
+    # there and only there, and a damaged page among same-placed stamps still stands out.
+    groups = []                                    # [(anchor spot, {page: box})]
+    for i, box in boxes.items():
+        own = spots.get(i) or [(0.0, 0.0)]
+        anchor = min(own)
+        for spot, members in groups:
+            if max(abs(spot[0] - anchor[0]), abs(spot[1] - anchor[1])) <= _SLOP:
+                members[i] = box
+                break
+        else:
+            groups.append((anchor, {i: box}))
+    for _spot, members in groups:
+        if len(members) < 2:
+            continue
+        spread = max(max(b[k] for b in members.values()) - min(b[k] for b in members.values())
                      for k in range(4))
         if spread > _SLOP:
-            worst = sorted(boxes.items(), key=lambda kv: kv[1])
+            worst = sorted(members.items(), key=lambda kv: kv[1])
             bad.append(f'page {worst[0][0] + 1} changed {_fmt(worst[0][1])} but page '
                        f'{worst[-1][0] + 1} changed {_fmt(worst[-1][1])} -- one stamp '
                        f'cannot leave two different holes ({spread:.3f} apart)')

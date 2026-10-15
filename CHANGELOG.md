@@ -30,6 +30,13 @@ between one run's end and the next one's start, in detection and removal alike.
 Not removed: the link's underline (a stroked path, and only text and `Do` operators are ever
 deleted) and the page's `/Link` annotation (the audit holds annotation counts).
 
+The same holds turned a quarter. The Hijet carries the stamp up the edge of its five landscape
+pages, and three rules assumed a horizontal line. `beside` now measures the gap along a column
+as well. `_sole_line` accepts a column of visible text. The render audit's consistency check
+("one stamp cannot leave two different holes") now compares only pages whose stamp operators
+sat in the same place, so a correctly cleaned turned page no longer refuses the file. Its
+containment check still holds every page's changed ink to where the deleted operators drew.
+
 ### Changed — yomitoku OCRs one file at a time across the pool; everything else stays parallel
 
 Each ocrmypdf call loads its own YomiToku model onto the GPU. On an 8 GB card, 3 workers OCR'ing

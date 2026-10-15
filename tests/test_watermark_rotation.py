@@ -117,6 +117,16 @@ def test_one_stamp_cannot_leave_two_different_holes(monkeypatch):
     assert bad and 'two different holes' in bad[0]
 
 
+def test_a_stamp_drawn_elsewhere_on_a_turned_page_is_its_own_hole(monkeypatch):
+    """Consistency is among pages whose stamp was DRAWN in the same place. The Hijet shape:
+    the stamp runs up the edge of a landscape page instead of across the foot, so that
+    page's hole is elsewhere -- by the operators' own positions, not by damage. Containment
+    still holds it to where the deleted operators drew."""
+    edge = (0.98, 0.70, 0.995, 0.85)
+    assert _audit(monkeypatch, {0: STAMP, 1: STAMP, 2: edge},
+                  {0: AT, 1: AT, 2: [(0.985, 0.25)]}) == []
+
+
 def test_a_stamp_removed_from_mid_page_is_fine(monkeypatch):
     """The regression the old rule caused: a stamp that really is mid-page used to FAIL
     the render audit, so the file was rejected rather than cleaned."""

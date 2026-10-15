@@ -126,8 +126,40 @@ def test_render_mode_follows_the_graphics_state():
 
 def test_the_beside_rule_reads_one_way():
     """A vertical run is never on a horizontal run's line, however close its start."""
-    assert W._beside((0.10, 0.01, False, 0.20), (0.21, 0.01, False, 0.30))
-    assert not W._beside((0.10, 0.01, False, 0.20), (0.27, 0.01, False, 0.40))
-    assert not W._beside((0.10, 0.01, False, 0.20), (0.21, 0.01, True, 0.21))
-    assert not W._beside((0.10, 0.01, False, 0.20), (0.21, 0.02, False, 0.30)), \
+    assert W._beside((0.10, 0.01, False, 0.20, 0.01), (0.21, 0.01, False, 0.30, 0.01))
+    assert not W._beside((0.10, 0.01, False, 0.20, 0.01), (0.27, 0.01, False, 0.40, 0.01))
+    assert not W._beside((0.10, 0.01, False, 0.20, 0.01), (0.21, 0.01, True, 0.21, 0.10))
+    assert not W._beside((0.10, 0.01, False, 0.20, 0.01), (0.21, 0.02, False, 0.30, 0.02)), \
         'a different baseline is judged origin to origin only'
+
+
+def test_the_beside_rule_runs_along_a_column_too():
+    """Turned a quarter, the same line is a column: same x, the gap measured along y."""
+    assert W._beside((0.99, 0.10, True, 0.99, 0.20), (0.99, 0.21, True, 0.99, 0.30))
+    assert not W._beside((0.99, 0.10, True, 0.99, 0.20), (0.99, 0.27, True, 0.99, 0.40))
+    assert not W._beside((0.99, 0.10, True, 0.99, 0.20), (0.95, 0.21, True, 0.95, 0.30))
+
+
+def test_a_stamp_turned_up_the_page_edge_is_removed_whole(tmp_path):
+    """The Hijet shape: the stamp reads across the foot of most pages, and up the edge of
+    the last one, a landscape page. The words must go with the link there as well."""
+    f = _one_line_stamp(tmp_path / 'turned.pdf', npages=4)
+    with pikepdf.open(str(f), allow_overwriting_input=True) as pdf:
+        page = pdf.pages[-1]
+        ops, y = '', 3
+        for piece in STAMP:                        # drawn upwards at x 606
+            ops += f' q BT /NxF0 {PT} Tf 0 1 -1 0 606 {y} Tm ({piece}) Tj ET Q'
+            y += PT * len(piece)
+        img = ' q 612 0 0 792 0 0 cm /Im0 Do Q'
+        body = ' q BT 3 Tr /NxF0 11 Tf 1 0 0 1 200 400 Tm (Step 4: torque to 40 Nm.) Tj ET Q'
+        page.Contents = pdf.make_stream((img + body + ops + chr(10)).encode('latin1'))
+        pdf.save()
+
+    out = tmp_path / 'clean.pdf'
+    res = W.clean_file(f, out, render=False)
+    assert res.get('err') is None and res['pages'] == 4, res
+    from pypdf import PdfReader
+    t = PdfReader(str(out)).pages[-1].extract_text() or ''
+    for word in ('Downloaded', 'example-stamp', 'search engine'):
+        assert word not in t, f'the turned page kept {word!r}: {t!r}'
+    assert 'Step 4: torque to 40 Nm.' in t
