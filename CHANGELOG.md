@@ -5,6 +5,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — yomitoku runs on Python 3.14
+
+Every YomiToku since 0.5.2 declares Python `<3.14`, so it needed a separate 3.13 environment from
+the rest of the tool. The cap is a declaration raised by hand one release at a time (`<3.13` in
+0.5.2, `<3.14` in 0.10.2), not a breakage: all 19 of its dependencies ship 3.14 wheels for
+Windows, and the yomitoku tests pass on 3.14.4 — on the CPU and on a GTX 1060 through the `cu126`
+torch build, which still carries Pascal (`sm_61`).
+
+It now installs past the declaration with `--no-deps --ignore-requires-python`, after its
+dependencies from the new `requirements-yomitoku.txt`. That list leaves out two of them:
+`pypdfium2`, pinned `==4.30.0` by YomiToku against ocrmypdf 17.13's `>=5` (on any Python — it only
+opens PDFs, and the plugin hands it images), and `onnxruntime`, which would overwrite a paddle
+venv's `onnxruntime-directml`. The `yomitoku` extra is gone: on 3.14 it installed nothing, and
+an extra cannot carry those flags.
+
 ### Fixed — a stamp written as one line over a scan is found, words and all
 
 ManualsLib downloads carry `Downloaded from www.Manualslib.com manuals search engine` at the
@@ -71,9 +86,9 @@ reading 1.25× as confident replaces it: that table then reads 40 of 40. Upright
 
 No recognition-score cut, unlike paddle: correctly read lines scored as low as 0.23.
 
-YomiToku needs Python 3.13 or older (every release since 0.5.2 declares `<3.14`; pip on 3.14
-quietly installs 0.4.1, which the plugin refuses to load), and is licensed CC BY-NC-SA 4.0 —
-non-commercial use only. It is an optional dependency (`pip install .[yomitoku]`).
+YomiToku is licensed CC BY-NC-SA 4.0 — non-commercial use only. It is an optional dependency,
+installed as `requirements-yomitoku.txt` describes (see above: a plain `pip install yomitoku` on
+Python 3.14 gets 0.4.1, which the plugin refuses to load).
 
 ### Fixed — paddle no longer drops vertical lines it turns the wrong way up, or reads table rules as text
 

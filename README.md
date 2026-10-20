@@ -107,8 +107,9 @@ The `jbig2topdf.py` wrapper ships in `tools/`. If a tool isn't on PATH, point at
 **Optional:** `pip install zopfli` enables `--born-digital max`. `pip install rapidocr onnxruntime`
 enables `--ocr-engine paddle`; install `onnxruntime-directml` (Windows, any DirectX 12 GPU) or
 `onnxruntime-gpu` (CUDA) *instead of* `onnxruntime` to run it on a GPU. The models are downloaded
-on first use. `pip install yomitoku` enables `--ocr-engine yomitoku` — on **Python 3.13 or
-older** (no YomiToku since 0.5.2 installs on 3.14), with a CUDA build of
+on first use. `--ocr-engine yomitoku` installs as
+[`requirements-yomitoku.txt`](requirements-yomitoku.txt) describes — not a plain
+`pip install yomitoku`, which on Python 3.14 gets the two-year-old 0.4.1 — with a CUDA build of
 [torch](https://pytorch.org) installed first to run it on an NVIDIA GPU. YomiToku is licensed
 CC BY-NC-SA 4.0: free for non-commercial use only.
 

@@ -35,10 +35,9 @@ test = ["pytest"]
 # --ocr-engine paddle. For a GPU, install onnxruntime-directml (Windows, any DirectX 12 card)
 # or onnxruntime-gpu (CUDA) INSTEAD of onnxruntime — they are one package under three names.
 paddle = ["rapidocr", "onnxruntime"]
-# --ocr-engine yomitoku. Needs Python < 3.14 (every YomiToku from 0.5.2 on does). For an
-# NVIDIA GPU install a CUDA build of torch first (pytorch.org). YomiToku is CC BY-NC-SA 4.0:
-# free for non-commercial use only.
-yomitoku = ["yomitoku>=0.15; python_version < '3.14'"]
+# --ocr-engine yomitoku has no extra: YomiToku declares Python < 3.14 and pins a pypdfium2
+# that ocrmypdf 17.13 cannot share, so it installs with --no-deps --ignore-requires-python,
+# which an extra cannot express. See requirements-yomitoku.txt.
 
 [project.urls]
 Homepage = "https://github.com/balexandrov/ocrmyworkshopmanual"

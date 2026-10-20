@@ -69,15 +69,22 @@ turned reading that is clearly more confident replaces it: that table then reads
 page takes three reads, 6.2 s). Without the turn YomiToku scores 331.
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # NVIDIA GPU; skip for CPU
-pip install yomitoku
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126  # NVIDIA GPU; skip for CPU
+pip install -r requirements-yomitoku.txt
+pip install --no-deps --ignore-requires-python "yomitoku==0.15.*"
 python ocrmyworkshopmanual.py SRC --ocr-engine yomitoku
 ```
 
-It needs **Python 3.13 or older**: every YomiToku since 0.5.2 declares `<3.14`, and pip on 3.14
-quietly installs 0.4.1, which the plugin refuses. It reads Japanese and English; any other
-language goes to Tesseract. YomiToku is licensed **CC BY-NC-SA 4.0 — non-commercial use only**;
-it is an optional dependency, not part of this repository.
+Not a plain `pip install yomitoku`: every YomiToku since 0.5.2 declares Python `<3.14`, so pip on
+3.14 quietly installs 0.4.1, which the plugin refuses. The declaration is a cap raised by hand one
+release at a time, not a breakage — all its dependencies ship 3.14 wheels and the yomitoku tests
+pass on 3.14.4. It also pins `pypdfium2==4.30.0` against ocrmypdf's `>=5`; it only uses it to open
+PDFs, and the plugin hands it images. `requirements-yomitoku.txt` leaves out `onnxruntime`, which
+YomiToku imports, because a venv set up for paddle already has one and plain `onnxruntime` would
+overwrite `onnxruntime-directml`; without paddle, `pip install onnxruntime`. The `cu126` torch
+build still carries Pascal (`sm_61`, GTX 10xx). It reads Japanese and English; any other language
+goes to Tesseract. YomiToku is licensed **CC BY-NC-SA 4.0 — non-commercial use only**; it is an
+optional dependency, not part of this repository.
 
 ## Carried OCR layers
 

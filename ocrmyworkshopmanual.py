@@ -755,10 +755,10 @@ def check_tools(want_ocr: bool, ocr_engine: str = 'tesseract'):
             why = _plugin_error(YOMITOKU_PLUGIN)
             if why:
                 return (f'--ocr-engine yomitoku: ocrmypdf cannot load the plugin ({why}). '
-                        'Install `pip install yomitoku` into the environment ocrmypdf runs '
-                        'from; for an NVIDIA GPU install a CUDA build of torch first '
-                        '(pytorch.org). YomiToku is free for non-commercial use only '
-                        '(CC BY-NC-SA 4.0).')
+                        'Install it into the environment ocrmypdf runs from as '
+                        'requirements-yomitoku.txt describes (not a plain `pip install '
+                        'yomitoku`: on Python 3.14 that installs the old 0.4.1). YomiToku is '
+                        'free for non-commercial use only (CC BY-NC-SA 4.0).')
     return None
 
 
@@ -6269,8 +6269,9 @@ def main():
                          'is YomiToku via the ocrmypdf_yomitoku plugin, Japanese and English '
                          'only: measured on 16 pages of Japanese service manuals it read 343 of '
                          '354 hand-checked strings where paddle read 307, at 1.3 s a page '
-                         'against 3.6. Needs `pip install yomitoku` (a CUDA build of torch for '
-                         'an NVIDIA GPU); free for non-commercial use only (CC BY-NC-SA 4.0)')
+                         'against 3.6. Install it as requirements-yomitoku.txt describes (a CUDA '
+                         'build of torch for an NVIDIA GPU); free for non-commercial use only '
+                         '(CC BY-NC-SA 4.0)')
     ap.add_argument('--paddle-dpi', type=int, default=0, metavar='DPI',
                     help='with --ocr-engine paddle: read pages scanned finer than DPI at DPI, '
                          'which is faster; the text layer is still mapped onto the full page. '

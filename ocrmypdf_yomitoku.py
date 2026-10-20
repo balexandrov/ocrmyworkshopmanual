@@ -45,14 +45,17 @@ from ocrmypdf import hookimpl
 from ocrmypdf.hocrtransform import BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 
-# The release the measurements above were made with. Every YomiToku from 0.5.2 on requires
-# Python < 3.14, so on 3.14 pip quietly installs 0.4.1 -- two years older, with different
-# models -- and the plugin would still load. Refuse it here, where the tool's start-up check
-# (loading the plugin through ocrmypdf) turns it into a clear error before the run.
+# The release the measurements above were made with. Every YomiToku from 0.5.2 on DECLARES
+# Python < 3.14, so a plain `pip install yomitoku` on 3.14 quietly installs 0.4.1 -- two years
+# older, with different models -- and the plugin would still load. Refuse it here, where the
+# tool's start-up check (loading the plugin through ocrmypdf) turns it into a clear error
+# before the run. 0.15 itself runs on 3.14 (the yomitoku tests pass on 3.14.4, CUDA and CPU);
+# requirements-yomitoku.txt installs it past the declaration.
 _MIN_VERSION = (0, 15)
 if tuple(int(p) for p in _dist_version('yomitoku').split('.')[:2]) < _MIN_VERSION:
     raise ImportError(f'yomitoku {_dist_version("yomitoku")} is older than the measured '
-                      f'{".".join(map(str, _MIN_VERSION))}; YomiToku >= 0.5.2 needs Python < 3.14')
+                      f'{".".join(map(str, _MIN_VERSION))}; install it as '
+                      'requirements-yomitoku.txt describes')
 
 # What YomiToku reads, as Tesseract language codes (what `-l` carries): Japanese, and the
 # Latin letters and digits Japanese manuals are full of. Anything else is refused, so the
