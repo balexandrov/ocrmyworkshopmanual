@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — combine keeps a part's own bookmarks, under that part
+
+A Toyota Japan CD chapter file carries the whole disc menu as its outline: the other chapters
+as `/GoToR` links to other files, and its own procedures, two and three levels down, as `/GoToR`
+links naming the file itself. Measured on the 1970 Crown MS50 book (27 parts, 1,138 own
+entries), `--plan` combining kept 16, and those landed wrong: at the root of the combined book,
+and in one case under the previous chapter's entry.
+
+- `part_outline` reads the raw outline items. pypdf resolves no `/GoToR`, so a `/GoToR` naming
+  the part itself is now followed to its page; one naming any other file is still left out.
+- Depths count only the kept entries above, so an entry whose menu ancestors were dropped hangs
+  under the nearest kept one instead of looking for a parent that is not there.
+- An outline level no longer finds a parent left over from an earlier part.
+- A part whose own outline is one root on its first page, its title again, has its children
+  placed straight under the part's entry. The same book now carries 1,159 bookmarks, nested as
+  the disc nests them.
+
 ### Changed — yomitoku runs on Python 3.14
 
 Every YomiToku since 0.5.2 declares Python `<3.14`, so it needed a separate 3.13 environment from
