@@ -680,6 +680,80 @@ def test_the_tree_outline_nests_each_parts_own_bookmarks_under_it(tmp_path):
     assert CM.part_outline(eng) == [(0, 'ENGINE SECTION', 0), (1, 'Timing chain', 2), (0, 'SPECIFICATIONS', 1)]
 
 
+def test_a_parts_own_bookmarks_under_a_dropped_ancestor_stay_under_that_part(tmp_path):
+    """A Toyota Japan CD chapter file's outline is the whole disc menu: the other chapters link
+    to other files and are dropped, and the file's own procedures sit two levels down in it, as
+    /GoToR actions naming the file itself (spelled in any case). They must be kept, and hang
+    under their own part's entry -- not at the root, and never under an entry left over from the
+    part before (the 1970 Crown MS50 book had all three: 16 of 1,138 kept, some at the root, one
+    under the wrong chapter)."""
+    import pikepdf
+    root = tmp_path / 'MS50'
+    root.mkdir()
+    parts = []
+    for name, own in (('1. Fuel.pdf', 'Choke setting'), ('2. Cooling.pdf', 'Fluid coupling')):
+        p = _pdf(root / name, npages=3)
+        with pikepdf.open(p, allow_overwriting_input=True) as pdf:
+            with pdf.open_outline() as ol:
+                elsewhere = pikepdf.Dictionary(S=pikepdf.Name.GoToR, F=pikepdf.String('other.pdf'),
+                                               D=pikepdf.Array([0, pikepdf.Name.Fit]))
+                menu = pikepdf.OutlineItem('Disc menu', action=elsewhere)
+                chapter = pikepdf.OutlineItem('Chapter', action=elsewhere)
+                # the disc's own procedures are /GoToR actions naming this very file
+                itself = pikepdf.Dictionary(S=pikepdf.Name.GoToR, F=pikepdf.String(name.upper()),
+                                            D=pikepdf.Array([pdf.pages[2].obj, pikepdf.Name.Fit]))
+                chapter.children.append(pikepdf.OutlineItem(own, action=itself))
+                menu.children.append(chapter)
+                ol.root.append(menu)
+            pdf.save(p)
+        parts.append(p)
+    assert CM.part_outline(parts[0]) == [(0, 'Choke setting', 2)]
+    files = CM.collect(root, recursive=True)
+    out = tmp_path / 'MS50.pdf'
+    assert CM.combine(files, out, tree=CM.tree_bookmarks(files, root)) == 6
+    r = PdfReader(str(out))
+    got = []
+
+    def walk(items, depth):
+        for it in items:
+            if isinstance(it, list):
+                walk(it, depth + 1)
+            else:
+                got.append((depth, str(it.title), r.get_destination_page_number(it) + 1))
+    walk(r.outline, 0)
+    assert got == [(0, '1. Fuel', 1), (1, 'Choke setting', 3),
+                   (0, '2. Cooling', 4), (1, 'Fluid coupling', 6)]
+
+
+def test_a_parts_single_root_on_its_first_page_is_not_repeated_under_it(tmp_path):
+    """A chapter file whose outline is one root -- the chapter's own title, on its first page --
+    with the procedures under it: the root says again what the part's entry says, so the
+    procedures hang straight under the part's entry."""
+    root = tmp_path / 'm'
+    root.mkdir()
+    p = _pdf(root / '1. Clutch.pdf', npages=3)
+    w = PdfWriter(clone_from=str(p))
+    top = w.add_outline_item('CLUTCH', 0)
+    w.add_outline_item('Removal', 1, parent=top)
+    w.add_outline_item('Installation', 2, parent=top)
+    with open(p, 'wb') as f:
+        w.write(f)
+    files = CM.collect(root, recursive=True)
+    out = tmp_path / 'm.pdf'
+    CM.combine(files, out, tree=CM.tree_bookmarks(files, root))
+    r = PdfReader(str(out))
+    got = []
+
+    def walk(items, depth):
+        for it in items:
+            if isinstance(it, list):
+                walk(it, depth + 1)
+            else:
+                got.append((depth, str(it.title)))
+    walk(r.outline, 0)
+    assert got == [(0, '1. Clutch'), (1, 'Removal'), (1, 'Installation')]
+
+
 def test_a_flat_folder_gets_no_bookmarks(tmp_path):
     """So every non-recursive run — the default, and what the Explorer menu uses — produces
     exactly the PDF it produced before this existed."""

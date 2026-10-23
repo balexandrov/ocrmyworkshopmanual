@@ -72,6 +72,7 @@ from pathlib import Path
 import img2pdf
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NumberObject
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp'}
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -861,26 +862,91 @@ def part_outline(pdf: Path) -> list:
     pypdf files them at the root instead, beside the file entries: measured on a 2024 Subaru WRX
     set of 10 chapter PDFs, 84 of their top-level bookmarks landed beside the 10 file entries and
     the chapter structure was gone. Entries whose destination does not resolve to a page are
-    left out (they would point nowhere in the merge either)."""
+    left out (they would point nowhere in the merge either).
+
+    The depth returned counts only the entries kept above it, so an entry whose ancestors were
+    left out hangs under the nearest kept one, or at the top. A Toyota Japan CD chapter file
+    carries the whole disc menu as its outline -- the other chapters as links to other files --
+    and its own procedures two and three levels down in it: with their raw depths, the 1970 Crown
+    MS50 book's own entries had no parent to hang under and landed at the root of the combined
+    book, one under another part's entry.
+
+    The raw outline items are read, not pypdf's `outline`, because pypdf resolves no /GoToR: on
+    those discs a chapter's own procedures are /GoToR actions naming the chapter file itself, and
+    pypdf found 4 of the 208 in one chapter -- 16 of 1,138 in the whole MS50 book. A /GoToR naming
+    any OTHER file is still left out."""
     out = []
     try:
         r = PdfReader(win_long(pdf))
+        page_of = {pg.indirect_reference.idnum: i for i, pg in enumerate(r.pages)}
+        named = r.named_destinations
+        own_name = Path(pdf).name.lower()
+        kept = []                    # raw depths of the kept entries above the current one
 
-        def walk(items, depth):
-            for it in items:
-                if isinstance(it, list):
-                    walk(it, depth + 1)
-                    continue
+        def page(dest):
+            if dest is None:
+                return None
+            dest = dest.get_object()
+            if not isinstance(dest, (list, ArrayObject)):    # a name: look it up in this file
+                d = named.get(str(dest))
+                return r.get_destination_page_number(d) if d is not None else None
+            if not dest:
+                return None
+            first = dest[0]
+            if isinstance(first, IndirectObject):
+                return page_of.get(first.idnum)
+            return int(first) if isinstance(first, (int, NumberObject)) else None
+
+        def target(item):
+            if '/Dest' in item:
+                return page(item['/Dest'])
+            a = item.get('/A')
+            a = a.get_object() if a is not None else None
+            if a is None:
+                return None
+            if a.get('/S') == '/GoTo':
+                return page(a.get('/D'))
+            if a.get('/S') == '/GoToR':
+                f = a.get('/F')
+                f = f.get_object() if f is not None else None
+                if isinstance(f, DictionaryObject):              # a file specification
+                    f = f.get('/UF') or f.get('/F')
+                if f is not None and Path(str(f).replace('\\', '/')).name.lower() == own_name:
+                    return page(a.get('/D'))
+            return None
+
+        def walk(node, depth):
+            while node is not None:
+                node = node.get_object()
                 try:
-                    pg = r.get_destination_page_number(it)
+                    pg = target(node)
                 except Exception:
                     pg = None
-                if pg is not None and pg >= 0:
-                    out.append((depth, str(it.title), pg))
-        walk(r.outline, 0)
+                if pg is not None and 0 <= pg < len(r.pages):
+                    while kept and kept[-1] >= depth:
+                        kept.pop()
+                    out.append((len(kept), str(node.get('/Title', '')), pg))
+                    kept.append(depth)
+                if '/First' in node:
+                    walk(node['/First'], depth + 1)
+                node = node.get('/Next')
+
+        outlines = r.trailer['/Root'].get('/Outlines')
+        if outlines is not None and '/First' in outlines.get_object():
+            walk(outlines.get_object()['/First'], 0)
     except Exception:
         return []
     return out
+
+
+def nested_outline(pdf: Path) -> list:
+    """`part_outline`, as it goes under the part's entry: one root opening on the part's first
+    page is the part's title again, so its children go straight under the part's entry (every
+    chapter of the 1970 Crown MS50 book had one)."""
+    own = part_outline(pdf)
+    if [d for d, _t, _pg in own].count(0) == 1 and own[0][0] == 0 and own[0][2] == 0:
+        own = [(d - 1, title, pg) for d, title, pg in own[1:]]
+    return own
 
 
 def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, tree: dict = None,
@@ -945,7 +1011,7 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
             marks.extend((lvl, title, first, p) for lvl, title in tree[i])
             if nested:
                 base = tree[i][-1][0]          # the part's own entry
-                marks.extend((base + 1 + d, title, first + pg, p) for d, title, pg in part_outline(p))
+                marks.extend((base + 1 + d, title, first + pg, p) for d, title, pg in nested_outline(p))
     # Page indices come from the merge, not from a prediction: a section whose first part is a
     # 9-page PDF must not have its bookmark land 8 pages early. An index past the end can only
     # mean that input contributed NO pages — a 0-page PDF, which `expected_pages` counts as 0
@@ -957,6 +1023,9 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
             raise CombineFailed(f'bookmark {title!r} would point past the end (page {pg + 1} '
                                 f'of {n_pages}): {src} contributed no pages')
         parents[lvl] = w.add_outline_item(title, pg, parent=parents.get(lvl - 1) if lvl else None)
+        # a deeper parent left from an earlier item is not this one's: never hang under it
+        for deeper in [k for k in parents if k > lvl]:
+            del parents[deeper]
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_pdf.with_suffix(out_pdf.suffix + '.part')
     try:
@@ -1211,7 +1280,7 @@ def main():
                      if r.expected else ''))
     if tree:
         want_items = sum(len(v) for v in tree.values())
-        inner = sum(len(part_outline(f)) for i, f in enumerate(files)
+        inner = sum(len(nested_outline(f)) for i, f in enumerate(files)
                     if i in tree and is_pdf(f) and i not in sel)
         got_items = outline_count(out_pdf)
         print(f'Bookmarks: {got_items} of {want_items + inner} present in the output '
