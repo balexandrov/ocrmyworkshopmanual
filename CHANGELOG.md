@@ -5,6 +5,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — combine no longer refuses a manual over one malformed link
+
+A link annotation whose action is not a usable action -- an array where a dictionary belongs, or a
+dictionary with no `/S` -- made pypdf's merge raise (`'ArrayObject' object has no attribute 'get'`,
+then `KeyError: '/S'`) while it collected the page's links, and `combine_manual.py` refused the whole
+manual. Measured on a Toyota Corolla CD that keeps every page as a PDF of its own: one page of a
+658-page supplement carried both kinds, and the supplement could not be joined at all.
+
+- `merge_source` checks each part before it is merged. A part with such links is merged from an
+  in-memory copy with those actions removed; the file on disk is untouched, and the link's area
+  does nothing, as it already did in every viewer. Page count and content are unchanged, so the
+  merge's page guard still holds. The run names each part and how many actions it dropped.
+
 ### Fixed — combine keeps a part's own bookmarks, under that part
 
 A Toyota Japan CD chapter file carries the whole disc menu as its outline: the other chapters
