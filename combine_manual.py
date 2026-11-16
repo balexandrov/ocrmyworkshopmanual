@@ -850,6 +850,40 @@ def _image_to_pdf_bytes(path: Path) -> bytes:
         return img2pdf.convert(buf.getvalue())
 
 
+def merge_source(p: Path):
+    """(what to hand the merge for part `p`, link actions dropped). Normally the path itself.
+
+    A link annotation whose /A is not an action -- an array, or a dictionary without /S, both
+    written by whatever made the Corolla200502 CD's one-page parts (RM1039Supp453.pdf) -- makes
+    pypdf's merge raise "'ArrayObject' object has no attribute 'get'" or KeyError '/S' while it
+    collects the page's links, and the
+    whole manual is then refused over one dead link. Such an action cannot be followed by any
+    viewer, so it is dropped from an in-memory reader of the part, which is merged instead;
+    the file on disk is untouched and the link's rectangle simply does nothing, as it already
+    did. Page count and content are unchanged, so the merge's page guard still holds."""
+    try:
+        r = PdfReader(win_long(p))
+        dropped = 0
+        for page in r.pages:
+            annots = page.get('/Annots')
+            annots = annots.get_object() if annots is not None else None
+            if not isinstance(annots, ArrayObject):
+                continue
+            for ref in annots:
+                a = ref.get_object()
+                if not isinstance(a, DictionaryObject) or '/A' not in a:
+                    continue
+                act = a['/A'].get_object()
+                # an array, or a dictionary with no /S (which kind of action?): the same part
+                # holds both, and pypdf fails on the second with KeyError '/S'
+                if not isinstance(act, DictionaryObject) or '/S' not in act:
+                    del a['/A']
+                    dropped += 1
+    except Exception:
+        return win_long(p), 0           # unreadable here: let the merge itself report it
+    return (r if dropped else win_long(p)), dropped
+
+
 class CombineFailed(Exception):
     """The combined PDF is not a faithful merge of its inputs — do not trust it, and
     above all do not delete the sources on the strength of it."""
@@ -990,17 +1024,21 @@ def combine(files, out_pdf: Path, verify: bool = True, bookmarks: dict = None, t
         first = len(w.pages)      # the index the next appended page will land at
         nested = bool(tree and i in tree and is_pdf(p)) and i not in sel
         try:
+            src, dropped = merge_source(p) if is_pdf(p) else (win_long(p), 0)
+            if dropped:
+                print(f'  {p.name}: {dropped} malformed link action(s) dropped (not a dictionary; '
+                      f'no viewer can follow them)', flush=True)
             if i in sel:
                 if sel[i] == [-1]:         # `prev`: a bookmark only, at the page merged last
                     first = len(w.pages) - 1
                     if first < 0:
                         raise CombineFailed(f'{p}: a "prev" bookmark with no page before it')
                 elif sel[i]:               # empty: a bookmark only, at the next page merged
-                    w.append(win_long(p), pages=sel[i], import_outline=False)
+                    w.append(src, pages=sel[i], import_outline=False)
             elif is_pdf(p):
                 # with a tree, the part's own outline is placed below its entry (further down),
                 # not imported at the root by the merge
-                w.append(win_long(p), import_outline=not nested)
+                w.append(src, import_outline=not nested)
             else:
                 w.append(io.BytesIO(_image_to_pdf_bytes(p)))
         except Exception as ex:
