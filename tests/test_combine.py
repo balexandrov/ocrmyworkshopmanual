@@ -1097,3 +1097,37 @@ def test_dry_run_says_what_it_would_do_about_unreadable_inputs(tmp_path):
 
     rc, out = _run_combine(d, '--dry-run', '--skip-unrecoverable')
     assert 'leave out' in out, out
+
+
+# ── malformed link actions ────────────────────────────────────────────────────
+
+def test_a_link_whose_action_is_not_a_dictionary_does_not_refuse_the_merge(tmp_path):
+    """The Corolla200502 CD's RM1039Supp453.pdf carries a link whose /A is an ARRAY and one whose
+    /A has no /S; pypdf's merge raised "'ArrayObject' object has no attribute 'get'", then
+    KeyError '/S', collecting the page's links, and the whole 658-page supplement was refused
+    over dead links. The actions are dropped from an in-memory copy, the merge goes on, the page
+    is kept and the file on disk is not touched."""
+    from pypdf.generic import (ArrayObject, DictionaryObject, FloatObject, NameObject,
+                               NumberObject)
+    good = _pdf(tmp_path / '1.pdf')
+    bad = _pdf(tmp_path / '2.pdf')
+    w = PdfWriter(clone_from=str(bad))
+    rect = ArrayObject([FloatObject(10), FloatObject(10), FloatObject(50), FloatObject(50)])
+
+    def link(action):
+        return w._add_object(DictionaryObject({
+            NameObject('/Type'): NameObject('/Annot'), NameObject('/Subtype'): NameObject('/Link'),
+            NameObject('/Rect'): rect, NameObject('/A'): action}))
+    w.pages[0][NameObject('/Annots')] = ArrayObject([
+        link(ArrayObject([NumberObject(0), NameObject('/XYZ')])),
+        link(DictionaryObject({NameObject('/D'): ArrayObject([NumberObject(0), NameObject('/Fit')])}))])
+    with open(bad, 'wb') as f:
+        w.write(f)
+    before = bad.read_bytes()
+
+    assert CM.merge_source(bad)[1] == 2
+    assert CM.combine([good, bad], tmp_path / 'out.pdf') == 2
+    out = PdfReader(str(tmp_path / 'out.pdf'))
+    assert all('/A' not in a.get_object() for a in out.pages[1].get('/Annots', []))
+    assert bad.read_bytes() == before, 'the part on disk must be left as it was'
+    assert CM.merge_source(good) == (CM.win_long(good), 0), 'a sound part is merged from its path'
