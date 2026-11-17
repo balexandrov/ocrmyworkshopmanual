@@ -127,6 +127,23 @@ def test_a_healthy_font_is_left_alone(tmp_path, kw):
     assert res["found"] == 0 and not out.exists()
 
 
+def test_a_null_in_the_contents_array_does_not_skip_the_file(tmp_path):
+    """A /Contents array holding null (a dangling reference reads as one) made the content
+    fingerprint raise, and the whole file kept its boxes -- 3,161 pages over three nulls on
+    one page. The null draws nothing; the fix must go ahead and the content stay equal."""
+    src = make_boxed_pdf(tmp_path / "boxed.pdf")
+    with pikepdf.open(str(src), allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0].obj
+        page.Contents = pikepdf.Array([page.Contents, None])
+        pdf.save(str(src))
+    out = tmp_path / "out.pdf"
+    res = S.clean_file(src, out)
+    assert res["found"] == 1 and not res["err"], res
+    assert _flat_space_entry(out)[0] == 32
+    with pikepdf.open(str(src)) as a, pikepdf.open(str(out)) as b:
+        assert S._fingerprint(a) == S._fingerprint(b)
+
+
 def test_rerunning_is_a_no_op(tmp_path):
     src = make_boxed_pdf(tmp_path / "boxed.pdf")
     once = tmp_path / "once.pdf"

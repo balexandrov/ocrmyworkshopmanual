@@ -191,12 +191,17 @@ def detect(pdf):
 
 # ---------------------------------------------------------------- a file
 def _fingerprint(pdf):
-    """What the repair must leave exactly as it was: page count and every page's content."""
+    """What the repair must leave exactly as it was: page count and every page's content.
+
+    A /Contents array can hold null -- a reference to an object that does not exist, which
+    draws nothing. Reading it raised and skipped the whole file: a 3,161-page repair manual
+    kept the boxes on every page over three nulls on page 297. Skipped here as they are in
+    pdfrepair and the lossless fingerprint."""
     out = []
     for page in pdf.pages:
         c = page.obj.get("/Contents")
-        parts = c if isinstance(c, pikepdf.Array) else ([c] if c is not None else [])
-        out.append(b"".join(p.read_bytes() for p in parts))
+        parts = c if isinstance(c, pikepdf.Array) else [c]
+        out.append(b"".join(p.read_bytes() for p in parts if p is not None))
     return out
 
 
