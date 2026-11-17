@@ -5,6 +5,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — the space fix no longer gives up on a null in a page's content array
+
+A `/Contents` array can hold null (a reference to an object that does not exist; it draws
+nothing). The space fix's content fingerprint read every entry as a stream, raised, and the file
+was passed through with all its boxes: a 3,161-page Toyota repair manual, 1,242 faulty fonts, over
+three nulls on one page ("space-fix scan skipped: AttributeError"). Nulls are now skipped, as the
+repair and lossless fingerprints already did.
+
 ### Fixed — no re-save of a file whose every page already has text
 
 A file with vector pages is OCR'd with `--skip-text`, which skips any page that carries text. When
