@@ -5,6 +5,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — no re-save of a file whose every page already has text
+
+A file with vector pages is OCR'd with `--skip-text`, which skips any page that carries text. When
+every page carries some (a heading and a page number is enough) that run adds nothing, but the file
+was still re-saved and reported `re-ocr` -- and again on every later pass, because `has_text` (40
+characters on 80% of pages) never says yes to it. Measured: an 18-page relay-location diagram set,
+4-77 characters a page, came back with new bytes and no new text.
+
+- The keep-the-original lane now checks every page for text before OCR'ing a file with vector pages,
+  stopping at the first page without; if there is none, the file is kept as it is and reported
+  `kept existing`. `--dry-run` predicts the same.
+
 ### Fixed — a deeply nested PDF is no longer called corrupt
 
 The render probe wrote its image beside the PDF (`_probe_<name>.png`). Past Windows' 260-character

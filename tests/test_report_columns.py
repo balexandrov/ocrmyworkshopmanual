@@ -71,6 +71,48 @@ def test_small_file_in_place_is_left_untouched(tmp_path, floor_5mb):
     assert src.read_bytes() == before
 
 
+def _sparse_text_diagram_set(path: Path) -> Path:
+    """The relay-location shape: mostly scanned drawings plus a vector page, and EVERY page
+    carrying only a heading -- text on each page, but far too little for `has_text`."""
+    import pikepdf
+    U.make_scan_pdf(path, npages=7)
+    vec = U.make_born_digital_pdf(path.with_name('vec.pdf'), npages=1, lines_per_page=1)
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf, pikepdf.open(str(vec)) as v:
+        pdf.pages.extend(v.pages)
+        pdf.save()
+    U._append_page_ops(path, U._stamp_ops(['F RELAY LOCATIONS']), nfonts=1)
+    return path
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+@pytest.mark.skipif(_ocr_missing is not None, reason=str(_ocr_missing))
+def test_text_on_every_page_is_not_reocred_to_no_effect(tmp_path, floor_5mb):
+    """A file with vector pages is OCR'd with --skip-text, which skips any page that has
+    text; when every page has some, that run adds nothing. It used to rewrite the file
+    anyway and report 're-ocr' -- on every pass. In place it must now stay byte-identical
+    and say 'kept existing'."""
+    src = _sparse_text_diagram_set(tmp_path / 'relay.pdf')
+    assert not owm.has_text(src) and owm._has_vector_pages(src), 'fixture must reach the OCR gate'
+    assert owm._every_page_has_text(src)
+    before = src.read_bytes()
+    res = owm.compress_one(str(src), str(src), 200, ocr=True, language='eng', in_place=True)
+    assert res.get('err') is None, res
+    assert res['ocr_state'] == owm.OCR_KEPT, res
+    assert src.read_bytes() == before, 'rewritten although OCR had nothing to add'
+
+
+def test_every_page_has_text_stops_at_a_page_without(tmp_path):
+    """One page with no text is enough for --skip-text to have work, so the gate must
+    let such a file through to OCR."""
+    import pikepdf
+    src = _sparse_text_diagram_set(tmp_path / 'relay.pdf')
+    bare = U.make_scan_pdf(tmp_path / 'bare.pdf', npages=1)
+    with pikepdf.open(str(src), allow_overwriting_input=True) as pdf, pikepdf.open(str(bare)) as b:
+        pdf.pages.extend(b.pages)
+        pdf.save()
+    assert not owm._every_page_has_text(src)
+
+
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_floor_skips_the_sample_projection(tmp_path, floor_5mb, monkeypatch):
     """The floor is checked BEFORE the pre-check, so a small file never pays to

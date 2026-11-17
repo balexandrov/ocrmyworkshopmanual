@@ -2869,6 +2869,21 @@ def has_text(pdf: Path, sample: int = 8, min_chars: int = 40,
     return with_text >= covered * len(ts.idxs)
 
 
+def _every_page_has_text(pdf: Path) -> bool:
+    """True if EVERY page carries some extractable text -- the condition under which
+    ocrmypdf --skip-text OCRs nothing at all. Stops at the first page without text, so a
+    scan costs one page. pypdf finds text only where a text-showing operator draws it, which
+    ocrmypdf also counts as text, so a True here never hides a page ocrmypdf would OCR;
+    a False (unreadable file included) just keeps the old behaviour."""
+    try:
+        for page in PdfReader(str(pdf)).pages:
+            if not (page.extract_text() or '').strip():
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def has_any_text(pdf: Path) -> bool:
     """True if ANY sampled page carries text — i.e. the file already has (at least a
     partial or stale) text layer.
@@ -4953,12 +4968,22 @@ def _ship_original(images_from: Path, work: Path, ocr: bool, language: str,
         return base, language, note, OCR_NONE, None
     if has_text(base):
         return base, language, note + ' (had text, OCR skipped)', OCR_KEPT, None
+    # A file with vector pages is OCR'd with --skip-text (see `_ocr_source`), which skips
+    # every page that carries ANY text. If no page lacks text, that run adds nothing -- yet
+    # it re-saved the file, which shipped as a rewrite reported 're-ocr', and did so again
+    # on every later pass. Measured: an 18-page relay-location diagram set whose pages carry
+    # only a heading and page number (4-77 chars each) came back with new bytes and not one
+    # character more. `has_text` cannot see this case: it asks for 40 chars on 80% of pages.
+    has_vector = _has_vector_pages(base)
+    if has_vector and _every_page_has_text(base):
+        return (base, language, note + ' (every page has text; --skip-text OCR would add nothing)',
+                OCR_KEPT, None)
     # A partly-searchable file still lands here (has_text wants text on nearly every
     # page), and --redo-ocr then REPLACES that stale layer instead of creating the first
     # one. The report has to say which of the two happened.
     had_text = has_any_text(base)
     ocred, language, onote = _ocr_source(base, work, language,
-                                         has_vector=_has_vector_pages(base),
+                                         has_vector=has_vector,
                                          timeout=timeout, preserve_images=True,
                                          pages=src_pages)
     note += onote
@@ -5675,6 +5700,9 @@ def _predict_ocr(src_p: Path, work: Path, ocr: bool, language: str) -> tuple:
     if not ocr:
         return OCR_NONE, ''
     if has_text(src_p):
+        return OCR_KEPT, ''
+    # the real run's `_ship_original` gate: vector pages + text on every page = nothing to OCR
+    if _has_vector_pages(src_p) and _every_page_has_text(src_p):
         return OCR_KEPT, ''
     state = OCR_REDO if has_any_text(src_p) else OCR_NEW
     try:
