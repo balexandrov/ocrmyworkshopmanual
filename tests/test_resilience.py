@@ -665,6 +665,23 @@ def test_corrupt_pdf_not_byte_copied_when_keeping_the_original(tmp_path, monkeyp
 
 
 @pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_render_probe_is_not_fooled_by_a_long_path(tmp_path):
+    """A good PDF nested so deep that a probe image named beside it would pass Windows'
+    260-character limit. The probe used to write there, Ghostscript could not, and the file
+    was reported "corrupt (repairable)" -- 143 good wiring diagrams in one manual. The PDF's
+    own path stays under the limit: only the probe's would have gone over."""
+    d = tmp_path
+    while len(str(d / ('x' * 40))) < 230:
+        d = d / ('x' * 40)
+    d = d / ('y' * (250 - len(str(d)) - 1))     # the folder: 250 characters
+    d.mkdir(parents=True)
+    p = U.make_born_digital_pdf(d / 'a.pdf', npages=1)
+    assert len(str(p)) < 260 < len(str(d / '_probe_a.png'))
+    assert U.owm._renders_ok(p), 'a valid PDF read as unrenderable'
+    assert sorted(x.name for x in d.iterdir()) == ['a.pdf'], 'probe left a file beside the PDF'
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
 def test_repair_prefers_the_engine_that_keeps_every_page(tmp_path):
     """Repair must not accept a PARTIAL salvage. Ghostscript's pdfwrite recovered only
     1 of 21 pages from a real corrupt manual while qpdf recovered all 21, so a repair

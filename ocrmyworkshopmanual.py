@@ -3296,14 +3296,21 @@ def _repair_note(stats: dict) -> str:
 def _renders_ok(pdf: Path, timeout: int = 0) -> bool:
     """Can this PDF actually be rendered? Cheap one-page Ghostscript probe. Used on the
     paths that copy the source through byte-for-byte, so a corrupt file is caught and
-    repaired instead of being faithfully reproduced as an unreadable copy."""
-    out = pdf.parent / f'_probe_{pdf.stem}.png'
+    repaired instead of being faithfully reproduced as an unreadable copy.
+
+    The probe image goes to a short temp folder, never beside the PDF: Ghostscript cannot
+    write a path past Windows' 260-character limit, so a probe named after a deeply nested
+    file failed to WRITE and read as "PDF does not render". Measured: all 143 files of one
+    manual flagged "corrupt (repairable)" were the ones whose probe path was 260-270
+    characters long; none of the 3,745 shorter ones were, and every one renders."""
+    tmp = Path(tempfile.mkdtemp(prefix='probe_'))
+    out = tmp / 'p.png'
     try:
         ok = _render_page_gray(pdf, 1, out, 36, timeout) and out.stat().st_size > 0
     except Exception:
         ok = False
     finally:
-        out.unlink(missing_ok=True)
+        shutil.rmtree(tmp, ignore_errors=True)
     return ok
 
 
