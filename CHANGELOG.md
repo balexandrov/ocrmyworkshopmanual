@@ -5,6 +5,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — a deeply nested PDF is no longer called corrupt
+
+The render probe wrote its image beside the PDF (`_probe_<name>.png`). Past Windows' 260-character
+path limit Ghostscript could not write it, the probe failed, and a good file was reported "born-digital
+PDF is corrupt (repairable)" -- in place it was then skipped, to `--dest` it was needlessly rewritten.
+Measured on one manual: exactly the 143 files whose probe path was 260-270 characters long, all of
+which render. The probe now writes into its own short temp folder.
+
 ### Fixed — `--in-place` really decrypts a file it leaves otherwise untouched
 
 Decryption only rebinds the copy the run reads. On the in-place lanes that write nothing (a
