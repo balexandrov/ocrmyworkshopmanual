@@ -5082,7 +5082,12 @@ def _compress_one(src: str, dest: str, dpi: int,
             src_p, wm_res, werr = _dewatermark_source(src_p, work)
             if werr and wm_res is None:
                 dnote += f' (watermark scan skipped: {werr})'
-        dewatermarked = bool(wm_res and wm_res.get('pages'))
+        # `dewatermarked` means "the source we hold is not the bytes on disk", and it is what
+        # forces an in-place write on the lanes that otherwise leave the file alone. A
+        # decrypted source is exactly that, so it counts from the start. Without it, every
+        # in-place file that took a "left untouched" lane went back encrypted while its row
+        # said "decrypted" (measured: 929 of 3,888 GSIC PDFs in one manual, 2026-11-17).
+        dewatermarked = decrypted or bool(wm_res and wm_res.get('pages'))
         dnote += pdfwatermark.note_for(wm_res)
         # THEN the box spaces, for the reasons in `_fixspaces_source`. Same contract: it only
         # rebinds what we READ, and a rewrite it made forces the write below exactly as a

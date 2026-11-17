@@ -113,6 +113,23 @@ def test_bytecopy_path_ships_decrypted_by_default(tmp_path):
 
 
 @pytest.mark.skipif(bool(_missing), reason=_missing or '')
+def test_in_place_left_untouched_still_ships_decrypted(tmp_path, monkeypatch):
+    """In place, a small born-digital file takes the 'left untouched' lane (under the
+    lossless floor). That lane used to put the encrypted original back while the row said
+    'decrypted'. The file on disk must really be decrypted, pages unchanged. The production
+    floor is restored: with conftest's 0 the lossless rewrite runs and hides the fault."""
+    monkeypatch.setattr(owm, 'MIN_COMPRESS_MB', 5.0)
+    p = U.make_born_digital_pdf(tmp_path / 'vector.pdf', npages=4)
+    U.encrypt_pdf_in_place(p)
+    res = owm.compress_one(str(p), str(p), 200, ocr=False, in_place=True)
+    assert not res.get('err')
+    assert _enc_state(p) == (False, True)
+    assert 'decrypted' in res['note']
+    with pikepdf.open(p) as pdf:
+        assert len(pdf.pages) == 4
+
+
+@pytest.mark.skipif(bool(_missing), reason=_missing or '')
 def test_no_decrypt_preserves_the_encryption(tmp_path):
     """The opt-out has to actually opt out -- and this is the pre-fix behaviour."""
     src = tmp_path / 'in'
