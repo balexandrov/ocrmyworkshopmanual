@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — `--in-place` really decrypts a file it leaves otherwise untouched
+
+Decryption only rebinds the copy the run reads. On the in-place lanes that write nothing (a
+born-digital file under the lossless floor, an OCR-only file that already had text) the encrypted
+original stayed on disk while the row said "decrypted: owner permission flags dropped". Measured on
+one Toyota GSIC manual: 929 of 3,888 PDFs still encrypted after a pass that reported all decrypted.
+
+- A decrypted source now counts as "the source we hold is not the bytes on disk", the same flag a
+  removed stamp or a box-space fix sets, so it forces the audited in-place write. Page content is
+  untouched; the row now says "rewritten in place".
+
 ### Fixed — combine no longer refuses a manual over one malformed link
 
 A link annotation whose action is not a usable action -- an array where a dictionary belongs, or a
