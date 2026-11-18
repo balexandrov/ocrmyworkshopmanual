@@ -150,6 +150,50 @@ def test_text_drawn_over_the_image_is_kept(tmp_path):
         assert owm._strip_invisible_ops(p.pages[0]) is None
 
 
+BLANK_STUB = b'BT 506 191 TD 0 0 0 rg /F1 12 Tf 0 Tc 0 Tw ( ) Tj -418 -9 TD ( ) Tj ET '
+
+
+def _page_ops(pdf):
+    import pikepdf
+    with pikepdf.open(str(pdf)) as p:
+        return p.pages[0].Contents.read_bytes()
+
+
+@pytest.mark.skipif(_missing is not None, reason=str(_missing))
+def test_a_blank_text_stub_over_the_scan_is_stripped(tmp_path):
+    """The AW4 overhaul manual's pages: the scan, then a fill-mode text object showing only
+    spaces. --skip-text counted it as text and OCR'd none of those 111 pages."""
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=1)
+    _set_ops(src, BLANK_STUB + b'BT /F1 11 Tf 60 700 Td [( )-250(\t)] TJ ET ')
+    out = tmp_path / 'out.pdf'
+    res = owm._strip_text_layer(src, out)        # also re-renders and compares
+    assert res == {'pages': 1, 'left': 0, 'err': None}
+    assert b'BT' not in _page_ops(out)
+
+
+@pytest.mark.parametrize('ops', [b'BT /F1 12 Tf ( x ) Tj ET ', b'BT /F1 12 Tf [( )(x)] TJ ET '],
+                         ids=['Tj', 'TJ'])
+def test_a_text_object_with_any_real_character_is_kept(tmp_path, ops):
+    import pikepdf
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=1)
+    _set_ops(src, ops)
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
+def test_blanks_remapped_by_differences_are_kept(tmp_path):
+    """/Differences can name code 32 anything; then the byte is not a space."""
+    import pikepdf
+    src = U.make_scan_pdf(tmp_path / 'src.pdf', npages=1)
+    _set_ops(src, b'BT /F1 12 Tf ( ) Tj ET ')
+    with pikepdf.open(str(src), allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj.Resources.Font.F1.Encoding = pikepdf.Dictionary(
+            Differences=pikepdf.Array([32, pikepdf.Name('/A')]))
+        pdf.save()
+    with pikepdf.open(str(src)) as p:
+        assert owm._strip_invisible_ops(p.pages[0]) is None
+
+
 @pytest.mark.parametrize('before', [b'0 0 100 100 re W n', b'/GS0 gs'],
                          ids=['clipped', 'graphics-state'])
 def test_text_under_a_clipped_or_restyled_image_is_kept(tmp_path, before):
