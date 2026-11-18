@@ -2388,10 +2388,57 @@ def _covers_page(ctm, box) -> bool:
             and ys[0] <= box[1] + tol and ys[1] >= box[3] - tol)
 
 
+_BLANK_CODES = frozenset(b' \t\r\n\xa0')
+
+
+def _shows_only_blanks(operands, op, fonts, font) -> bool:
+    """True if this text-show operator draws only blank characters (space, tab, CR, LF,
+    no-break space) in a simple font, i.e. paints nothing whatever its render mode.
+
+    Some scan-to-PDF tools leave such a stub on every page: `BT /F0 12 Tf ( ) Tj ... ET` in
+    plain fill mode after the scan image. Measured on an AW4 overhaul manual (124 pages, 111
+    of them so): ocrmypdf --skip-text counts the stub as text and OCRs none of those pages,
+    and before this they were not 'invisible' either, so --replace-text left them alone too.
+    Only a simple font (not Type0 / Type3) whose /Differences leave those codes alone
+    qualifies: there the byte IS the character. Unsure answers False, the safe side."""
+    import pikepdf
+    try:
+        f = fonts.get(font) if font else None
+        if f is None or f.get('/Subtype') in ('/Type0', '/Type3'):
+            return False
+        enc = f.get('/Encoding')
+        if isinstance(enc, pikepdf.Dictionary) and '/Differences' in enc:
+            code = None
+            for d in enc['/Differences']:
+                if isinstance(d, pikepdf.Name):
+                    if code in _BLANK_CODES and str(d) not in ('/space', '/nbspace', '/nonbreakingspace'):
+                        return False
+                    code = None if code is None else code + 1
+                else:
+                    code = int(d)
+        strs = []
+        o = str(op)
+        if o == 'TJ':
+            for x in operands[0]:
+                if isinstance(x, pikepdf.String):
+                    strs.append(bytes(x))
+                elif isinstance(x, (pikepdf.Array, pikepdf.Dictionary, pikepdf.Name)):
+                    return False                # not a kerning number: unsure
+
+        elif operands and isinstance(operands[-1], pikepdf.String):
+            strs.append(bytes(operands[-1]))
+        else:
+            return False
+        return all(b in _BLANK_CODES for s in strs for b in s)
+    except Exception:
+        return False
+
+
 def _strip_invisible_ops(page):
     """The page's content with every text object that draws nothing removed, or None if
     there is no such object. A text object draws nothing when it shows ONLY invisible (Tr 3)
-    glyphs, or when an opaque image covering the whole page is painted over it later in the
+    glyphs, or only blank characters (`_shows_only_blanks`), or when an opaque image covering
+    the whole page is painted over it later in the
     same stream. A text object that shows any glyph that stays visible is kept whole:
     dropping one show operator out of it would move the glyphs after it, since each one
     advances the text matrix.
@@ -2419,6 +2466,7 @@ def _strip_invisible_ops(page):
         ops = pikepdf.parse_content_stream(page)
         forms = _invisible_form_names(page)
         opaque = _opaque_image_names(page)
+        fonts = (_inherited_resources(page.obj) or {}).get('/Font') or {}
         box = [float(v) for v in page.mediabox]
         box = [min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3])]
     except Exception:
@@ -2426,7 +2474,7 @@ def _strip_invisible_ops(page):
     # items: ('op', operands, op) | ['block', ops, visible, dropped]
     items, block, stack, tr, dropped_forms = [], None, [], 0, 0
     ctm, clip, gs = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), False, False
-    visible = False
+    visible, font = False, None
     for operands, op in ops:
         o = str(op)
         if block is not None:
@@ -2436,7 +2484,10 @@ def _strip_invisible_ops(page):
                     tr = int(operands[0])
                 except Exception:
                     visible = True              # unreadable mode: keep the block, the safe side
-            elif o in _TEXT_SHOW_OPS and tr != _TR_INVISIBLE:
+            elif o == 'Tf':
+                font = str(operands[0]) if operands else None
+            elif o in _TEXT_SHOW_OPS and tr != _TR_INVISIBLE \
+                    and not _shows_only_blanks(operands, op, fonts, font):
                 visible = True
             elif o == 'ET':
                 items.append(['block', block, visible, not visible])
@@ -2453,10 +2504,12 @@ def _strip_invisible_ops(page):
                 if it[0] == 'block' and it[2]:
                     it[3] = True
         if o == 'q':
-            stack.append((tr, ctm, clip, gs))
+            stack.append((tr, ctm, clip, gs, font))
         elif o == 'Q':
-            tr, ctm, clip, gs = stack.pop() if stack else (0, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
-                                                           False, False)
+            tr, ctm, clip, gs, font = stack.pop() if stack else (
+                0, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), False, False, None)
+        elif o == 'Tf':
+            font = str(operands[0]) if operands else None
         elif o == 'Tr':
             try:
                 tr = int(operands[0])

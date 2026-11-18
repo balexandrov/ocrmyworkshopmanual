@@ -5,6 +5,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — `--replace-text` strips a text stub that shows only blanks
+
+Some scan-to-PDF tools leave a fill-mode text object on every page that shows nothing but spaces
+(`BT /F0 12 Tf ( ) Tj ... ET`, after the scan image). `--skip-text` counts it as text, so OCR skipped
+those pages, and since it was neither Tr 3 nor under the scan, `--replace-text` kept it too. Measured:
+a 124-page AW4 overhaul manual, 111 pages so, came back with text on 13. A text object whose every
+show operator draws only space, tab, CR, LF or no-break space in a simple font (no Type0/Type3, no
+`/Differences` remapping those codes) now counts as drawing nothing; with this all 124 pages are OCR'd.
+The render check before and after still applies.
+
 ### Fixed — the space fix no longer gives up on a null in a page's content array
 
 A `/Contents` array can hold null (a reference to an object that does not exist; it draws
